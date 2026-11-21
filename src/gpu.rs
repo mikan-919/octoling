@@ -3,8 +3,8 @@
 //! 生成 (forward) は1トークンずつで、カーネル列を CUDA Graph に記録して再生する。
 //! prefill は最大 TMAX トークンをまとめて処理し、重みを読む回数をトークン数で割る。
 
-use crate::model::{self, BLOCK, CORE, D, EXTENT, FF, GLOBAL_LAYERS, Layer, MXFP8_FROM, Model, N_LAYER, N_SLOT, PASSES, TOP_K, VOCAB, W};
-use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaStream, result, sys};
+use crate::model::{self, BLOCK, CORE, D, EXTENT, FF, GLOBAL_LAYERS, Layer, MXFP8_FROM, Model, N_EXP, N_LAYER, N_SLOT, PASSES, TOP_K, VOCAB, W};
+use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaModule, CudaStream, result, sys};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -154,11 +154,29 @@ pub struct Gpu {
     // 1トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph
     graphs: RefCell<Vec<CudaGraph>>,
     capturing: Cell<bool>,
+    // prefill で、20〜23層の MXFP8 expert の一部を PCIe で送って GPU で計算するための送信用ストリームと置き場
+    copy: Arc<CudaStream>,
+    staging: [P; 2],
+    up_done: [CudaEvent; 2],
+    comp_done: [CudaEvent; 2],
 }
 
-const KERNELS: [&str; 20] = [
+/// prefill で1回に PCIe で送る MXFP8 expert の数。置き場は2つあり、片方を送るあいだにもう片方で計算する
+const GROUP: usize = 8;
+// MXFP8 の expert 1個あたりのバイト数
+const W13: usize = 2 * FF * D;
+const S13: usize = W13 / 32;
+const W2: usize = D * FF;
+const S2: usize = W2 / 32;
+
+/// GPU と CPU の分担を釣り合わせるための見積もり (秒)。expert 8個 (66 MB) を PCIe で送る時間と、CPU で割り当て1つを計算する時間。
+/// 実測: PCIe 4.0 x8 で 14.3 GB/s、CPU は 512 トークンの1層 (4096 割り当て) で約 130 ms。別の機械では測り直す
+const GPU_PER_GROUP: f64 = 4.6e-3;
+const CPU_PER_ASSIGN: f64 = 32e-6;
+
+const KERNELS: [&str; 22] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
-    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum",
+    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -171,13 +189,19 @@ fn f4(n: usize) -> u64 {
 }
 
 impl Gpu {
-    pub fn new(cpu: Model) -> Self {
+    pub fn new(mut cpu: Model) -> Self {
+        let ctx = CudaContext::new(0).expect("GPU を開けない");
+        ctx.bind_to_thread().unwrap();
+        // 20〜23層の MXFP8 expert (4.2 GB) をページ固定メモリに写す。prefill で PCIe から非同期に送るため。
+        // CPU の計算もこちらを読むので、mmap した元のページは OS が追い出せる
+        for l in cpu.layers.iter_mut().filter(|l| l.experts.mx) {
+            let e = &mut l.experts;
+            (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
+        }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
         let src = format!("#define MAX_CTX_DEV {MAX_CTX}\n{}", include_str!("gpu.cu"));
         let ptx = compile_ptx_with_opts(src, CompileOptions { arch: Some("sm_120"), ..Default::default() })
             .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
-        let ctx = CudaContext::new(0).expect("GPU を開けない");
-        ctx.bind_to_thread().unwrap();
         // 既定のストリームは CUDA Graph に記録できない
         let stream = ctx.new_stream().unwrap();
         let module = ctx.load_module(ptx).unwrap();
@@ -266,9 +290,30 @@ impl Gpu {
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
+        let staging = [0; 2].map(|_| up.zeros(GROUP * (W13 + S13 + W2 + S2)));
         let (free, _) = result::mem_get_info().unwrap();
         eprintln!("GPU に {:.2} GB 載せた。残り {:.2} GB", up.total as f64 / 1e9, free as f64 / 1e9);
-        Self { cpu, _ctx: ctx, stream, _module: module, f, layers, slots, unembed, norm, output_query, b, pos: 0, graphs: RefCell::new(vec![]), capturing: Cell::new(false) }
+        let ev = || ctx.new_event(None).unwrap();
+        Self {
+            cpu,
+            copy: ctx.new_stream().unwrap(),
+            staging,
+            up_done: [ev(), ev()],
+            comp_done: [ev(), ev()],
+            _ctx: ctx.clone(),
+            stream,
+            _module: module,
+            f,
+            layers,
+            slots,
+            unembed,
+            norm,
+            output_query,
+            b,
+            pos: 0,
+            graphs: RefCell::new(vec![]),
+            capturing: Cell::new(false),
+        }
     }
 
     fn launch(&self, name: &str, grid: (u32, u32), block: u32, smem: u32, args: &[u64]) {
@@ -290,8 +335,8 @@ impl Gpu {
         self.stream.synchronize().unwrap();
     }
 
-    fn dtoh(&self, src: P, n: usize) -> Vec<f32> {
-        let mut v = vec![0.0; n];
+    fn dtoh<T: Default + Clone>(&self, src: P, n: usize) -> Vec<T> {
+        let mut v = vec![T::default(); n];
         // SAFETY: src は n 要素以上ある。転送が終わるまで待つ
         unsafe { result::memcpy_dtoh_async(&mut v, src, self.stream.cu_stream()) }.unwrap();
         self.stream.synchronize().unwrap();
@@ -355,7 +400,7 @@ impl Gpu {
             for (i, g) in self.graphs.borrow().iter().enumerate() {
                 g.launch().unwrap();
                 if i < N_LAYER - MXFP8_FROM {
-                    self.cpu_moe(MXFP8_FROM + i, 1);
+                    self.cpu_moe(MXFP8_FROM + i);
                 }
             }
         }
@@ -387,12 +432,73 @@ impl Gpu {
         }
     }
 
-    /// 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
-    fn cpu_moe(&self, il: usize, t: usize) {
-        let h = self.dtoh(self.b.h, t * D);
-        let l = &self.cpu.layers[il];
-        let y = if t == 1 { self.cpu.moe(l, &h) } else { self.cpu.moe_batch(l, &h) };
+    /// (生成) 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
+    fn cpu_moe(&self, il: usize) {
+        let h = self.dtoh(self.b.h, D);
+        let y = self.cpu.moe(&self.cpu.layers[il], &h);
         self.htod(self.b.y, &y);
+    }
+
+    /// (prefill) 20〜23層の MoE を、expert 8個ずつの組に分け、一部の組は PCIe で送って GPU で、残りは CPU で同時に計算する。
+    /// b.h を読み b.y に書く
+    fn hybrid_moe(&self, il: usize, t: usize) {
+        let (b, l, cl) = (&self.b, &self.layers[il], &self.cpu.layers[il]);
+        let n = t * TOP_K;
+        self.gemm(l.router, b.h, b.rl, 128, D, t);
+        k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
+        k!(self, "moe_sort", 1, 32, 0; b.ids, n as i32, b.order, b.off);
+        // SAFETY: yd は T*8*D 要素ある。CPU が受け持つ割り当ての行は 0 のまま moe_sum に渡る
+        unsafe { result::memset_d8_async(b.yd, 0, n * D * 4, self.stream.cu_stream()) }.unwrap();
+        let ids: Vec<i32> = self.dtoh(b.ids, n);
+        let wts: Vec<f32> = self.dtoh(b.wts, n);
+        let off: Vec<i32> = self.dtoh(b.off, N_EXP + 1);
+        let h: Vec<f32> = self.dtoh(b.h, t * D);
+
+        // GPU の手間は組の数、CPU の手間は割り当ての数に比例するとみて、割り当ての多い組から GPU に回す
+        let count = |g: usize| (off[(g + 1) * GROUP] - off[g * GROUP]) as f64;
+        let mut groups: Vec<usize> = (0..N_EXP / GROUP).filter(|&g| count(g) > 0.0).collect();
+        groups.sort_by(|&a, &b| count(b).total_cmp(&count(a)));
+        let mut cpu_cost = groups.iter().map(|&g| count(g)).sum::<f64>() * CPU_PER_ASSIGN;
+        let mut k = 0;
+        while k < groups.len() {
+            let next = cpu_cost - count(groups[k]) * CPU_PER_ASSIGN;
+            if ((k + 1) as f64 * GPU_PER_GROUP).max(next) >= (k as f64 * GPU_PER_GROUP).max(cpu_cost) {
+                break;
+            }
+            cpu_cost = next;
+            k += 1;
+        }
+        let mut on_gpu = [false; N_EXP];
+        for &g in &groups[..k] {
+            on_gpu[g * GROUP..(g + 1) * GROUP].fill(true);
+        }
+
+        let e = &cl.experts;
+        let at = [0, GROUP * W13, GROUP * (W13 + S13), GROUP * (W13 + S13 + W2)];
+        for (i, &g) in groups[..k].iter().enumerate() {
+            let (s, e0) = (i % 2, g * GROUP);
+            let st = self.staging[s];
+            // 置き場 s を前に使った計算が終わってから上書きする
+            self.copy.wait(&self.comp_done[s]).unwrap();
+            for ((src, size), at) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)].into_iter().zip(at) {
+                // SAFETY: src はページ固定メモリなので非同期に送れる。置き場は GROUP 個分ある
+                unsafe { result::memcpy_htod_async(st + at as u64, &src[e0 * size..(e0 + GROUP) * size], self.copy.cu_stream()) }.unwrap();
+            }
+            self.up_done[s].record(&self.copy).unwrap();
+            self.stream.wait(&self.up_done[s]).unwrap();
+            let [w13, s13, w2, s2] = at.map(|a| st + a as u64);
+            let (base, cnt) = (off[e0], off[e0 + GROUP] - off[e0]);
+            k!(self, "gemm_mxfp8_grouped", (2 * FF / 64, GROUP), 128, 0;
+                w13, s13, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, e0 as i32, b.gu);
+            k!(self, "situ_sel", (cnt as usize * FF).div_ceil(256), 256, 0; b.gu, b.act, b.order, base, cnt);
+            k!(self, "gemm_mxfp8_grouped", (D / 64, GROUP), 128, 0; w2, s2, D as i32, FF as i32, b.act, 1i32, b.order, b.off, e0 as i32, b.yd);
+            self.comp_done[s].record(&self.stream).unwrap();
+        }
+        // GPU が送って計算しているあいだに、残りの組を CPU で計算する
+        let y = self.cpu.moe_batch(cl, &h, &ids, &wts, |ex| !on_gpu[ex]);
+        self.htod(b.a, &y);
+        k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, t as i32);
+        k!(self, "add", (t * D).div_ceil(256), 256, 0; b.y, b.a, b.y, (t * D) as i32);
     }
 
     /// T トークン分のカーネル列を投げる。logits は最後のトークンの分だけ求める
@@ -505,11 +611,12 @@ impl Gpu {
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }
-            None => {
+            None if t == 1 => {
                 self.end();
-                self.cpu_moe(il, t);
+                self.cpu_moe(il);
                 self.begin();
             }
+            None => self.hybrid_moe(il, t),
         }
         self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t);
         k!(self, "add", (t * D).div_ceil(256), 256, 0; b.x, b.y, b.x, (t * D) as i32);
@@ -559,5 +666,15 @@ impl Uploader {
             self.stream.synchronize().unwrap();
         }
         p
+    }
+}
+
+/// ページ固定メモリに写す。解放はしない (プロセスの終わりまで使う)
+fn pin(src: &[u8]) -> &'static [u8] {
+    // SAFETY: 確保した領域に src を写し、その領域を指すスライスを返す
+    unsafe {
+        let p = result::malloc_host(src.len(), 0).expect("ページ固定メモリを確保できない") as *mut u8;
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+        std::slice::from_raw_parts(p, src.len())
     }
 }

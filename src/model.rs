@@ -420,16 +420,16 @@ impl Model {
         y
     }
 
-    /// T トークンぶんの MoE。expert ごとに割り当てられたトークンをまとめ、重みの1行を読むあいだに全トークンへ掛ける。
-    /// 割り当て a = トークン * 8 + k。
-    pub(crate) fn moe_batch(&self, l: &Layer, xs: &[f32]) -> Vec<f32> {
+    /// T トークンぶんの MoE のうち、mine(expert) が真の expert の分。expert ごとに割り当てられたトークンをまとめ、
+    /// 重みの行を読むあいだに全トークンへ掛ける。割り当て a = トークン * 8 + k の expert は ids[a]、重みは wts[a]
+    /// (route_scale 込み)。ルーティングは GPU が求めたものを受け取り、GPU と CPU で expert の分担が食い違わないようにする。
+    pub(crate) fn moe_batch(&self, l: &Layer, xs: &[f32], ids: &[i32], wts: &[f32], mine: impl Fn(usize) -> bool) -> Vec<f32> {
         let t = xs.len() / D;
         let e = &l.experts;
-        let routes: Vec<_> = (0..t).map(|tok| self.route(l, &xs[tok * D..][..D])).collect();
         let mut lists = vec![vec![]; N_EXP];
-        for (tok, (sel, _)) in routes.iter().enumerate() {
-            for (k, &ex) in sel.iter().enumerate() {
-                lists[ex].push(tok * TOP_K + k);
+        for (a, &ex) in ids.iter().enumerate() {
+            if mine(ex as usize) {
+                lists[ex as usize].push(a);
             }
         }
         let used: Vec<usize> = (0..N_EXP).filter(|&ex| !lists[ex].is_empty()).collect();
@@ -457,7 +457,7 @@ impl Model {
             let r0 = (task % chunks) * 64;
             block_gemm(e, e.w2, e.s2, ex * D + r0, FF, &lists[ex], |a| &act[a * FF..][..FF], |a, r, v| {
                 // SAFETY: 同上
-                unsafe { *out.at(a * D + r0 + r) = v * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K] };
+                unsafe { *out.at(a * D + r0 + r) = v * e.g2(ex) * wts[a] };
             });
         });
         let mut y = vec![0.0; t * D];

@@ -588,6 +588,54 @@ extern "C" __global__ void gemm_nvfp4_grouped(const u8* __restrict__ w, const u8
     }
 }
 
+// (prefill 用) MXFP8 の expert を、PCIe で送った置き場から読んで掛ける。置き場には expert e0 から gridDim.y 個が並ぶ
+// Y[a][r] = sum_c W_e[r][c] X[a / xdiv][c]。グリッドは (rows/64, expert 数)、128スレッド
+// E4M3 x 2^(s-127) は BF16 で誤差なく表せる
+extern "C" __global__ void gemm_mxfp8_grouped(const u8* __restrict__ w, const u8* __restrict__ s, int rows, int cols, const float* __restrict__ x, int xdiv,
+                                              const int* order, const int* off, int e0, float* y) {
+    __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
+    __shared__ int as[32];
+    int e = e0 + blockIdx.y, beg = off[e], end = off[e + 1];
+    if (beg == end) return;
+    int tid = threadIdx.x, r0 = blockIdx.x * 64;
+    const u8* we = w + (size_t)blockIdx.y * rows * cols;
+    const u8* se = s + (size_t)blockIdx.y * rows * (cols / 32);
+    for (int c0 = beg; c0 < end; c0 += 32) {
+        if (tid < 32) as[tid] = c0 + tid < end ? order[c0 + tid] : -1;
+        float acc[4][4] = {};
+        for (int k0 = 0; k0 < cols; k0 += 32) {
+            __syncthreads();
+            {
+                int r = tid / 2, c = (tid % 2) * 16;
+                uint4 pk = *(const uint4*)(we + (size_t)(r0 + r) * cols + k0 + c);
+                float sc = __uint_as_float((unsigned)se[(size_t)(r0 + r) * (cols / 32) + (k0 + c) / 32] << 23);
+                unsigned u[4] = {pk.x, pk.y, pk.z, pk.w}, v[8];
+                for (int i = 0; i < 4; i++) {
+                    v[2 * i] = pack2(e4m3(u[i]) * sc, e4m3(u[i] >> 8) * sc);
+                    v[2 * i + 1] = pack2(e4m3(u[i] >> 16) * sc, e4m3(u[i] >> 24) * sc);
+                }
+                *(uint4*)&Ws[r * TS + c] = make_uint4(v[0], v[1], v[2], v[3]);
+                *(uint4*)&Ws[r * TS + c + 8] = make_uint4(v[4], v[5], v[6], v[7]);
+            }
+            load_x(Xs, x, cols, k0, [&](int j) { return as[j] >= 0 ? as[j] / xdiv : -1; });
+            __syncthreads();
+            mma_tile(Ws, Xs, acc);
+        }
+        store_y(acc, r0, [&](int r, int c, float v) {
+            if (as[c] >= 0) y[(size_t)as[c] * rows + r] = v;
+        });
+        __syncthreads();
+    }
+}
+
+// (prefill 用) order[base..base+n] の割り当てだけ SITU をかける
+extern "C" __global__ void situ_sel(const float* gu, float* act, const int* order, int base, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * FF) return;
+    int a = order[base + i / FF], j = i % FF;
+    act[(size_t)a * FF + j] = situ(gu[(size_t)a * 2 * FF + 2 * j], gu[(size_t)a * 2 * FF + 2 * j + 1]);
+}
+
 // (prefill 用) gate/up が交互に並ぶ [n][2FF] に SITU をかけて [n][FF] にする
 extern "C" __global__ void situ_rows(const float* gu, float* act, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
