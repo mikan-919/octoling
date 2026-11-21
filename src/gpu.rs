@@ -1,5 +1,7 @@
 //! GPU (CUDA) 版の順伝播。計算の順序は model.rs の CPU 版と同じ。
 //! 20〜23層の MXFP8 expert は VRAM に載らないので CPU で計算する。埋め込み表も CPU に置く。
+//! 生成 (forward) は1トークンずつで、カーネル列を CUDA Graph に記録して再生する。
+//! prefill は最大 TMAX トークンをまとめて処理し、重みを読む回数をトークン数で割る。
 
 use crate::model::{self, BLOCK, CORE, D, EXTENT, FF, GLOBAL_LAYERS, Layer, MXFP8_FROM, Model, N_LAYER, N_SLOT, PASSES, TOP_K, VOCAB, W};
 use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaStream, result, sys};
@@ -13,6 +15,12 @@ use std::sync::Arc;
 /// attn カーネルはスコアを共有メモリに置くので、48KB に収まる長さにもする。
 /// ponytail: 文脈長の上限。伸ばすなら KV を BF16 にするか、スコアを分割して求める
 pub const MAX_CTX: usize = 2048;
+
+/// prefill で一度に処理するトークン数の上限
+pub const TMAX: usize = 256;
+
+/// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
+const RING: usize = EXTENT + TMAX;
 
 type P = u64; // デバイスのポインタ
 
@@ -35,9 +43,28 @@ impl Arg for f32 {
     }
 }
 
+trait Grid {
+    fn dims(self) -> (u32, u32);
+}
+impl Grid for usize {
+    fn dims(self) -> (u32, u32) {
+        (self as u32, 1)
+    }
+}
+impl Grid for i32 {
+    fn dims(self) -> (u32, u32) {
+        (self as u32, 1)
+    }
+}
+impl Grid for (usize, usize) {
+    fn dims(self) -> (u32, u32) {
+        (self.0 as u32, self.1 as u32)
+    }
+}
+
 macro_rules! k {
     ($g:expr, $name:literal, $grid:expr, $block:expr, $smem:expr; $($a:expr),* $(,)?) => {
-        $g.launch($name, $grid as u32, $block as u32, $smem as u32, &[$(Arg::bits($a)),*])
+        $g.launch($name, Grid::dims($grid), $block as u32, $smem as u32, &[$(Arg::bits($a)),*])
     };
 }
 
@@ -76,15 +103,15 @@ struct GSlot {
     hist: [P; 4], // k, v, attn 出力, mlp 出力
 }
 
-// 1トークン分の作業領域
+// TMAX トークン分の作業領域。並びは gpu.cu の先頭に書いたとおり [種類][T][要素]
 struct Bufs {
     x: P,
-    pos: P, // i32。カーネルはここから位置を読む
-    blocks: P, // [8][D]
+    pos: P,    // i32。バッチの先頭トークンの位置。カーネルはここから読む
+    blocks: P, // [8][T][D]
     prelude: P,
-    bank: P, // [2][D]
-    msgs: P, // [4][D]
-    inp: P,  // [3][D]
+    bank: P, // [2][T][D]
+    msgs: P, // [4][T][D]
+    inp: P,  // [3][T][D]
     qx: P,
     kx: P,
     vx: P,
@@ -100,14 +127,15 @@ struct Bufs {
     rl: P,
     ids: P,
     wts: P,
-    act: P,
+    act: P, // [T*8][FF]
+    gu: P,  // [T*8][2FF]
+    yd: P,  // [T*8][D]
+    order: P,
+    off: P,
     logits: P,
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
-const R_OFF: usize = 3072;
-const GATE_OFF: usize = 3072 + 384;
-const SINK_OFF: usize = 3072 + 384 + 3072;
 
 pub struct Gpu {
     cpu: &'static Model,
@@ -127,11 +155,18 @@ pub struct Gpu {
     capturing: Cell<bool>,
 }
 
-const KERNELS: [&str; 13] = ["mv_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4"];
+const KERNELS: [&str; 18] = [
+    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
+    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum",
+];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
     // SAFETY: u16/f32/u8 の配列をバイト列として読むだけ
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
+}
+
+fn f4(n: usize) -> u64 {
+    (n * 4) as u64
 }
 
 impl Gpu {
@@ -146,7 +181,7 @@ impl Gpu {
         let module = ctx.load_module(ptx).unwrap();
         let f = KERNELS.iter().map(|&n| (n, module.load_function(n).unwrap())).collect();
 
-        let mut up = Uploader::new(&ctx, &stream);
+        let mut up = Uploader::new(&stream);
         let f32s = |v: &[f32], up: &mut Uploader| up.bytes(as_bytes(v));
         let bfs = |parts: &[W], up: &mut Uploader| up.bytes(as_bytes(&parts.concat()));
         let flat = |c: &[[f32; 4]]| c.iter().flatten().copied().collect::<Vec<f32>>();
@@ -185,7 +220,7 @@ impl Gpu {
             .collect();
         let slots = (0..N_SLOT)
             .map(|s| {
-                let rows = if GLOBAL_LAYERS.contains(&phys(s)) { MAX_CTX } else { EXTENT };
+                let rows = if GLOBAL_LAYERS.contains(&phys(s)) { MAX_CTX } else { RING };
                 GSlot {
                     kc: up.zeros(rows * 1024 * 4),
                     vc: up.zeros(rows * 1024 * 4),
@@ -194,44 +229,50 @@ impl Gpu {
             })
             .collect();
         let fz = |n: usize, up: &mut Uploader| up.zeros(n * 4);
+        let t = TMAX;
         let b = Bufs {
-            x: fz(D, &mut up),
+            x: fz(t * D, &mut up),
             pos: fz(1, &mut up),
-            blocks: fz(8 * D, &mut up),
-            prelude: fz(D, &mut up),
-            bank: fz(2 * D, &mut up),
-            msgs: fz(4 * D, &mut up),
-            inp: fz(3 * D, &mut up),
-            qx: fz(QX, &mut up),
-            kx: fz(1024 + 32, &mut up),
-            vx: fz(1024 + 32, &mut up),
-            kp: fz(1024, &mut up),
-            vp: fz(1024, &mut up),
-            o: fz(3072, &mut up),
-            a: fz(D, &mut up),
-            h: fz(D, &mut up),
-            y: fz(D, &mut up),
-            cat: fz(2 * D, &mut up),
-            g: fz(64, &mut up),
-            gf: fz(2 * D, &mut up),
-            rl: fz(128, &mut up),
-            ids: fz(TOP_K, &mut up),
-            wts: fz(TOP_K, &mut up),
-            act: fz(TOP_K * FF, &mut up),
+            blocks: fz(8 * t * D, &mut up),
+            prelude: fz(t * D, &mut up),
+            bank: fz(2 * t * D, &mut up),
+            msgs: fz(4 * t * D, &mut up),
+            inp: fz(3 * t * D, &mut up),
+            qx: fz(t * QX, &mut up),
+            kx: fz(t * (1024 + 32), &mut up),
+            vx: fz(t * (1024 + 32), &mut up),
+            kp: fz(t * 1024, &mut up),
+            vp: fz(t * 1024, &mut up),
+            o: fz(t * 3072, &mut up),
+            a: fz(t * D, &mut up),
+            h: fz(t * D, &mut up),
+            y: fz(t * D, &mut up),
+            cat: fz(t * 2 * D, &mut up),
+            g: fz(t * 64, &mut up),
+            gf: fz(t * 2 * D, &mut up),
+            rl: fz(t * 128, &mut up),
+            ids: fz(t * TOP_K, &mut up),
+            wts: fz(t * TOP_K, &mut up),
+            act: fz(t * TOP_K * FF, &mut up),
+            gu: fz(t * TOP_K * 2 * FF, &mut up),
+            yd: fz(t * TOP_K * D, &mut up),
+            order: fz(t * TOP_K, &mut up),
+            off: fz(129, &mut up),
             logits: fz(201024, &mut up),
         };
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
-        eprintln!("GPU に {:.2} GB 載せた", up.total as f64 / 1e9);
+        let (free, _) = result::mem_get_info().unwrap();
+        eprintln!("GPU に {:.2} GB 載せた。残り {:.2} GB", up.total as f64 / 1e9, free as f64 / 1e9);
         Self { cpu, _ctx: ctx, stream, _module: module, f, layers, slots, unembed, norm, output_query, b, pos: 0, graphs: RefCell::new(vec![]), capturing: Cell::new(false) }
     }
 
-    fn launch(&self, name: &str, grid: u32, block: u32, smem: u32, args: &[u64]) {
+    fn launch(&self, name: &str, grid: (u32, u32), block: u32, smem: u32, args: &[u64]) {
         let mut vals = args.to_vec();
         let mut ptrs: Vec<*mut c_void> = vals.iter_mut().map(|v| v as *mut u64 as *mut c_void).collect();
         // SAFETY: 引数の数と型は gpu.cu の宣言に合わせてある。ポインタはどれも 64bit
-        unsafe { result::launch_kernel(self.f[name].cu_function(), (grid, 1, 1), (block, 1, 1), smem, self.stream.cu_stream(), &mut ptrs) }
+        unsafe { result::launch_kernel(self.f[name].cu_function(), (grid.0, grid.1, 1), (block, 1, 1), smem, self.stream.cu_stream(), &mut ptrs) }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 
@@ -240,7 +281,7 @@ impl Gpu {
         unsafe { result::memcpy_dtod_async(dst, src, floats * 4, self.stream.cu_stream()) }.unwrap();
     }
 
-    fn htod(&self, dst: P, src: &[f32]) {
+    fn htod<T>(&self, dst: P, src: &[T]) {
         // SAFETY: dst は src 以上の長さで確保してある。転送が終わるまで待つ
         unsafe { result::memcpy_htod_async(dst, src, self.stream.cu_stream()) }.unwrap();
         self.stream.synchronize().unwrap();
@@ -254,49 +295,78 @@ impl Gpu {
         v
     }
 
-    fn mv(&self, w: P, x: P, y: P, rows: usize, cols: usize) {
-        k!(self, "mv_bf16", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32);
+    /// Y[t] = W X[t]。T = 1 は行列×ベクトル、それより多ければタイル分割した行列積
+    fn gemm(&self, w: P, x: P, y: P, rows: usize, cols: usize, t: usize) {
+        if t == 1 {
+            k!(self, "mv_bf16", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32);
+        } else {
+            k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
+        }
     }
 
-    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P) {
-        k!(self, "mix", nq, 256, 0; blocks, nb as i32, cur, queries, out);
+    #[allow(clippy::too_many_arguments)]
+    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize) {
+        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32);
     }
 
-    fn control(&self, cur: P, msg: P, c: &GCtrl) {
+    fn control(&self, cur: P, msg: P, c: &GCtrl, t: usize) {
         let b = &self.b;
-        k!(self, "norm2", 2, 256, 0; cur, msg, b.cat);
-        self.mv(c.down, b.cat, b.g, 64, 2 * D);
-        self.mv(c.gf, b.g, b.gf, 2 * D, 64);
-        k!(self, "control", D.div_ceil(256), 256, 0; cur, msg, b.gf);
+        k!(self, "norm2", (2, t), 256, 0; cur, msg, b.cat);
+        self.gemm(c.down, b.cat, b.g, 64, 2 * D, t);
+        self.gemm(c.gf, b.g, b.gf, 2 * D, 64, t);
+        k!(self, "control", (D.div_ceil(256), t), 256, 0; cur, msg, b.gf);
     }
 
-    fn conv(&self, cur: P, w: P, dyn_: P, hist: P, out: P, ch: usize, cph: usize) {
-        k!(self, "conv", ch.div_ceil(256), 256, 0; cur, w, dyn_, hist, out, ch as i32, cph as i32);
+    #[allow(clippy::too_many_arguments)]
+    fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize) {
+        let d = dyn_.map_or(-1, |d| d as i32);
+        k!(self, "conv", ch.div_ceil(256), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32);
+    }
+
+    /// トークンの埋め込みと先頭の位置を GPU に送る
+    fn inputs(&self, tokens: &[u32]) {
+        assert!(self.pos + tokens.len() <= MAX_CTX, "文脈長の上限 {MAX_CTX} を超えた");
+        let e: Vec<f32> = tokens
+            .iter()
+            .flat_map(|&tok| {
+                let mut e = model::bf_row(self.cpu.embed, tok as usize, D);
+                model::rmsnorm(&mut e, Some(self.cpu.embed_norm));
+                e
+            })
+            .collect();
+        self.htod(self.b.x, &e);
+        self.htod(self.b.pos, &[self.pos as i32]);
     }
 
     /// 1トークンを処理して、語彙の logits を返す。
     /// 最初のトークンでカーネル列を CUDA Graph に記録し、以降は再生する。トレース中は記録せず毎回カーネルを投げる。
     pub fn forward(&mut self, token: u32) -> Vec<f32> {
-        assert!(self.pos < MAX_CTX, "文脈長の上限 {MAX_CTX} を超えた");
-        let mut e = model::bf_row(self.cpu.embed, token as usize, D);
-        model::rmsnorm(&mut e, Some(self.cpu.embed_norm));
-        self.htod(self.b.x, &e);
-        // SAFETY: b.pos は i32 1個ぶん確保してある。転送が終わるまで待つ
-        unsafe { result::memcpy_htod_async(self.b.pos, &[self.pos as i32], self.stream.cu_stream()) }.unwrap();
+        self.inputs(&[token]);
         if self.graphs.borrow().is_empty() || model::tracing() {
             self.capturing.set(!model::tracing());
             self.begin();
-            self.record();
+            self.record(1);
             self.end();
+            self.capturing.set(false);
         } else {
             for (i, g) in self.graphs.borrow().iter().enumerate() {
                 g.launch().unwrap();
                 if i < N_LAYER - MXFP8_FROM {
-                    self.cpu_moe(MXFP8_FROM + i);
+                    self.cpu_moe(MXFP8_FROM + i, 1);
                 }
             }
         }
         self.pos += 1;
+        self.dtoh(self.b.logits, VOCAB)
+    }
+
+    /// プロンプトを TMAX トークンずつまとめて処理し、最後のトークンの logits を返す。
+    pub fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        for chunk in tokens.chunks(TMAX) {
+            self.inputs(chunk);
+            self.record(chunk.len());
+            self.pos += chunk.len();
+        }
         self.dtoh(self.b.logits, VOCAB)
     }
 
@@ -315,113 +385,128 @@ impl Gpu {
     }
 
     /// 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
-    fn cpu_moe(&self, il: usize) {
-        let h = self.dtoh(self.b.h, D);
-        let y = self.cpu.moe(&self.cpu.layers[il], &h);
+    fn cpu_moe(&self, il: usize, t: usize) {
+        let h = self.dtoh(self.b.h, t * D);
+        let l = &self.cpu.layers[il];
+        let y = if t == 1 { self.cpu.moe(l, &h) } else { self.cpu.moe_batch(l, &h) };
         self.htod(self.b.y, &y);
     }
 
-    fn record(&self) {
+    /// T トークン分のカーネル列を投げる。logits は最後のトークンの分だけ求める
+    fn record(&self, t: usize) {
         let b = &self.b;
+        let slab = |i: usize| f4(i * t * D); // [種類][T][D] の i 番目
         let mut nb = 0;
         for il in 0..CORE.0 {
-            self.layer(il, il, il, &mut nb, false);
+            self.layer(il, il, il, &mut nb, false, t);
         }
-        self.copy(b.prelude, b.x, D);
+        self.copy(b.prelude, b.x, t * D);
         let prelude_nb = nb;
         for pass in 0..PASSES {
             if pass > 0 {
                 // 前の周の、最初のコアブロックより後のブロックと出力
                 assert_eq!(nb, prelude_nb + 2);
-                self.copy(b.bank, b.blocks + ((prelude_nb + 1) * D * 4) as u64, D);
-                self.copy(b.bank + (D * 4) as u64, b.x, D);
-                self.copy(b.x, b.prelude, D);
+                self.copy(b.bank, b.blocks + slab(prelude_nb + 1), t * D);
+                self.copy(b.bank + slab(1), b.x, t * D);
+                self.copy(b.x, b.prelude, t * D);
                 nb = prelude_nb;
             }
             for ip in CORE.0..CORE.1 {
                 let slot = if pass == 0 { ip } else { N_LAYER + (pass - 1) * (CORE.1 - CORE.0) + ip - CORE.0 };
                 if pass > 0 {
-                    self.mix(b.bank, 1, b.bank + (D * 4) as u64, self.layers[ip].msg_query, 4, b.msgs);
+                    self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t);
                 }
-                self.layer(ip, ip, slot, &mut nb, pass > 0);
+                self.layer(ip, ip, slot, &mut nb, pass > 0, t);
             }
         }
         for il in CORE.1..N_LAYER {
-            self.layer(il, il, il, &mut nb, false);
+            self.layer(il, il, il, &mut nb, false, t);
         }
-        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h);
-        k!(self, "rmsnorm", 1, 256, 0; b.h, self.norm, b.h, D as i32, 0i32);
-        self.mv(self.unembed, b.h, b.logits, 201024, D);
+        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t);
+        let last = b.h + f4((t - 1) * D);
+        k!(self, "rmsnorm", 1, 256, 0; last, self.norm, last, D as i32, 0i32, 1i32);
+        self.gemm(self.unembed, last, b.logits, 201024, D, 1);
         k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32);
     }
 
-    fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool, t: usize) {
         let (l, s, b) = (&self.layers[il], &self.slots[slot], &self.b);
-        let fd = |i: usize| (i * D * 4) as u64; // D 要素 i 本ぶんのバイト数
+        let slab = |i: usize| f4(i * t * D);
+        let ti = t as i32;
         // attention の入力: SWA は1本、global は Q, K, V に1本ずつ
         if il > 0 {
-            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp);
+            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t);
         } else {
-            self.copy(b.inp, b.x, D);
+            self.copy(b.inp, b.x, t * D);
         }
         let separate = l.global || msgs;
         if !l.global && msgs {
-            self.copy(b.inp + fd(1), b.inp, D);
-            self.copy(b.inp + fd(2), b.inp, D);
+            self.copy(b.inp + slab(1), b.inp, t * D);
+            self.copy(b.inp + slab(2), b.inp, t * D);
         }
         if msgs {
             for j in 0..3 {
-                self.control(b.inp + fd(j), b.msgs + fd(j), &l.ctrl[j]);
+                self.control(b.inp + slab(j), b.msgs + slab(j), &l.ctrl[j], t);
             }
         }
         let n_in = if separate { 3 } else { 1 };
-        k!(self, "rmsnorm", n_in, 256, 0; b.inp, l.norms, b.inp, D as i32, if l.global { D as i32 } else { 0i32 });
-        let (xq, xk, xv) = if separate { (b.inp, b.inp + fd(1), b.inp + fd(2)) } else { (b.inp, b.inp, b.inp) };
+        k!(self, "rmsnorm", n_in * t, 256, 0; b.inp, l.norms, b.inp, D as i32, if l.global { D as i32 } else { 0i32 }, ti);
+        let (xq, xk, xv) = if separate { (b.inp, b.inp + slab(1), b.inp + slab(2)) } else { (b.inp, b.inp, b.inp) };
 
         let nk = if l.global { 1024 + 32 } else { 1024 };
-        self.mv(l.wq, xq, b.qx, QX, D);
-        self.mv(l.wk, xk, b.kx, nk, D);
-        self.mv(l.wv, xv, b.vx, nk, D);
-        let (kd, vd) = if l.global { (b.kx + 4096, b.vx + 4096) } else { (0, 0) };
-        self.conv(b.kx, l.k_conv, kd, s.hist[0], b.kp, 1024, 128);
-        self.conv(b.vx, l.v_conv, vd, s.hist[1], b.vp, 1024, 128);
-        let f4 = |n: usize| (n * 4) as u64;
-        k!(self, "qkv_post", 64, 128, 0; b.qx, b.qx + f4(R_OFF), b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, l.global as i32, s.kc, s.vc);
+        self.gemm(l.wq, xq, b.qx, QX, D, t);
+        self.gemm(l.wk, xk, b.kx, nk, D, t);
+        self.gemm(l.wv, xv, b.vx, nk, D, t);
+        let dyn_ = l.global.then_some(1024);
+        self.conv(b.kx, nk, l.k_conv, dyn_, s.hist[0], b.kp, 1024, 1024, 128, t);
+        self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t);
+        let ring = if l.global { 0 } else { RING as i32 };
+        k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
         let smem = (EXTENT + MAX_CTX) * 4;
-        k!(self, "attn", 24, 128, smem; b.qx, b.qx + f4(R_OFF), b.qx + f4(SINK_OFF), s.kc, s.vc, l.rel_proj, b.qx + f4(GATE_OFF), b.o,
-            b.pos, (!l.global) as i32);
-        self.mv(l.wo, b.o, b.a, D, 3072);
-        self.conv(b.a, l.attn_conv, 0, s.hist[2], b.a, D, D);
+        k!(self, "attn", (24, t), 128, smem; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring);
+        self.gemm(l.wo, b.o, b.a, D, 3072, t);
+        self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.a, D, D, D, t);
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む
         if ip % BLOCK == 0 {
-            self.copy(b.blocks + fd(*nb), b.x, D);
+            self.copy(b.blocks + slab(*nb), b.x, t * D);
             *nb += 1;
-            self.copy(b.x, b.a, D);
+            self.copy(b.x, b.a, t * D);
         } else {
-            k!(self, "add", D.div_ceil(256), 256, 0; b.x, b.a, b.x, D as i32);
+            k!(self, "add", (t * D).div_ceil(256), 256, 0; b.x, b.a, b.x, (t * D) as i32);
         }
 
-        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h);
+        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t);
         if msgs {
-            self.control(b.h, b.msgs + fd(3), &l.ctrl[3]);
+            self.control(b.h, b.msgs + slab(3), &l.ctrl[3], t);
         }
-        k!(self, "rmsnorm", 1, 256, 0; b.h, l.mlp_norm, b.h, D as i32, 0i32);
+        k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, D as i32, 0i32, ti);
         match l.experts {
             Some([w13, s13, a13, w2, s2, a2]) => {
-                self.mv(l.router, b.h, b.rl, 128, D);
-                k!(self, "topk", 1, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
-                k!(self, "moe_up_nvfp4", (TOP_K * FF * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act);
-                k!(self, "moe_down_nvfp4", (D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y);
+                self.gemm(l.router, b.h, b.rl, 128, D, t);
+                k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
+                if t == 1 {
+                    k!(self, "moe_up_nvfp4", (TOP_K * FF * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act);
+                    k!(self, "moe_down_nvfp4", (D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y);
+                } else {
+                    let n = (t * TOP_K) as i32;
+                    k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
+                    k!(self, "gemm_nvfp4_grouped", (2 * FF / 64, 128), 256, 0;
+                        w13, s13, a13, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, b.gu);
+                    k!(self, "situ_rows", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, n);
+                    k!(self, "gemm_nvfp4_grouped", (D / 64, 128), 256, 0; w2, s2, a2, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
+                    k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
+                }
             }
             None => {
                 self.end();
-                self.cpu_moe(il);
+                self.cpu_moe(il, t);
                 self.begin();
             }
         }
-        self.conv(b.y, l.mlp_conv, 0, s.hist[3], b.y, D, D);
-        k!(self, "add", D.div_ceil(256), 256, 0; b.x, b.y, b.x, D as i32);
-        if model::tracing() {
+        self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t);
+        k!(self, "add", (t * D).div_ceil(256), 256, 0; b.x, b.y, b.x, (t * D) as i32);
+        if model::tracing() && t == 1 {
             model::trace(slot, &self.dtoh(b.x, D));
         }
     }
@@ -441,7 +526,7 @@ struct Uploader {
 const PIN: usize = 64 << 20;
 
 impl Uploader {
-    fn new(_ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Self {
+    fn new(stream: &Arc<CudaStream>) -> Self {
         // SAFETY: 確保に失敗したらエラーで止まる。解放はしない (プロセスの終わりまで使う)
         let pin = unsafe { result::malloc_host(PIN, 0) }.expect("ページ固定メモリを確保できない") as *mut u8;
         Self { stream: stream.clone(), pin, total: 0 }

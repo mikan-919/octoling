@@ -386,12 +386,18 @@ impl Model {
         add(&cur, &m)
     }
 
-    pub(crate) fn moe(&self, l: &Layer, x: &[f32]) -> Vec<f32> {
+    /// ルーター: 上位8個の expert と、正規化して route_scale を掛けた重み
+    fn route(&self, l: &Layer, x: &[f32]) -> ([usize; TOP_K], [f32; TOP_K]) {
         let p: Vec<f32> = mv(l.router, x).iter().map(|&z| sigmoid(z)).collect();
         let mut idx: Vec<usize> = (0..N_EXP).collect();
         idx.sort_by(|&a, &b| (p[b] + l.router_bias[b]).total_cmp(&(p[a] + l.router_bias[a])));
-        let sel = &idx[..TOP_K];
+        let sel: [usize; TOP_K] = idx[..TOP_K].try_into().unwrap();
         let sum: f32 = sel.iter().map(|&e| p[e]).sum::<f32>() + 1e-20;
+        (sel, sel.map(|e| p[e] / sum * ROUTE_SCALE))
+    }
+
+    pub(crate) fn moe(&self, l: &Layer, x: &[f32]) -> Vec<f32> {
+        let (sel, wts) = self.route(l, x);
         let e = &l.experts;
         // 8 expert の行をまとめて分割し、全スレッドに配る
         let mut gu = vec![0.0; TOP_K * 2 * FF];
@@ -399,16 +405,11 @@ impl Model {
             for (i, o) in o.iter_mut().enumerate() {
                 let r = c * 64 + i;
                 let ex = sel[r / (2 * FF)];
-                let g = if e.mx { 1.0 } else { e.a13[ex] / 2688.0 };
-                *o = e.dot(e.w13, e.s13, ex * 2 * FF + r % (2 * FF), x) * g;
+                *o = e.dot(e.w13, e.s13, ex * 2 * FF + r % (2 * FF), x) * e.g13(ex);
             }
         });
-        // w13 の行は gate と up が交互に並ぶ
-        let act: Vec<f32> = gu
-            .chunks(2)
-            .map(|c| SITU_BETA * (c[0] / SITU_BETA).tanh() * sigmoid(c[0]) * SITU_LINEAR * (c[1] / SITU_LINEAR).tanh())
-            .collect();
-        let g2: Vec<f32> = sel.iter().map(|&ex| p[ex] / sum * ROUTE_SCALE * if e.mx { 1.0 } else { e.a2[ex] / 2688.0 }).collect();
+        let act = situ_pairs(&gu);
+        let g2: Vec<f32> = (0..TOP_K).map(|k| wts[k] * e.g2(sel[k])).collect();
         let mut y = vec![0.0; D];
         crate::pool::chunks_mut(&mut y, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
@@ -418,6 +419,67 @@ impl Model {
         });
         y
     }
+
+    /// T トークンぶんの MoE。expert ごとに割り当てられたトークンをまとめ、重みの1行を読むあいだに全トークンへ掛ける。
+    /// 割り当て a = トークン * 8 + k。
+    pub(crate) fn moe_batch(&self, l: &Layer, xs: &[f32]) -> Vec<f32> {
+        let t = xs.len() / D;
+        let e = &l.experts;
+        let routes: Vec<_> = (0..t).map(|tok| self.route(l, &xs[tok * D..][..D])).collect();
+        let mut lists = vec![vec![]; N_EXP];
+        for (tok, (sel, _)) in routes.iter().enumerate() {
+            for (k, &ex) in sel.iter().enumerate() {
+                lists[ex].push(tok * TOP_K + k);
+            }
+        }
+        let used: Vec<usize> = (0..N_EXP).filter(|&ex| !lists[ex].is_empty()).collect();
+        let n_assign = t * TOP_K;
+
+        let mut gu = vec![0.0; n_assign * 2 * FF];
+        let out = Shared(gu.as_mut_ptr());
+        let chunks = 2 * FF / 64;
+        crate::pool::run(used.len() * chunks, &|task| {
+            let ex = used[task / chunks];
+            for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
+                for &a in &lists[ex] {
+                    let v = e.dot(e.w13, e.s13, ex * 2 * FF + row, &xs[a / TOP_K * D..][..D]) * e.g13(ex);
+                    // SAFETY: (expert, 行) ごとに書く場所は重ならない
+                    unsafe { *out.at(a * 2 * FF + row) = v };
+                }
+            }
+        });
+        let act = situ_pairs(&gu);
+
+        let mut yd = vec![0.0; n_assign * D];
+        let out = Shared(yd.as_mut_ptr());
+        let chunks = D / 64;
+        crate::pool::run(used.len() * chunks, &|task| {
+            let ex = used[task / chunks];
+            for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
+                for &a in &lists[ex] {
+                    let v = e.dot(e.w2, e.s2, ex * D + row, &act[a * FF..][..FF]) * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K];
+                    // SAFETY: 同上
+                    unsafe { *out.at(a * D + row) = v };
+                }
+            }
+        });
+        (0..t * D).map(|i| (0..TOP_K).map(|k| yd[(i / D * TOP_K + k) * D + i % D]).sum()).collect()
+    }
+}
+
+/// スレッド間で、重ならない場所に書くためのポインタ
+struct Shared(*mut f32);
+unsafe impl Sync for Shared {}
+impl Shared {
+    fn at(&self, i: usize) -> *mut f32 {
+        // SAFETY: 呼び出し側が範囲内を指定する
+        unsafe { self.0.add(i) }
+    }
+}
+
+/// gate と up が交互に並ぶ列に SITU をかける
+fn situ_pairs(gu: &[f32]) -> Vec<f32> {
+    gu.chunks(2).map(|c| SITU_BETA * (c[0] / SITU_BETA).tanh() * sigmoid(c[0]) * SITU_LINEAR * (c[1] / SITU_LINEAR).tanh()).collect()
 }
 
 fn bf16(x: u16) -> f32 {
@@ -452,6 +514,15 @@ fn mv(w: W, x: &[f32]) -> Vec<f32> {
 }
 
 impl Experts {
+    /// gate/up と down の大域スケール。MXFP8 は 1
+    fn g13(&self, ex: usize) -> f32 {
+        if self.mx { 1.0 } else { self.a13[ex] / 2688.0 }
+    }
+
+    fn g2(&self, ex: usize) -> f32 {
+        if self.mx { 1.0 } else { self.a2[ex] / 2688.0 }
+    }
+
     /// 行 row と x の内積。NVFP4 は amax の大域スケールを掛ける前の値を返す。
     fn dot(&self, w: &[u8], s: &[u8], row: usize, x: &[f32]) -> f32 {
         let n = x.len();
