@@ -3,6 +3,9 @@
 
 pub const BLOCK: usize = 16;
 
+/// E4M3 の全256値。
+pub static E4M3: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| std::array::from_fn(|i| e4m3(i as u8)));
+
 pub const E2M1: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
 
 /// OCP の E4M3 (fn): 指数バイアス 7、無限大なし、0x7f/0xff が NaN。

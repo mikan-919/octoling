@@ -1,9 +1,8 @@
 //! Inkling 2 Mini のテキスト部の順伝播。1トークンずつ処理する。
 //! 仕様は llama.cpp の src/models/inkling2.cpp と inkling2-loop.cpp に合わせている。
 
-use crate::nvfp4::{E2M1, e4m3};
+use crate::kernels::{dot_bf16, dot_mxfp8, dot_nvfp4};
 use crate::st::SafeTensors;
-use rayon::prelude::*;
 
 pub const D: usize = 2304;
 const N_LAYER: usize = 24;
@@ -341,7 +340,7 @@ impl Model {
         let rel_proj = bf_vec(l.rel_proj);
         let scale = 1.0 / (HD as f32).sqrt();
         let mut o = vec![0.0; N_HEAD * HD];
-        o.par_chunks_mut(HD).enumerate().for_each(|(h, oh)| {
+        crate::pool::chunks_mut(&mut o, HD, |h, oh| {
             let qh = &q[h * HD..][..HD];
             let rh = &r[h * N_REL..][..N_REL];
             let kvh = h / (N_HEAD / N_KV);
@@ -394,28 +393,29 @@ impl Model {
         let sel = &idx[..TOP_K];
         let sum: f32 = sel.iter().map(|&e| p[e]).sum::<f32>() + 1e-20;
         let e = &l.experts;
-        let outs: Vec<Vec<f32>> = sel
-            .par_iter()
-            .map(|&ex| {
-                let w = p[ex] / sum * ROUTE_SCALE;
-                let g13 = if e.mx { 1.0 } else { e.a13[ex] / 2688.0 };
-                let mut gu = vec![0.0; 2 * FF];
-                for (row, out) in gu.iter_mut().enumerate() {
-                    *out = e.dot(e.w13, e.s13, ex * 2 * FF + row, x) * g13;
-                }
-                // w13 の行は gate と up が交互に並ぶ
-                let act: Vec<f32> = gu
-                    .chunks(2)
-                    .map(|c| SITU_BETA * (c[0] / SITU_BETA).tanh() * sigmoid(c[0]) * SITU_LINEAR * (c[1] / SITU_LINEAR).tanh())
-                    .collect();
-                let g2 = if e.mx { w } else { e.a2[ex] / 2688.0 * w };
-                (0..D).map(|row| e.dot(e.w2, e.s2, ex * D + row, &act) * g2).collect()
-            })
+        // 8 expert の行をまとめて分割し、全スレッドに配る
+        let mut gu = vec![0.0; TOP_K * 2 * FF];
+        crate::pool::chunks_mut(&mut gu, 64, |c, o| {
+            for (i, o) in o.iter_mut().enumerate() {
+                let r = c * 64 + i;
+                let ex = sel[r / (2 * FF)];
+                let g = if e.mx { 1.0 } else { e.a13[ex] / 2688.0 };
+                *o = e.dot(e.w13, e.s13, ex * 2 * FF + r % (2 * FF), x) * g;
+            }
+        });
+        // w13 の行は gate と up が交互に並ぶ
+        let act: Vec<f32> = gu
+            .chunks(2)
+            .map(|c| SITU_BETA * (c[0] / SITU_BETA).tanh() * sigmoid(c[0]) * SITU_LINEAR * (c[1] / SITU_LINEAR).tanh())
             .collect();
+        let g2: Vec<f32> = sel.iter().map(|&ex| p[ex] / sum * ROUTE_SCALE * if e.mx { 1.0 } else { e.a2[ex] / 2688.0 }).collect();
         let mut y = vec![0.0; D];
-        for o in outs {
-            y.iter_mut().zip(o).for_each(|(y, o)| *y += o);
-        }
+        crate::pool::chunks_mut(&mut y, 64, |c, o| {
+            for (i, o) in o.iter_mut().enumerate() {
+                let row = c * 64 + i;
+                *o = (0..TOP_K).map(|k| e.dot(e.w2, e.s2, sel[k] * D + row, &act[k * FF..][..FF]) * g2[k]).sum();
+            }
+        });
         y
     }
 }
@@ -436,22 +436,11 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
-fn dot_bf(w: &[u16], x: &[f32]) -> f32 {
-    // 8本の部分和に分けて自動ベクトル化させる
-    let mut acc = [0f32; 16];
-    for (wc, xc) in w.chunks_exact(16).zip(x.chunks_exact(16)) {
-        for i in 0..16 {
-            acc[i] += bf16(wc[i]) * xc[i];
-        }
-    }
-    acc.iter().sum()
-}
-
 fn matvec(w: W, x: &[f32], out: &mut [f32]) {
     let n = x.len();
-    out.par_chunks_mut(64).enumerate().for_each(|(c, o)| {
+    crate::pool::chunks_mut(out, 64, |c, o| {
         for (i, o) in o.iter_mut().enumerate() {
-            *o = dot_bf(&w[(c * 64 + i) * n..][..n], x);
+            *o = dot_bf16(&w[(c * 64 + i) * n..][..n], x);
         }
     });
 }
@@ -467,36 +456,11 @@ impl Experts {
     fn dot(&self, w: &[u8], s: &[u8], row: usize, x: &[f32]) -> f32 {
         let n = x.len();
         if self.mx {
-            mxfp8_dot(&w[row * n..][..n], &s[row * n / 32..][..n / 32], x)
+            dot_mxfp8(&w[row * n..][..n], &s[row * n / 32..][..n / 32], x)
         } else {
-            nvfp4_dot(&w[row * n / 2..][..n / 2], &s[row * n / 16..][..n / 16], x)
+            dot_nvfp4(&w[row * n / 2..][..n / 2], &s[row * n / 16..][..n / 16], x)
         }
     }
-}
-
-static E4M3: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| std::array::from_fn(|i| e4m3(i as u8)));
-
-/// MXFP8: E4M3 の値に、32要素ごとの 2^(s-127) のスケールを掛ける。
-fn mxfp8_dot(w: &[u8], scales: &[u8], x: &[f32]) -> f32 {
-    let t = &*E4M3;
-    let mut total = 0.0;
-    for ((wb, xb), &s) in w.chunks_exact(32).zip(x.chunks_exact(32)).zip(scales) {
-        let sum: f32 = wb.iter().zip(xb).map(|(&b, x)| t[b as usize] * x).sum();
-        total += sum * f32::from_bits((s as u32) << 23);
-    }
-    total
-}
-
-fn nvfp4_dot(packed: &[u8], scales: &[u8], x: &[f32]) -> f32 {
-    let mut total = 0.0;
-    for (blk, (p, xs)) in packed.chunks_exact(8).zip(x.chunks_exact(16)).enumerate() {
-        let mut s = 0.0;
-        for (i, &b) in p.iter().enumerate() {
-            s += E2M1[(b & 15) as usize] * xs[2 * i] + E2M1[(b >> 4) as usize] * xs[2 * i + 1];
-        }
-        total += s * e4m3(scales[blk]);
-    }
-    total
 }
 
 fn rmsnorm(x: &mut [f32], w: Option<W>) {

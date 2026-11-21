@@ -5,7 +5,6 @@
     in {
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
-        RUSTFLAGS = "-C target-cpu=native";
       };
     };
 }
