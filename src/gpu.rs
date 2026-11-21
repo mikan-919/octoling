@@ -12,8 +12,8 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 /// global 層の KV キャッシュの長さ。8192 にすると VRAM の予算を超え、Windows が GPU メモリを退避して遅くなる。
-/// attn カーネルはスコアを共有メモリに置くので、48KB に収まる長さにもする。
-/// ponytail: 文脈長の上限。伸ばすなら KV を BF16 にするか、スコアを分割して求める
+/// attn_part は分割1つ分のスコア (MAX_CTX / 16 個) を共有メモリに置く。
+/// ponytail: 文脈長の上限。伸ばすなら KV を BF16 にして VRAM を空ける
 pub const MAX_CTX: usize = 2048;
 
 /// prefill で一度に処理するトークン数の上限
@@ -132,6 +132,7 @@ struct Bufs {
     yd: P,  // [T*8][D]
     order: P,
     off: P,
+    part: P, // [24][NSPLIT][HD + 2]。生成時の注意の部分結果
     logits: P,
 }
 
@@ -155,8 +156,8 @@ pub struct Gpu {
     capturing: Cell<bool>,
 }
 
-const KERNELS: [&str; 18] = [
-    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
+const KERNELS: [&str; 20] = [
+    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum",
 ];
 
@@ -172,7 +173,8 @@ fn f4(n: usize) -> u64 {
 impl Gpu {
     pub fn new(cpu: Model) -> Self {
         let cpu: &'static Model = Box::leak(Box::new(cpu));
-        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() })
+        let src = format!("#define MAX_CTX_DEV {MAX_CTX}\n{}", include_str!("gpu.cu"));
+        let ptx = compile_ptx_with_opts(src, CompileOptions { arch: Some("sm_120"), ..Default::default() })
             .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
         let ctx = CudaContext::new(0).expect("GPU を開けない");
         ctx.bind_to_thread().unwrap();
@@ -259,6 +261,7 @@ impl Gpu {
             order: fz(t * TOP_K, &mut up),
             off: fz(129, &mut up),
             logits: fz(201024, &mut up),
+            part: fz(24 * 16 * 130, &mut up),
         };
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
@@ -463,8 +466,12 @@ impl Gpu {
         self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t);
         let ring = if l.global { 0 } else { RING as i32 };
         k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
-        let smem = (EXTENT + MAX_CTX) * 4;
-        k!(self, "attn", (24, t), 128, smem; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring);
+        if t == 1 {
+            k!(self, "attn_part", (24, 16), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring);
+            k!(self, "attn_combine", 24, 128, 0; b.qx, b.part, b.o);
+        } else {
+            k!(self, "attn_tile", (24, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
+        }
         self.gemm(l.wo, b.o, b.a, D, 3072, t);
         self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.a, D, D, D, t);
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む

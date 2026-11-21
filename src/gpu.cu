@@ -308,44 +308,151 @@ extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp,
     }
 }
 
-// ブロックは (ヘッド, トークン)、128スレッド。ring > 0 なら SWA で、直近 EXTENT 個の位置をリングバッファ (位置 % ring) から読む
-// 共有メモリ: 相対位置バイアス EXTENT 個 + スコア (pos + 1 - first) 個
-extern "C" __global__ void attn(const float* qx, const float* kc, const float* vc, const float* rel_proj, float* out, const int* posp, int ring) {
-    extern __shared__ float sm[];
-    float* rel = sm;
-    float* sc = sm + EXTENT;
-    int pos = *posp + blockIdx.y, first = ring ? max(0, pos + 1 - EXTENT) : 0;
-    const float* q = qx + (size_t)blockIdx.y * QX;
+// ---- 注意 ----
+// 位置 pos のクエリは、global 層なら 0..=pos、SWA 層 (ring > 0) なら直近 EXTENT 個の位置を見る。SWA の KV はリングバッファ (位置 % ring)。
+// スコア = q.k / sqrt(HD) + 相対位置バイアス (距離 d < EXTENT のとき r . rel_proj[:, d])。sink はロジット sinks[h]、値はゼロベクトル。
+
+__device__ __forceinline__ float rel_bias(const float* rh, const float* rel_proj, int d) {
+    if (d >= EXTENT) return 0.f;
+    float s = 0.f;
+    #pragma unroll
+    for (int i = 0; i < NREL; i++) s += rh[i] * rel_proj[i * EXTENT + d];
+    return s;
+}
+
+__device__ __forceinline__ size_t kv_row(int j, int ring) { return (size_t)(ring ? j % ring : j) * 1024; }
+
+// (T = 1 用) キーの範囲を NSPLIT 個に分けて、部分ごとの (最大値 m、指数和 z、重み付き和 o[HD]) を part に書く。
+// グリッドは (ヘッド, NSPLIT) で固定なので、CUDA Graph でも位置に応じて分け方が変わる。128スレッド
+#define NSPLIT 16
+#define PART (HD + 2)
+extern "C" __global__ void attn_part(const float* qx, const float* kc, const float* vc, const float* rel_proj, float* part, const int* posp, int ring) {
+    __shared__ float sc[(MAX_CTX_DEV + NSPLIT - 1) / NSPLIT];
+    int pos = *posp, first = ring ? max(0, pos + 1 - EXTENT) : 0, n = pos + 1;
     int h = blockIdx.x, kvh = h / 3, t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    int chunk = (n - first + NSPLIT - 1) / NSPLIT, j0 = first + blockIdx.y * chunk, j1 = min(n, j0 + chunk);
+    float* out = part + (h * NSPLIT + blockIdx.y) * PART;
     float rh[NREL];
-    for (int i = 0; i < NREL; i++) rh[i] = q[R_OFF + h * NREL + i];
-    for (int d = t; d < EXTENT; d += blockDim.x) {
-        float s = 0.f;
-        for (int i = 0; i < NREL; i++) s += rh[i] * rel_proj[i * EXTENT + d];
-        rel[d] = s;
-    }
-    __syncthreads();
-    float4 qv = ((const float4*)(q + h * HD))[lane];
-    int n = pos + 1;
-    for (int j = first + warp; j < n; j += blockDim.x >> 5) {
-        int idx = ring ? j % ring : j;
-        float4 kv = ((const float4*)(kc + (size_t)idx * 1024 + kvh * HD))[lane];
+    for (int i = 0; i < NREL; i++) rh[i] = qx[R_OFF + h * NREL + i];
+    float4 qv = ((const float4*)(qx + h * HD))[lane];
+    for (int j = j0 + warp; j < j1; j += blockDim.x >> 5) {
+        float4 kv = ((const float4*)(kc + kv_row(j, ring) + kvh * HD))[lane];
         float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
-        int d = pos - j;
-        if (lane == 0) sc[j - first] = s * rsqrtf((float)HD) + (d < EXTENT ? rel[d] : 0.f);
+        if (lane == 0) sc[j - j0] = s * rsqrtf((float)HD) + rel_bias(rh, rel_proj, pos - j);
     }
     __syncthreads();
-    // sink のロジットは sinks[h]、値はゼロベクトル
-    float sink = q[SINK_OFF + h];
-    float m = sink;
-    for (int i = t; i < n - first; i += blockDim.x) m = fmaxf(m, sc[i]);
+    float m = -INFINITY;
+    for (int i = t; i < j1 - j0; i += blockDim.x) m = fmaxf(m, sc[i]);
     m = block_max(m);
-    float z = t == 0 ? expf(sink - m) : 0.f;
-    for (int i = t; i < n - first; i += blockDim.x) z += sc[i] = expf(sc[i] - m);
+    float z = 0.f;
+    if (j1 > j0)
+        for (int i = t; i < j1 - j0; i += blockDim.x) z += sc[i] = expf(sc[i] - m);
     z = block_sum(z);
     float o = 0.f;
-    for (int j = first; j < n; j++) o += sc[j - first] * vc[(size_t)(ring ? j % ring : j) * 1024 + kvh * HD + t];
-    out[(size_t)blockIdx.y * 3072 + h * HD + t] = o / z * sigmoidf(q[GATE_OFF + h * HD + t]);
+    for (int j = j0; j < j1; j++) o += sc[j - j0] * vc[kv_row(j, ring) + kvh * HD + t];
+    out[2 + t] = o;
+    if (t == 0) {
+        out[0] = m;
+        out[1] = z;
+    }
+}
+
+// (T = 1 用) 部分結果と sink をまとめ、出力ゲートをかける。ヘッドごとに1ブロック、128スレッド
+extern "C" __global__ void attn_combine(const float* qx, const float* part, float* out) {
+    int h = blockIdx.x, t = threadIdx.x;
+    const float* p = part + h * NSPLIT * PART;
+    float sink = qx[SINK_OFF + h], m = sink;
+    for (int s = 0; s < NSPLIT; s++) m = fmaxf(m, p[s * PART]);
+    float z = expf(sink - m), o = 0.f;
+    for (int s = 0; s < NSPLIT; s++) {
+        float f = p[s * PART + 1] > 0.f ? expf(p[s * PART] - m) : 0.f;
+        z += p[s * PART + 1] * f;
+        o += p[s * PART + 2 + t] * f;
+    }
+    out[h * HD + t] = o / z * sigmoidf(qx[GATE_OFF + h * HD + t]);
+}
+
+// (prefill 用) 32 クエリ x 16 キーのタイルで、K と V を共有メモリに載せて 32 クエリで使い回す (オンライン softmax)。
+// グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
+#define QT 32
+#define KT 16
+extern "C" __global__ void attn_tile(const float* qx, const float* kc, const float* vc, const float* rel_proj, float* out, const int* posp, int ring, int T) {
+    __shared__ __align__(16) float Qs[QT][HD];
+    __shared__ __align__(16) float Ks[KT][HD + 4];
+    __shared__ __align__(16) float Vs[KT][HD];
+    __shared__ float Ps[QT][KT];
+    __shared__ float Rs[QT][NREL];
+    int h = blockIdx.x, kvh = h / 3, tid = threadIdx.x, qi = tid / 4, part = tid % 4;
+    int t0 = blockIdx.y * QT, nq = min(QT, T - t0), p0 = *posp + t0;
+    for (int i = tid; i < QT * HD; i += blockDim.x) {
+        int q = i / HD;
+        Qs[q][i % HD] = q < nq ? qx[(size_t)(t0 + q) * QX + h * HD + i % HD] : 0.f;
+    }
+    for (int i = tid; i < QT * NREL; i += blockDim.x) {
+        int q = i / NREL;
+        Rs[q][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + h * NREL + i % NREL] : 0.f;
+    }
+    int pq = p0 + qi; // このスレッドのクエリの位置
+    bool valid = qi < nq;
+    float m = valid ? qx[(size_t)(t0 + qi) * QX + SINK_OFF + h] : 0.f, z = 1.f; // sink から始める
+    float o[32];
+    for (int d = 0; d < 32; d++) o[d] = 0.f;
+    int pmax = p0 + nq - 1, jlo = ring ? max(0, p0 + 1 - EXTENT) : 0;
+    for (int j0 = jlo; j0 <= pmax; j0 += KT) {
+        __syncthreads();
+        for (int i = tid; i < KT * HD; i += blockDim.x) {
+            int k = i / HD, j = j0 + k;
+            float kv = 0.f, vv = 0.f;
+            if (j <= pmax) {
+                kv = kc[kv_row(j, ring) + kvh * HD + i % HD];
+                vv = vc[kv_row(j, ring) + kvh * HD + i % HD];
+            }
+            Ks[k][i % HD] = kv;
+            Vs[k][i % HD] = vv;
+        }
+        __syncthreads();
+        // このスレッドはキー part*4 .. part*4+3 のスコアを計算する
+        float s[4], tmax = -INFINITY;
+        for (int kk = 0; kk < 4; kk++) {
+            int k = part * 4 + kk, j = j0 + k, d = pq - j;
+            bool ok = valid && j <= pq && (!ring || d < EXTENT);
+            float acc = 0.f;
+            if (ok) {
+                for (int e = 0; e < HD; e += 4) {
+                    float4 a = *(const float4*)&Qs[qi][e], b = *(const float4*)&Ks[k][e];
+                    acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                }
+                acc = acc * rsqrtf((float)HD) + rel_bias(Rs[qi], rel_proj, d);
+            }
+            s[kk] = ok ? acc : -INFINITY;
+            tmax = fmaxf(tmax, s[kk]);
+        }
+        // 同じクエリの4スレッドは隣り合うレーン
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+        float mn = fmaxf(m, tmax), f = expf(m - mn), ps = 0.f;
+        for (int kk = 0; kk < 4; kk++) {
+            float p = expf(s[kk] - mn);
+            Ps[qi][part * 4 + kk] = p;
+            ps += p;
+        }
+        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+        ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+        z = z * f + ps;
+        m = mn;
+        __syncwarp();
+        for (int d = 0; d < 32; d++) o[d] *= f;
+        for (int k = 0; k < KT; k++) {
+            float p = Ps[qi][k];
+            const float* vr = &Vs[k][part * 32];
+            for (int d = 0; d < 32; d++) o[d] += p * vr[d];
+        }
+    }
+    if (valid) {
+        const float* gate = qx + (size_t)(t0 + qi) * QX + GATE_OFF + h * HD + part * 32;
+        float* dst = out + (size_t)(t0 + qi) * 3072 + h * HD + part * 32;
+        for (int d = 0; d < 32; d++) dst[d] = o[d] / z * sigmoidf(gate[d]);
+    }
 }
 
 extern "C" __global__ void add(const float* a, const float* b, float* out, int n) {
