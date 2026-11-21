@@ -25,11 +25,11 @@ fn main() {
     let model = Model::load(SafeTensors::open(dir.join("model-00001-of-00001.safetensors")).expect("重みを開けない"));
     match args[1].as_str() {
         "serve" => {
-            let mut engine = Engine::new(Gpu::new(model), &dir.join("tokenizer.json"));
+            let mut engine = Engine::new(Gpu::new(model), dir);
             serve(&mut engine, args.get(3).map_or("127.0.0.1:8080", String::as_str)).expect("待ち受けできない");
         }
         "chat" if args.len() >= 4 => {
-            let mut engine = Engine::new(Gpu::new(model), &dir.join("tokenizer.json"));
+            let mut engine = Engine::new(Gpu::new(model), dir);
             let e = effort(&serde_json::json!(args.get(4).map_or("high", String::as_str))).unwrap_or_else(|e| panic!("{e}"));
             let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], reasoning: None }];
             let prompt = engine.prompt(&msgs, e).unwrap();

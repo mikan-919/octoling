@@ -2,7 +2,7 @@
 //! テンプレートは models/official/chat_template.jinja のうち、文章だけのメッセージを扱う部分を Rust で書いたもの。
 //! ツール呼び出しと画像は扱わない。
 
-use crate::gpu::{Gpu, MAX_CTX};
+use crate::gpu::{Drafter, Gpu, MAX_CTX, SPEC_T};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -47,11 +47,17 @@ pub struct Engine {
     sp: Special,
     /// GPU の文脈に入っているトークン。次のプロンプトがこれの続きなら、続きの分だけ prefill する
     cached: Vec<u32>,
+    draft: Option<Drafter>,
 }
 
 impl Engine {
-    pub fn new(gpu: Gpu, tokenizer: &std::path::Path) -> Self {
-        let tok = Tokenizer::from_file(tokenizer).expect("tokenizer.json を読めない");
+    /// dir の tokenizer.json を読む。OCTO_DRAFT=1 で mtp.safetensors があれば下書きモデルとして読み、
+    /// 貪欲法 (temperature 0) の生成を投機的デコードにする。この機械では受け入れが 1 回の検証あたり 1.2〜2.5 トークンで、
+    /// 下書き約 9 ms と検証 30〜50 ms を取り返せないことが多いので、既定では使わない
+    pub fn new(gpu: Gpu, dir: &std::path::Path) -> Self {
+        let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json を読めない");
+        let mtp = dir.join("mtp.safetensors");
+        let draft = (mtp.exists() && std::env::var_os("OCTO_DRAFT").is_some()).then(|| Drafter::load(&gpu, &mtp));
         let id = |s: &str| tok.token_to_id(s).unwrap_or_else(|| panic!("{s} がない"));
         let sp = Special {
             user: id("<|message_user|>"),
@@ -62,7 +68,7 @@ impl Engine {
             end_message: id("<|end_message|>"),
             end_sampling: id("<|content_model_end_sampling|>"),
         };
-        Self { gpu, tok, sp, cached: vec![] }
+        Self { gpu, tok, sp, cached: vec![], draft }
     }
 
     fn encode(&self, s: &str) -> Vec<u32> {
@@ -124,58 +130,117 @@ impl Engine {
         if !reuse {
             self.gpu.reset();
             self.cached.clear();
+            if let Some(d) = &mut self.draft {
+                d.reset();
+            }
         }
         let reused = self.cached.len();
         let t0 = std::time::Instant::now();
-        let mut logits = self.gpu.prefill(&prompt[reused..]);
+        // 下書きモデルの文脈は、本体の文脈と常に同じ位置まで進めておく
+        let draft = &mut self.draft;
+        let mut logits = self.gpu.prefill_with(&prompt[reused..], |g, n| {
+            if let Some(d) = draft {
+                d.add_ctx(g, n);
+            }
+        });
         let t_prefill = t0.elapsed().as_secs_f64();
         self.cached = prompt.to_vec();
         let t0 = std::time::Instant::now();
-        let log = |n: usize, finish: &str| {
-            let dt = t0.elapsed().as_secs_f64();
-            eprintln!(
-                "prompt {} tokens ({reused} reused, prefill {:.0} ms), generated {n} tokens ({:.1} tok/s), {finish}",
-                prompt.len(),
-                t_prefill * 1e3,
-                n as f64 / dt
-            );
-        };
 
-        let mut rng = p.seed | 1;
-        let mut mode = Mode::None;
-        let mut pending: Vec<u32> = vec![];
-        let mut n = 0;
-        let finish = loop {
-            if n == p.max_tokens || self.gpu.pos() >= MAX_CTX {
-                break "length";
-            }
-            let t = sample(&logits, p, &mut rng);
-            n += 1;
-            if t == self.sp.end_sampling {
-                break "stop";
-            }
-            // 特殊トークンで、思考と本文のどちらを書いているかが切り替わる
-            if t >= 199998 {
-                if !self.flush(&mut pending, mode, true, &mut on) {
+        let mut out = Out { mode: Mode::None, pending: vec![] };
+        let (mut n, mut steps, mut t_draft, mut t_verify) = (0, 0, 0f64, 0f64);
+        let greedy = p.temperature <= 0.0 || p.top_k == 1;
+        let finish = if greedy && self.draft.is_some() {
+            // 投機的デコード: 下書きをまとめて検証し、一致した先頭までを受け入れる。出力は1トークンずつの貪欲法と同じ
+            let mut next = argmax(&logits);
+            loop {
+                if n >= p.max_tokens || self.gpu.pos() >= MAX_CTX {
+                    break "length";
+                }
+                if next == self.sp.end_sampling {
+                    n += 1;
                     break "stop";
                 }
-                mode = match t {
-                    _ if t == self.sp.thinking => Mode::Thinking,
-                    _ if t == self.sp.end_message || t == self.sp.model => Mode::None,
-                    _ => Mode::Text, // <|content_text|> と、本文として扱うその他の内容
-                };
-            } else {
-                pending.push(t);
-                if !self.flush(&mut pending, mode, false, &mut on) {
+                let room = (p.max_tokens - n).min(MAX_CTX - self.gpu.pos()).min(SPEC_T);
+                let anchor = *self.cached.last().unwrap();
+                let mut chunk = vec![next];
+                let tm = std::time::Instant::now();
+                chunk.extend(self.draft.as_mut().unwrap().draft(&self.gpu, anchor, next, room - 1));
+                t_draft += tm.elapsed().as_secs_f64();
+                let tm = std::time::Instant::now();
+                let pred = self.gpu.verify(&chunk);
+                t_verify += tm.elapsed().as_secs_f64();
+                let mut a = 1;
+                while a < chunk.len() && pred[a - 1] == chunk[a] {
+                    a += 1;
+                }
+                self.gpu.rewind(a, chunk.len());
+                self.draft.as_mut().unwrap().add_ctx(&self.gpu, a);
+                steps += 1;
+                let mut stop = false;
+                for &t in &chunk[..a] {
+                    self.cached.push(t);
+                    n += 1;
+                    if t == self.sp.end_sampling || !self.emit(t, &mut out, &mut on) {
+                        stop = true;
+                        break;
+                    }
+                }
+                if stop {
                     break "stop";
                 }
+                next = pred[a - 1];
             }
-            logits = self.gpu.forward(t);
-            self.cached.push(t);
+        } else {
+            let mut rng = p.seed | 1;
+            loop {
+                if n == p.max_tokens || self.gpu.pos() >= MAX_CTX {
+                    break "length";
+                }
+                let t = sample(&logits, p, &mut rng);
+                n += 1;
+                if t == self.sp.end_sampling || !self.emit(t, &mut out, &mut on) {
+                    break "stop";
+                }
+                logits = self.gpu.forward(t);
+                if let Some(d) = &mut self.draft {
+                    d.add_ctx(&self.gpu, 1);
+                }
+                self.cached.push(t);
+            }
         };
-        self.flush(&mut pending, mode, true, &mut on);
-        log(n, finish);
+        self.flush(&mut out.pending, out.mode, true, &mut on);
+        let dt = t0.elapsed().as_secs_f64();
+        let spec = if steps > 0 {
+            let k = 1e3 / steps as f64;
+            format!(", {:.2} tokens per verify, draft {:.1} ms + verify {:.1} ms per step", n as f64 / steps as f64, t_draft * k, t_verify * k)
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "prompt {} tokens ({reused} reused, prefill {:.0} ms), generated {n} tokens ({:.1} tok/s{spec}), {finish}",
+            prompt.len(),
+            t_prefill * 1e3,
+            n as f64 / dt
+        );
         Ok((finish, n))
+    }
+
+    /// 生成したトークン t を断片として渡す。特殊トークンで、思考と本文のどちらを書いているかが切り替わる。
+    /// 受け手が止めたら false
+    fn emit(&self, t: u32, out: &mut Out, on: &mut impl FnMut(Piece) -> bool) -> bool {
+        if t >= 199998 {
+            let ok = self.flush(&mut out.pending, out.mode, true, on);
+            out.mode = match t {
+                _ if t == self.sp.thinking => Mode::Thinking,
+                _ if t == self.sp.end_message || t == self.sp.model => Mode::None,
+                _ => Mode::Text, // <|content_text|> と、本文として扱うその他の内容
+            };
+            ok
+        } else {
+            out.pending.push(t);
+            self.flush(&mut out.pending, out.mode, false, on)
+        }
     }
 
     /// まだ渡していないトークンを文字列にして渡す。UTF-8 の途中で切れている間は (force でなければ) 待つ
@@ -196,6 +261,22 @@ impl Engine {
     }
 }
 
+struct Out {
+    mode: Mode,
+    pending: Vec<u32>,
+}
+
+/// 最大の値の位置。同じ値なら小さい位置 (GPU の argmax_rows と同じ決め方)
+fn argmax(l: &[f32]) -> u32 {
+    let mut b = 0;
+    for (i, &x) in l.iter().enumerate() {
+        if x > l[b] {
+            b = i;
+        }
+    }
+    b as u32
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     None,
@@ -214,9 +295,8 @@ fn next_rand(s: &mut u64) -> f32 {
 /// temperature、top_k、top_p でトークンを1つ選ぶ。temperature が 0 なら最大のもの。
 /// ponytail: top_p だけ指定されたときは上位 1000 個の中で切る。それより外の確率は捨てる
 fn sample(logits: &[f32], p: &Params, rng: &mut u64) -> u32 {
-    let argmax = || (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
     if p.temperature <= 0.0 || p.top_k == 1 {
-        return argmax();
+        return argmax(logits);
     }
     let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
     let limit = if p.top_k > 0 { p.top_k } else if p.top_p < 1.0 { 1000 } else { 0 };

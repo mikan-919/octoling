@@ -187,9 +187,10 @@ const S2: usize = W2 / 32;
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 24] = [
+const KERNELS: [&str; 36] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -299,7 +300,7 @@ impl Gpu {
             order: fz(t * TOP_K, &mut up),
             off: fz(129, &mut up),
             logits: fz(201024, &mut up),
-            part: fz(24 * 16 * 130, &mut up),
+            part: fz(SPEC_T * 24 * 16 * 130, &mut up),
             taps: fz(4 * t * D, &mut up),
             amax: fz(SPEC_T, &mut up),
             logits_all: fz(SPEC_T * 201024, &mut up),
@@ -364,10 +365,13 @@ impl Gpu {
         v
     }
 
-    /// Y[t] = W X[t]。T = 1 は行列×ベクトル、それより多ければタイル分割した行列積
+    /// Y[t] = W X[t]。T = 1 は行列×ベクトル、T <= SPEC_T は重みを1回読んで T 本と積和、それより多ければテンソルコアの行列積
+    /// (テンソルコアの行列積は大きいバッチ向けで、数トークンだと読み込みの待ちで遅い)
     fn gemm(&self, w: P, x: P, y: P, rows: usize, cols: usize, t: usize) {
         if t == 1 {
             k!(self, "mv_bf16", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32);
+        } else if t <= SPEC_T {
+            k!(self, "mv_bf16_t", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
         } else {
             k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
         }
@@ -665,9 +669,9 @@ impl Gpu {
         self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t, seq(1));
         let ring = if l.global { 0 } else { RING as i32 };
         k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
-        if t == 1 {
-            k!(self, "attn_part", (24, 16), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring);
-            k!(self, "attn_combine", 24, 128, 0; b.qx, b.part, b.o);
+        if t <= SPEC_T {
+            k!(self, "attn_part", (24, 16 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring);
+            k!(self, "attn_combine", (24, t), 128, 0; b.qx, b.part, b.o);
         } else {
             k!(self, "attn_tile", (24, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
         }
@@ -691,9 +695,9 @@ impl Gpu {
             Some([w13, s13, a13, w2, s2, a2]) => {
                 self.gemm(l.router, b.h, b.rl, 128, D, t);
                 k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
-                if t == 1 {
-                    k!(self, "moe_up_nvfp4", (TOP_K * FF * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act);
-                    k!(self, "moe_down_nvfp4", (D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y);
+                if t <= SPEC_T {
+                    k!(self, "moe_up_nvfp4", (t * TOP_K * FF * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act, ti);
+                    k!(self, "moe_down_nvfp4", (t * D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y, ti);
                 } else {
                     let n = (t * TOP_K) as i32;
                     k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
@@ -752,16 +756,21 @@ impl Uploader {
 
     fn bytes(&mut self, src: &[u8]) -> P {
         let p = self.zeros(src.len());
+        self.to(p, src);
+        p
+    }
+
+    /// 確保済みの dst に送る。送り終わるまで待つ
+    fn to(&mut self, dst: P, src: &[u8]) {
         for (i, c) in src.chunks(PIN).enumerate() {
             // SAFETY: pin は PIN バイトある。前の転送が終わってから上書きする
             unsafe {
                 std::ptr::copy_nonoverlapping(c.as_ptr(), self.pin, c.len());
                 let staged = std::slice::from_raw_parts(self.pin, c.len());
-                result::memcpy_htod_async(p + (i * PIN) as u64, staged, self.stream.cu_stream()).unwrap();
+                result::memcpy_htod_async(dst + (i * PIN) as u64, staged, self.stream.cu_stream()).unwrap();
             }
             self.stream.synchronize().unwrap();
         }
-        p
     }
 }
 
@@ -774,3 +783,6 @@ fn pin(src: &[u8]) -> &'static [u8] {
         std::slice::from_raw_parts(p, src.len())
     }
 }
+
+mod draft;
+pub use draft::Drafter;

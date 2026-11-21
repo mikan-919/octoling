@@ -112,7 +112,7 @@ impl Default for State {
     }
 }
 
-fn cast<T>(b: &'static [u8]) -> &'static [T] {
+pub(crate) fn cast<T>(b: &'static [u8]) -> &'static [T] {
     // SAFETY: u16/f32 はどのビット列も有効。整列は下で検査する
     let (pre, mid, post) = unsafe { b.align_to::<T>() };
     assert!(pre.is_empty() && post.is_empty(), "テンソルが整列していない");
@@ -476,6 +476,15 @@ impl Model {
 fn block_gemm<'a>(e: &Experts, w: &[u8], s: &[u8], row0: usize, k: usize, list: &[usize], x: impl Fn(usize) -> &'a [f32], mut out: impl FnMut(usize, usize, f32)) {
     const ROWS: usize = 64;
     const KB: usize = 1152;
+    // 割り当てが少ない (検証の小さいバッチ) と、行を f32 に展開する手間のほうが重いので、量子化のまま内積をとる
+    if list.len() < 8 {
+        for r in 0..ROWS {
+            for &a in list {
+                out(a, r, e.dot(w, s, row0 + r, x(a)));
+            }
+        }
+        return;
+    }
     let mut wb = vec![0.0; ROWS * k];
     for (r, o) in wb.chunks_mut(k).enumerate() {
         e.dequant(w, s, row0 + r, o);
