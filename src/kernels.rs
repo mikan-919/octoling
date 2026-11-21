@@ -83,19 +83,23 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// 1本の w と4本の x それぞれの内積。w を1回読むあいだに4本と積和し、FMA の待ち時間を4本の独立な積和で埋める。
-pub fn dot_f32_x4(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
-    assert!(w.len() % 16 == 0 && x.iter().all(|x| x.len() == w.len()));
+/// 2本の w と4本の x の、8通りの内積。読み込み6回で FMA 8回を回し、8本の独立な積和で FMA の待ち時間を埋める。
+pub fn dot_2x4(w: [&[f32]; 2], x: [&[f32]; 4]) -> [[f32; 4]; 2] {
+    let n = w[0].len();
+    assert!(n % 16 == 0 && w[1].len() == n && x.iter().all(|x| x.len() == n));
     // SAFETY: 長さは上で検査した
     unsafe {
-        let mut acc = [_mm512_setzero_ps(); 4];
-        for i in (0..w.len()).step_by(16) {
-            let wv = _mm512_loadu_ps(w.as_ptr().add(i));
+        let mut acc = [[_mm512_setzero_ps(); 4]; 2];
+        for i in (0..n).step_by(16) {
+            let w0 = _mm512_loadu_ps(w[0].as_ptr().add(i));
+            let w1 = _mm512_loadu_ps(w[1].as_ptr().add(i));
             for j in 0..4 {
-                acc[j] = _mm512_fmadd_ps(wv, _mm512_loadu_ps(x[j].as_ptr().add(i)), acc[j]);
+                let xv = _mm512_loadu_ps(x[j].as_ptr().add(i));
+                acc[0][j] = _mm512_fmadd_ps(w0, xv, acc[0][j]);
+                acc[1][j] = _mm512_fmadd_ps(w1, xv, acc[1][j]);
             }
         }
-        acc.map(|a| _mm512_reduce_add_ps(a))
+        acc.map(|r| r.map(|a| _mm512_reduce_add_ps(a)))
     }
 }
 
@@ -174,6 +178,6 @@ mod tests {
         let mut row = vec![0.0; 1152];
         dequant_mxfp8(&w, &scales, &mut row);
         close(dot_f32(&row, &x), want);
-        close(dot_f32_x4(&row, [&x; 4])[3], want);
+        close(dot_2x4([&x, &row], [&x; 4])[1][3], want);
     }
 }

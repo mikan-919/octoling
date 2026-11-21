@@ -1,7 +1,7 @@
 //! Inkling 2 Mini のテキスト部の順伝播。1トークンずつ処理する。
 //! 仕様は llama.cpp の src/models/inkling2.cpp と inkling2-loop.cpp に合わせている。
 
-use crate::kernels::{dequant_mxfp8, dot_bf16, dot_f32, dot_f32_x4, dot_mxfp8, dot_nvfp4};
+use crate::kernels::{dequant_mxfp8, dot_2x4, dot_bf16, dot_mxfp8, dot_nvfp4};
 use crate::st::SafeTensors;
 
 pub const D: usize = 2304;
@@ -440,15 +440,11 @@ impl Model {
         let chunks = 2 * FF / 64;
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
-            let mut w = vec![0.0; D];
-            for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
-                // 行を1回だけ展開し、その expert に割り当てられた全トークンに掛ける
-                e.dequant(e.w13, e.s13, ex * 2 * FF + row, &mut w);
-                dots(&w, &lists[ex], |a| &xs[a / TOP_K * D..][..D], |a, v| {
-                    // SAFETY: (expert, 行) ごとに書く場所は重ならない
-                    unsafe { *out.at(a * 2 * FF + row) = v * e.g13(ex) };
-                });
-            }
+            let r0 = (task % chunks) * 64;
+            block_gemm(e, e.w13, e.s13, ex * 2 * FF + r0, D, &lists[ex], |a| &xs[a / TOP_K * D..][..D], |a, r, v| {
+                // SAFETY: (expert, 行) ごとに書く場所は重ならない
+                unsafe { *out.at(a * 2 * FF + r0 + r) = v * e.g13(ex) };
+            });
         });
         let mut act = vec![0.0; n_assign * FF];
         crate::pool::chunks_mut(&mut act, FF, |a, o| o.copy_from_slice(&situ_pairs(&gu[a * 2 * FF..][..2 * FF])));
@@ -458,14 +454,11 @@ impl Model {
         let chunks = D / 64;
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
-            let mut w = vec![0.0; FF];
-            for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
-                e.dequant(e.w2, e.s2, ex * D + row, &mut w);
-                dots(&w, &lists[ex], |a| &act[a * FF..][..FF], |a, v| {
-                    // SAFETY: 同上
-                    unsafe { *out.at(a * D + row) = v * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K] };
-                });
-            }
+            let r0 = (task % chunks) * 64;
+            block_gemm(e, e.w2, e.s2, ex * D + r0, FF, &lists[ex], |a| &act[a * FF..][..FF], |a, r, v| {
+                // SAFETY: 同上
+                unsafe { *out.at(a * D + r0 + r) = v * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K] };
+            });
         });
         let mut y = vec![0.0; t * D];
         crate::pool::chunks_mut(&mut y, D, |tok, o| {
@@ -477,15 +470,40 @@ impl Model {
     }
 }
 
-/// w と、list の各割り当ての入力 x(a) との内積を out(a, 値) に渡す。4本ずつまとめて計算する
-fn dots<'a>(w: &[f32], list: &[usize], x: impl Fn(usize) -> &'a [f32], mut out: impl FnMut(usize, f32)) {
-    let mut it = list.chunks_exact(4);
-    for c in &mut it {
-        let v = dot_f32_x4(w, [x(c[0]), x(c[1]), x(c[2]), x(c[3])]);
-        (0..4).for_each(|j| out(c[j], v[j]));
+/// expert の重みの 64 行 (row0 から) と、list の各割り当ての入力 x(a) (長さ k) の積を out(a, 行, 値) に渡す。
+/// 64 行を f32 に展開し、列を KB ずつに区切って 2行 x 4トークンの組で積和する。
+/// 4トークン分の x の区間 (4 x KB x 4 バイト) が L1 に残り、重みの行は L2 から読む。
+fn block_gemm<'a>(e: &Experts, w: &[u8], s: &[u8], row0: usize, k: usize, list: &[usize], x: impl Fn(usize) -> &'a [f32], mut out: impl FnMut(usize, usize, f32)) {
+    const ROWS: usize = 64;
+    const KB: usize = 1152;
+    let mut wb = vec![0.0; ROWS * k];
+    for (r, o) in wb.chunks_mut(k).enumerate() {
+        e.dequant(w, s, row0 + r, o);
     }
-    for &a in it.remainder() {
-        out(a, dot_f32(w, x(a)));
+    // 4 の倍数になるよう最後の割り当てを繰り返す (余りの結果は捨てる)
+    let mut l4 = list.to_vec();
+    while l4.len() % 4 != 0 {
+        l4.push(*list.last().unwrap());
+    }
+    let n4 = l4.len();
+    let mut acc = vec![0.0; ROWS * n4];
+    for kb in (0..k).step_by(KB) {
+        let kl = KB.min(k - kb);
+        for (g, tg) in l4.chunks(4).enumerate() {
+            let xs = [0, 1, 2, 3].map(|j| &x(tg[j])[kb..kb + kl]);
+            for r in (0..ROWS).step_by(2) {
+                let v = dot_2x4([&wb[r * k + kb..][..kl], &wb[(r + 1) * k + kb..][..kl]], xs);
+                for j in 0..4 {
+                    acc[r * n4 + g * 4 + j] += v[0][j];
+                    acc[(r + 1) * n4 + g * 4 + j] += v[1][j];
+                }
+            }
+        }
+    }
+    for r in 0..ROWS {
+        for (j, &a) in list.iter().enumerate() {
+            out(a, r, acc[r * n4 + j]);
+        }
     }
 }
 
