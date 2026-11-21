@@ -1,15 +1,17 @@
 //! GPU (CUDA) 版の順伝播。計算の順序は model.rs の CPU 版と同じ。
 //! 20〜23層の MXFP8 expert は VRAM に載らないので CPU で計算する。埋め込み表も CPU に置く。
 
-use crate::model::{self, BLOCK, CORE, D, EXTENT, FF, GLOBAL_LAYERS, Layer, Model, N_LAYER, N_SLOT, PASSES, TOP_K, VOCAB, W};
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, result};
+use crate::model::{self, BLOCK, CORE, D, EXTENT, FF, GLOBAL_LAYERS, Layer, MXFP8_FROM, Model, N_LAYER, N_SLOT, PASSES, TOP_K, VOCAB, W};
+use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaModule, CudaStream, result, sys};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-/// global 層の KV キャッシュの長さ。attn カーネルはスコアを共有メモリに置くので、48KB に収まる長さにする。
-/// ponytail: 文脈長の上限。伸ばすならスコアを分割して求める
+/// global 層の KV キャッシュの長さ。8192 にすると VRAM の予算を超え、Windows が GPU メモリを退避して遅くなる。
+/// attn カーネルはスコアを共有メモリに置くので、48KB に収まる長さにもする。
+/// ponytail: 文脈長の上限。伸ばすなら KV を BF16 にするか、スコアを分割して求める
 pub const MAX_CTX: usize = 2048;
 
 type P = u64; // デバイスのポインタ
@@ -77,6 +79,7 @@ struct GSlot {
 // 1トークン分の作業領域
 struct Bufs {
     x: P,
+    pos: P, // i32。カーネルはここから位置を読む
     blocks: P, // [8][D]
     prelude: P,
     bank: P, // [2][D]
@@ -119,6 +122,9 @@ pub struct Gpu {
     output_query: P,
     b: Bufs,
     pos: usize,
+    // 1トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph
+    graphs: RefCell<Vec<CudaGraph>>,
+    capturing: Cell<bool>,
 }
 
 const KERNELS: [&str; 13] = ["mv_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4"];
@@ -135,7 +141,8 @@ impl Gpu {
             .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
         let ctx = CudaContext::new(0).expect("GPU を開けない");
         ctx.bind_to_thread().unwrap();
-        let stream = ctx.default_stream();
+        // 既定のストリームは CUDA Graph に記録できない
+        let stream = ctx.new_stream().unwrap();
         let module = ctx.load_module(ptx).unwrap();
         let f = KERNELS.iter().map(|&n| (n, module.load_function(n).unwrap())).collect();
 
@@ -189,6 +196,7 @@ impl Gpu {
         let fz = |n: usize, up: &mut Uploader| up.zeros(n * 4);
         let b = Bufs {
             x: fz(D, &mut up),
+            pos: fz(1, &mut up),
             blocks: fz(8 * D, &mut up),
             prelude: fz(D, &mut up),
             bank: fz(2 * D, &mut up),
@@ -216,7 +224,7 @@ impl Gpu {
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
         eprintln!("GPU に {:.2} GB 載せた", up.total as f64 / 1e9);
-        Self { cpu, _ctx: ctx, stream, _module: module, f, layers, slots, unembed, norm, output_query, b, pos: 0 }
+        Self { cpu, _ctx: ctx, stream, _module: module, f, layers, slots, unembed, norm, output_query, b, pos: 0, graphs: RefCell::new(vec![]), capturing: Cell::new(false) }
     }
 
     fn launch(&self, name: &str, grid: u32, block: u32, smem: u32, args: &[u64]) {
@@ -267,12 +275,54 @@ impl Gpu {
     }
 
     /// 1トークンを処理して、語彙の logits を返す。
+    /// 最初のトークンでカーネル列を CUDA Graph に記録し、以降は再生する。トレース中は記録せず毎回カーネルを投げる。
     pub fn forward(&mut self, token: u32) -> Vec<f32> {
         assert!(self.pos < MAX_CTX, "文脈長の上限 {MAX_CTX} を超えた");
         let mut e = model::bf_row(self.cpu.embed, token as usize, D);
         model::rmsnorm(&mut e, Some(self.cpu.embed_norm));
+        self.htod(self.b.x, &e);
+        // SAFETY: b.pos は i32 1個ぶん確保してある。転送が終わるまで待つ
+        unsafe { result::memcpy_htod_async(self.b.pos, &[self.pos as i32], self.stream.cu_stream()) }.unwrap();
+        if self.graphs.borrow().is_empty() || model::tracing() {
+            self.capturing.set(!model::tracing());
+            self.begin();
+            self.record();
+            self.end();
+        } else {
+            for (i, g) in self.graphs.borrow().iter().enumerate() {
+                g.launch().unwrap();
+                if i < N_LAYER - MXFP8_FROM {
+                    self.cpu_moe(MXFP8_FROM + i);
+                }
+            }
+        }
+        self.pos += 1;
+        self.dtoh(self.b.logits, VOCAB)
+    }
+
+    fn begin(&self) {
+        if self.capturing.get() {
+            self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+        }
+    }
+
+    fn end(&self) {
+        if self.capturing.get() {
+            let g = self.stream.end_capture(sys::CUgraphInstantiate_flags(0)).unwrap().expect("空のグラフ");
+            g.launch().unwrap();
+            self.graphs.borrow_mut().push(g);
+        }
+    }
+
+    /// 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
+    fn cpu_moe(&self, il: usize) {
+        let h = self.dtoh(self.b.h, D);
+        let y = self.cpu.moe(&self.cpu.layers[il], &h);
+        self.htod(self.b.y, &y);
+    }
+
+    fn record(&self) {
         let b = &self.b;
-        self.htod(b.x, &e);
         let mut nb = 0;
         for il in 0..CORE.0 {
             self.layer(il, il, il, &mut nb, false);
@@ -303,13 +353,10 @@ impl Gpu {
         k!(self, "rmsnorm", 1, 256, 0; b.h, self.norm, b.h, D as i32, 0i32);
         self.mv(self.unembed, b.h, b.logits, 201024, D);
         k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32);
-        self.pos += 1;
-        self.dtoh(b.logits, VOCAB)
     }
 
     fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool) {
         let (l, s, b) = (&self.layers[il], &self.slots[slot], &self.b);
-        let pos = self.pos;
         let fd = |i: usize| (i * D * 4) as u64; // D 要素 i 本ぶんのバイト数
         // attention の入力: SWA は1本、global は Q, K, V に1本ずつ
         if il > 0 {
@@ -338,14 +385,11 @@ impl Gpu {
         let (kd, vd) = if l.global { (b.kx + 4096, b.vx + 4096) } else { (0, 0) };
         self.conv(b.kx, l.k_conv, kd, s.hist[0], b.kp, 1024, 128);
         self.conv(b.vx, l.v_conv, vd, s.hist[1], b.vp, 1024, 128);
-        let tau = if l.global { 1.0 + 0.1 * ((pos as f32 + 1.0) / 8192.0).max(1.0).ln() } else { 1.0 };
-        let row = (if l.global { pos } else { pos % EXTENT } * 1024 * 4) as u64;
         let f4 = |n: usize| (n * 4) as u64;
-        k!(self, "qkv_post", 64, 128, 0; b.qx, b.qx + f4(R_OFF), b.kp, b.vp, l.q_clip, l.rel_clip, tau, s.kc + row, s.vc + row);
-        let first = if l.global { 0 } else { (pos + 1).saturating_sub(EXTENT) };
-        let smem = (EXTENT + pos + 1 - first) * 4;
+        k!(self, "qkv_post", 64, 128, 0; b.qx, b.qx + f4(R_OFF), b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, l.global as i32, s.kc, s.vc);
+        let smem = (EXTENT + MAX_CTX) * 4;
         k!(self, "attn", 24, 128, smem; b.qx, b.qx + f4(R_OFF), b.qx + f4(SINK_OFF), s.kc, s.vc, l.rel_proj, b.qx + f4(GATE_OFF), b.o,
-            pos as i32, first as i32, (!l.global) as i32);
+            b.pos, (!l.global) as i32);
         self.mv(l.wo, b.o, b.a, D, 3072);
         self.conv(b.a, l.attn_conv, 0, s.hist[2], b.a, D, D);
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む
@@ -370,9 +414,9 @@ impl Gpu {
                 k!(self, "moe_down_nvfp4", (D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y);
             }
             None => {
-                let h = self.dtoh(b.h, D);
-                let y = self.cpu.moe(&self.cpu.layers[il], &h);
-                self.htod(b.y, &y);
+                self.end();
+                self.cpu_moe(il);
+                self.begin();
             }
         }
         self.conv(b.y, l.mlp_conv, 0, s.hist[3], b.y, D, D);

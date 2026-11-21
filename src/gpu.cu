@@ -150,10 +150,15 @@ __device__ float clip_scale(float v, float threshold) {
     return fminf(threshold / norm, 1.f);
 }
 
-// Q, R, K の L2 クリップ、V の正規化、global 層の tau。K と V はキャッシュの行に書く。64ブロック x 128スレッド
+// Q, R, K の L2 クリップ、V の正規化、global 層の tau。K と V はキャッシュの行に書く (SWA はリングバッファ)。64ブロック x 128スレッド
+// 位置はデバイスのメモリから読む。CUDA Graph で同じカーネル列を毎トークン再生するため
 extern "C" __global__ void qkv_post(float* q, float* r, const float* k, const float* v, const float* qclip, const float* rclip,
-                                    float tau, float* kc, float* vc) {
-    int b = blockIdx.x, t = threadIdx.x;
+                                    const int* posp, int global, float* kc, float* vc) {
+    int b = blockIdx.x, t = threadIdx.x, pos = *posp;
+    float tau = global ? 1.f + 0.1f * logf(fmaxf(1.f, (pos + 1.f) / 8192.f)) : 1.f;
+    size_t row = (size_t)(global ? pos : pos % EXTENT) * 1024;
+    kc += row;
+    vc += row;
     if (b < 24) {
         float x = q[b * HD + t] * qclip[b * HD + t];
         x *= clip_scale(x, 22.627416997969522f);
@@ -174,10 +179,11 @@ extern "C" __global__ void qkv_post(float* q, float* r, const float* k, const fl
     }
 }
 
-// 1ヘッド1ブロック、128スレッド。位置 first..=pos を見る。ring なら SWA のリングバッファ (位置 % EXTENT)
+// 1ヘッド1ブロック、128スレッド。ring なら SWA で、直近 EXTENT 個の位置をリングバッファ (位置 % EXTENT) から読む
 // 共有メモリ: 相対位置バイアス EXTENT 個 + スコア (pos + 1 - first) 個
 extern "C" __global__ void attn(const float* q, const float* r, const float* sinks, const float* kc, const float* vc, const float* rel_proj,
-                                const float* gate, float* out, int pos, int first, int ring) {
+                                const float* gate, float* out, const int* posp, int ring) {
+    int pos = *posp, first = ring ? max(0, pos + 1 - EXTENT) : 0;
     extern __shared__ float sm[];
     float* rel = sm;
     float* sc = sm + EXTENT;
