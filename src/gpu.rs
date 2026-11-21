@@ -300,7 +300,7 @@ impl Gpu {
         if t == 1 {
             k!(self, "mv_bf16", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32);
         } else {
-            k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
+            k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
         }
     }
 
@@ -491,10 +491,10 @@ impl Gpu {
                 } else {
                     let n = (t * TOP_K) as i32;
                     k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
-                    k!(self, "gemm_nvfp4_grouped", (2 * FF / 64, 128), 256, 0;
+                    k!(self, "gemm_nvfp4_grouped", (2 * FF / 64, 128), 128, 0;
                         w13, s13, a13, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, b.gu);
                     k!(self, "situ_rows", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, n);
-                    k!(self, "gemm_nvfp4_grouped", (D / 64, 128), 256, 0; w2, s2, a2, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
+                    k!(self, "gemm_nvfp4_grouped", (D / 64, 128), 128, 0; w2, s2, a2, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }

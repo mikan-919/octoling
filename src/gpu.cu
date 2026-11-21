@@ -82,50 +82,107 @@ extern "C" __global__ void mv_bf16(const bf16* __restrict__ w, const float* __re
     if (lane == 0) y[row] = s;
 }
 
-// 64行 x 32列のタイルの積和。Ws[k][行]、Xs[k][列] を共有メモリに置き、各スレッドが 4行 x 2列を受け持つ
-#define TILE_MAC(acc)                                                         \
-    for (int kk = 0; kk < 32; kk++) {                                         \
-        float4 w4 = *(const float4*)&Ws[kk][ty * 4];                          \
-        float2 x2 = *(const float2*)&Xs[kk][tx * 2];                          \
-        acc[0][0] += w4.x * x2.x; acc[0][1] += w4.x * x2.y;                   \
-        acc[1][0] += w4.y * x2.x; acc[1][1] += w4.y * x2.y;                   \
-        acc[2][0] += w4.z * x2.x; acc[2][1] += w4.z * x2.y;                   \
-        acc[3][0] += w4.w * x2.x; acc[3][1] += w4.w * x2.y;                   \
-    }
+// ---- テンソルコアの行列積 (prefill 用) ----
+// mma.sync m16n8k16 (BF16 入力、f32 累積) を使う。ブロックは 128スレッド (4ワープ) で 64行 x 32列 (トークン) を受け持ち、
+// ワープ w が行 16w..16w+15 と 32列 (8列のタイル4つ) を計算する。K は 32 ずつ共有メモリに載せる。
+// 共有メモリの行は 40 個の BF16 (32 + 8 の詰め物) で、フラグメントを読むときにバンクが衝突しない。
+#define TS 40
 
-// Y[t][r] = sum_c W[r][c] X[t][c]。W は BF16 の [rows, cols]、cols は 32 の倍数。ブロックは 64行 x 32トークン、256スレッド
-extern "C" __global__ void gemm_bf16(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
-    __shared__ __align__(16) float Ws[32][64];
-    __shared__ __align__(16) float Xs[32][32];
-    int tid = threadIdx.x, ty = tid / 16, tx = tid % 16;
-    int r0 = blockIdx.x * 64, t0 = blockIdx.y * 32;
-    float acc[4][2] = {};
-    for (int k0 = 0; k0 < cols; k0 += 32) {
-        // W のタイル: 64行 x 32列 = 2048 要素、1スレッド 8 要素 (uint4)
-        {
-            int r = tid / 4, c = (tid % 4) * 8;
-            uint4 v = r0 + r < rows ? __ldg((const uint4*)(w + (size_t)(r0 + r) * cols + k0 + c)) : make_uint4(0, 0, 0, 0);
-            unsigned u[4] = {v.x, v.y, v.z, v.w};
-            for (int i = 0; i < 4; i++) {
-                Ws[c + 2 * i][r] = bf(u[i] & 0xffffu);
-                Ws[c + 2 * i + 1][r] = bf(u[i] >> 16);
+__device__ __forceinline__ unsigned short f2bf(float f) {
+    unsigned u = __float_as_uint(f);
+    return (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+__device__ __forceinline__ unsigned pack2(float a, float b) { return (unsigned)f2bf(a) | ((unsigned)f2bf(b) << 16); }
+
+// Ws [64][TS]、Xs [2][32][TS] (どちらも K が連続) から、K 32 個分の積和を acc[4][4] に足す。
+// Xs は活性を BF16 2つの和 (上位 + 残り) に分けたもので、重みと2回掛けて足す。重みは BF16 で誤差がないので、
+// 活性の精度は約16ビットになる (BF16 1つだけだと 8ビットで、48層を通すと logits が 1% ほどずれた)
+__device__ __forceinline__ void mma_tile(const unsigned short* Ws, const unsigned short* Xs, float acc[4][4]) {
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const unsigned* W32 = (const unsigned*)Ws;
+    #pragma unroll
+    for (int ks = 0; ks < 32; ks += 16) {
+        int r = warp * 16 + g, k = ks / 2 + t;
+        unsigned a0 = W32[r * (TS / 2) + k], a1 = W32[(r + 8) * (TS / 2) + k];
+        unsigned a2 = W32[r * (TS / 2) + k + 4], a3 = W32[(r + 8) * (TS / 2) + k + 4];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned* X32 = (const unsigned*)(Xs + h * 32 * TS);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                unsigned b0 = X32[(j * 8 + g) * (TS / 2) + k], b1 = X32[(j * 8 + g) * (TS / 2) + k + 4];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
             }
         }
-        // X のタイル: 32トークン x 32列、1スレッド 4 要素
+    }
+}
+
+// x を BF16 の上位と残りに分ける
+__device__ __forceinline__ void split2(float a, float b, unsigned& hi, unsigned& lo) {
+    unsigned short ha = f2bf(a), hb = f2bf(b);
+    hi = (unsigned)ha | ((unsigned)hb << 16);
+    lo = pack2(a - bf(ha), b - bf(hb));
+}
+
+// X の 32 行 x K 32 個を BF16 2つの和にして Xs [2][32][TS] に置く。row(j) が負なら 0 で埋める。1スレッド 8 要素
+template <typename F>
+__device__ __forceinline__ void load_x(unsigned short* Xs, const float* x, int cols, int k0, F row) {
+    int j = threadIdx.x / 4, c = (threadIdx.x % 4) * 8, r = row(j);
+    uint4 hi = make_uint4(0, 0, 0, 0), lo = hi;
+    if (r >= 0) {
+        const float4* p = (const float4*)(x + (size_t)r * cols + k0 + c);
+        float4 a = p[0], b = p[1];
+        split2(a.x, a.y, hi.x, lo.x);
+        split2(a.z, a.w, hi.y, lo.y);
+        split2(b.x, b.y, hi.z, lo.z);
+        split2(b.z, b.w, hi.w, lo.w);
+    }
+    *(uint4*)&Xs[j * TS + c] = hi;
+    *(uint4*)&Xs[32 * TS + j * TS + c] = lo;
+}
+
+// 出力: acc[j] は行 16w+g と 16w+g+8、列 8j+2t と 8j+2t+1
+template <typename F>
+__device__ __forceinline__ void store_y(float acc[4][4], int r0, F put) {
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    for (int j = 0; j < 4; j++) {
+        int r = r0 + warp * 16 + g, c = j * 8 + 2 * t;
+        put(r, c, acc[j][0]);
+        put(r, c + 1, acc[j][1]);
+        put(r + 8, c, acc[j][2]);
+        put(r + 8, c + 1, acc[j][3]);
+    }
+}
+
+// Y[t][r] = sum_c W[r][c] X[t][c]。W は BF16 の [rows, cols]、cols は 32 の倍数。グリッドは (rows/64, T/32)
+extern "C" __global__ void gemm_bf16(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
+    __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
+    int r0 = blockIdx.x * 64, t0 = blockIdx.y * 32, tid = threadIdx.x;
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < cols; k0 += 32) {
+        // W のタイル: 64行 x 32列。1スレッド 16 要素 (uint4 2つ)
         {
-            int j = tid / 8, c = (tid % 8) * 4;
-            float4 v = t0 + j < T ? *(const float4*)(x + (size_t)(t0 + j) * cols + k0 + c) : make_float4(0, 0, 0, 0);
-            Xs[c][j] = v.x; Xs[c + 1][j] = v.y; Xs[c + 2][j] = v.z; Xs[c + 3][j] = v.w;
+            int r = tid / 2, c = (tid % 2) * 16;
+            uint4 a = make_uint4(0, 0, 0, 0), b = a;
+            if (r0 + r < rows) {
+                const uint4* p = (const uint4*)(w + (size_t)(r0 + r) * cols + k0 + c);
+                a = __ldg(p);
+                b = __ldg(p + 1);
+            }
+            *(uint4*)&Ws[r * TS + c] = a;
+            *(uint4*)&Ws[r * TS + c + 8] = b;
         }
+        load_x(Xs, x, cols, k0, [&](int j) { return t0 + j < T ? t0 + j : -1; });
         __syncthreads();
-        TILE_MAC(acc)
+        mma_tile(Ws, Xs, acc);
         __syncthreads();
     }
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 2; j++) {
-            int r = r0 + ty * 4 + i, t = t0 + tx * 2 + j;
-            if (r < rows && t < T) y[(size_t)t * rows + r] = acc[i][j];
-        }
+    store_y(acc, r0, [&](int r, int c, float v) {
+        if (r < rows && t0 + c < T) y[(size_t)(t0 + c) * rows + r] = v;
+    });
 }
 
 // 長さ n のベクトル gridDim.x 本をそれぞれ RMS 正規化する。並びは [種類][T][n] で、重みは種類ごとに wstride ずつずれる (0 なら共通)
@@ -383,45 +440,43 @@ extern "C" __global__ void moe_sort(const int* ids, int n, int* order, int* off)
 }
 
 // (prefill 用) expert ごとに、その expert に割り当てられた入力行をまとめて掛ける。重みはバッチにつき1回だけ読む
-// Y[a][r] = amax/2688 * sum_c W_e[r][c] X[a / xdiv][c]。ブロックは (rows/64, expert)、256スレッド
+// Y[a][r] = amax/2688 * sum_c W_e[r][c] X[a / xdiv][c]。グリッドは (rows/64, expert)、128スレッド
+// e2m1 x e4m3 は BF16 で誤差なく表せるので、amax/2688 は最後に掛ける
 extern "C" __global__ void gemm_nvfp4_grouped(const u8* __restrict__ w, const u8* __restrict__ s, const float* amax, int rows, int cols,
                                               const float* __restrict__ x, int xdiv, const int* order, const int* off, float* y) {
-    __shared__ __align__(16) float Ws[32][64];
-    __shared__ __align__(16) float Xs[32][32];
+    __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
     __shared__ int as[32];
     int e = blockIdx.y, beg = off[e], end = off[e + 1];
     if (beg == end) return;
-    int tid = threadIdx.x, ty = tid / 16, tx = tid % 16, r0 = blockIdx.x * 64;
+    int tid = threadIdx.x, r0 = blockIdx.x * 64;
     const u8* we = w + (size_t)e * rows * (cols / 2);
     const u8* se = s + (size_t)e * rows * (cols / 16);
     float g = amax[e] / 2688.f;
     for (int c0 = beg; c0 < end; c0 += 32) {
         if (tid < 32) as[tid] = c0 + tid < end ? order[c0 + tid] : -1;
-        float acc[4][2] = {};
+        float acc[4][4] = {};
         for (int k0 = 0; k0 < cols; k0 += 32) {
             __syncthreads();
-            // W のタイル: 64行 x 32列 = 行あたり 16 バイトとスケール 2 個。1スレッド 8 要素
+            // W のタイル: 64行 x 32列。1スレッドが1行の 16 要素 (8 バイトとスケール1個) を展開する
             {
-                int r = tid / 4, c = (tid % 4) * 8;
-                const u8* p = we + (size_t)(r0 + r) * (cols / 2) + (k0 + c) / 2;
-                unsigned u = *(const unsigned*)p;
-                float sc = e4m3(se[(size_t)(r0 + r) * (cols / 16) + (k0 + c) / 16]) * g;
-                for (int i = 0; i < 8; i++) Ws[c + i][r] = e2m1(u >> (4 * i)) * sc;
+                int r = tid / 2, c = (tid % 2) * 16;
+                uint2 pk = *(const uint2*)(we + (size_t)(r0 + r) * (cols / 2) + (k0 + c) / 2);
+                float sc = e4m3(se[(size_t)(r0 + r) * (cols / 16) + (k0 + c) / 16]);
+                unsigned v[8];
+                for (int i = 0; i < 4; i++) {
+                    v[i] = pack2(e2m1(pk.x >> (8 * i)) * sc, e2m1(pk.x >> (8 * i + 4)) * sc);
+                    v[i + 4] = pack2(e2m1(pk.y >> (8 * i)) * sc, e2m1(pk.y >> (8 * i + 4)) * sc);
+                }
+                *(uint4*)&Ws[r * TS + c] = make_uint4(v[0], v[1], v[2], v[3]);
+                *(uint4*)&Ws[r * TS + c + 8] = make_uint4(v[4], v[5], v[6], v[7]);
             }
-            {
-                int j = tid / 8, c = (tid % 8) * 4;
-                int a = as[j];
-                float4 v = a >= 0 ? *(const float4*)(x + (size_t)(a / xdiv) * cols + k0 + c) : make_float4(0, 0, 0, 0);
-                Xs[c][j] = v.x; Xs[c + 1][j] = v.y; Xs[c + 2][j] = v.z; Xs[c + 3][j] = v.w;
-            }
+            load_x(Xs, x, cols, k0, [&](int j) { return as[j] >= 0 ? as[j] / xdiv : -1; });
             __syncthreads();
-            TILE_MAC(acc)
+            mma_tile(Ws, Xs, acc);
         }
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 2; j++) {
-                int a = as[tx * 2 + j];
-                if (a >= 0) y[(size_t)a * rows + r0 + ty * 4 + i] = acc[i][j];
-            }
+        store_y(acc, r0, [&](int r, int c, float v) {
+            if (as[c] >= 0) y[(size_t)as[c] * rows + r] = v * g;
+        });
         __syncthreads();
     }
 }
