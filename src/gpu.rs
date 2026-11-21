@@ -17,7 +17,7 @@ use std::sync::Arc;
 pub const MAX_CTX: usize = 2048;
 
 /// prefill で一度に処理するトークン数の上限
-pub const TMAX: usize = 256;
+pub const TMAX: usize = 512;
 
 /// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
 const RING: usize = EXTENT + TMAX;
