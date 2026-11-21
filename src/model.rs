@@ -5,85 +5,85 @@ use crate::kernels::{dot_bf16, dot_mxfp8, dot_nvfp4};
 use crate::st::SafeTensors;
 
 pub const D: usize = 2304;
-const N_LAYER: usize = 24;
-const N_HEAD: usize = 24;
-const N_KV: usize = 8;
-const HD: usize = 128;
-const N_REL: usize = 16;
-const EXTENT: usize = 1024; // 相対位置表の長さ。SWA の窓幅も同じ 1024
-const N_EXP: usize = 128;
-const TOP_K: usize = 8;
-const FF: usize = 1152;
-const RANK: usize = 64;
-const CORE: (usize, usize) = (6, 18);
-const PASSES: usize = 3;
-const BLOCK: usize = 6; // attention residual の1ブロックの層数
-const N_SLOT: usize = N_LAYER + (PASSES - 1) * (CORE.1 - CORE.0);
-const VOCAB: usize = 200058;
-const EPS: f32 = 1e-6;
-const QK_CLIP: f32 = 22.627416997969522;
-const REL_CLIP: f32 = 8.0;
-const ROUTE_SCALE: f32 = 8.0;
-const SITU_BETA: f32 = 4.0;
-const SITU_LINEAR: f32 = 25.0;
-const SOFTCAP: f32 = 30.0;
-const MXFP8_FROM: usize = 20; // 20〜23層の expert は MXFP8
-const GLOBAL_LAYERS: [usize; 4] = [5, 11, 17, 23];
+pub(crate) const N_LAYER: usize = 24;
+pub(crate) const N_HEAD: usize = 24;
+pub(crate) const N_KV: usize = 8;
+pub(crate) const HD: usize = 128;
+pub(crate) const N_REL: usize = 16;
+pub(crate) const EXTENT: usize = 1024; // 相対位置表の長さ。SWA の窓幅も同じ 1024
+pub(crate) const N_EXP: usize = 128;
+pub(crate) const TOP_K: usize = 8;
+pub(crate) const FF: usize = 1152;
+pub(crate) const RANK: usize = 64;
+pub(crate) const CORE: (usize, usize) = (6, 18);
+pub(crate) const PASSES: usize = 3;
+pub(crate) const BLOCK: usize = 6; // attention residual の1ブロックの層数
+pub(crate) const N_SLOT: usize = N_LAYER + (PASSES - 1) * (CORE.1 - CORE.0);
+pub(crate) const VOCAB: usize = 200058;
+pub(crate) const EPS: f32 = 1e-6;
+pub(crate) const QK_CLIP: f32 = 22.627416997969522;
+pub(crate) const REL_CLIP: f32 = 8.0;
+pub(crate) const ROUTE_SCALE: f32 = 8.0;
+pub(crate) const SITU_BETA: f32 = 4.0;
+pub(crate) const SITU_LINEAR: f32 = 25.0;
+pub(crate) const SOFTCAP: f32 = 30.0;
+pub(crate) const MXFP8_FROM: usize = 20; // 20〜23層の expert は MXFP8
+pub(crate) const GLOBAL_LAYERS: [usize; 4] = [5, 11, 17, 23];
 
-type W = &'static [u16]; // BF16 の行優先行列 [out, in]
+pub(crate) type W = &'static [u16]; // BF16 の行優先行列 [out, in]
 
-struct Experts {
-    mx: bool, // true なら MXFP8、false なら NVFP4
-    w13: &'static [u8],
-    s13: &'static [u8],
-    a13: &'static [f32],
-    w2: &'static [u8],
-    s2: &'static [u8],
-    a2: &'static [f32],
+pub(crate) struct Experts {
+    pub(crate) mx: bool, // true なら MXFP8、false なら NVFP4
+    pub(crate) w13: &'static [u8],
+    pub(crate) s13: &'static [u8],
+    pub(crate) a13: &'static [f32],
+    pub(crate) w2: &'static [u8],
+    pub(crate) s2: &'static [u8],
+    pub(crate) a2: &'static [f32],
 }
 
-struct Ctrl {
-    down: W,
-    gain: W,
-    forget: W,
+pub(crate) struct Ctrl {
+    pub(crate) down: W,
+    pub(crate) gain: W,
+    pub(crate) forget: W,
 }
 
-struct Layer {
-    global: bool,
-    attn_query: Option<&'static [f32]>, // 1本 (SWA) か 3本 (global)
-    mlp_query: &'static [f32],
-    norms: [W; 3], // SWA は3つとも attn_norm
-    wq: W,
-    wk: W,
-    wv: W,
-    wo: W,
-    wr: W,
-    gate_attn: W,
-    sink: W,
-    q_clip: W,
-    rel_clip: W,
-    rel_proj: W, // [N_REL, EXTENT]
-    k_conv: Vec<[f32; 4]>, // [ch][k]、k=3 が現在のトークン
-    v_conv: Vec<[f32; 4]>,
-    k_dyn: Option<W>,
-    v_dyn: Option<W>,
-    attn_conv: Vec<[f32; 4]>,
-    mlp_conv: Vec<[f32; 4]>,
-    mlp_norm: W,
-    router: W,
-    router_bias: &'static [f32],
-    experts: Experts,
-    ctrl: Option<[Ctrl; 4]>, // q, k, v, mlp
-    msg_query: Option<Vec<f32>>, // [4, D]
+pub(crate) struct Layer {
+    pub(crate) global: bool,
+    pub(crate) attn_query: Option<&'static [f32]>, // 1本 (SWA) か 3本 (global)
+    pub(crate) mlp_query: &'static [f32],
+    pub(crate) norms: [W; 3], // SWA は3つとも attn_norm
+    pub(crate) wq: W,
+    pub(crate) wk: W,
+    pub(crate) wv: W,
+    pub(crate) wo: W,
+    pub(crate) wr: W,
+    pub(crate) gate_attn: W,
+    pub(crate) sink: W,
+    pub(crate) q_clip: W,
+    pub(crate) rel_clip: W,
+    pub(crate) rel_proj: W, // [N_REL, EXTENT]
+    pub(crate) k_conv: Vec<[f32; 4]>, // [ch][k]、k=3 が現在のトークン
+    pub(crate) v_conv: Vec<[f32; 4]>,
+    pub(crate) k_dyn: Option<W>,
+    pub(crate) v_dyn: Option<W>,
+    pub(crate) attn_conv: Vec<[f32; 4]>,
+    pub(crate) mlp_conv: Vec<[f32; 4]>,
+    pub(crate) mlp_norm: W,
+    pub(crate) router: W,
+    pub(crate) router_bias: &'static [f32],
+    pub(crate) experts: Experts,
+    pub(crate) ctrl: Option<[Ctrl; 4]>, // q, k, v, mlp
+    pub(crate) msg_query: Option<Vec<f32>>, // [4, D]
 }
 
 pub struct Model {
-    embed: W,
-    embed_norm: W,
-    norm: W,
-    unembed: W,
-    output_query: &'static [f32],
-    layers: Vec<Layer>,
+    pub(crate) embed: W,
+    pub(crate) embed_norm: W,
+    pub(crate) norm: W,
+    pub(crate) unembed: W,
+    pub(crate) output_query: &'static [f32],
+    pub(crate) layers: Vec<Layer>,
 }
 
 #[derive(Default, Clone)]
@@ -386,7 +386,7 @@ impl Model {
         add(&cur, &m)
     }
 
-    fn moe(&self, l: &Layer, x: &[f32]) -> Vec<f32> {
+    pub(crate) fn moe(&self, l: &Layer, x: &[f32]) -> Vec<f32> {
         let p: Vec<f32> = mv(l.router, x).iter().map(|&z| sigmoid(z)).collect();
         let mut idx: Vec<usize> = (0..N_EXP).collect();
         idx.sort_by(|&a, &b| (p[b] + l.router_bias[b]).total_cmp(&(p[a] + l.router_bias[a])));
@@ -424,11 +424,11 @@ fn bf16(x: u16) -> f32 {
     f32::from_bits((x as u32) << 16)
 }
 
-fn bf_vec(w: W) -> Vec<f32> {
+pub(crate) fn bf_vec(w: W) -> Vec<f32> {
     w.iter().map(|&x| bf16(x)).collect()
 }
 
-fn bf_row(w: W, row: usize, n: usize) -> Vec<f32> {
+pub(crate) fn bf_row(w: W, row: usize, n: usize) -> Vec<f32> {
     bf_vec(&w[row * n..][..n])
 }
 
@@ -463,7 +463,7 @@ impl Experts {
     }
 }
 
-fn rmsnorm(x: &mut [f32], w: Option<W>) {
+pub(crate) fn rmsnorm(x: &mut [f32], w: Option<W>) {
     let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let k = 1.0 / (ms + EPS).sqrt();
     match w {
@@ -558,8 +558,12 @@ fn control(cur: &[f32], msg: &[f32], c: &Ctrl) -> Vec<f32> {
 static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("OCTO_TRACE").is_some());
 
 /// OCTO_TRACE を設定すると、各キャッシュスロットの層出力を llama.cpp の l_out-N と比べられる形で出す。
-fn trace(slot: usize, x: &[f32]) {
+pub(crate) fn trace(slot: usize, x: &[f32]) {
     if *TRACE {
         eprintln!("l_out-{slot} [{:.4} {:.4} {:.4}] sum {:.6}", x[0], x[1], x[2], x.iter().sum::<f32>());
     }
+}
+
+pub(crate) fn tracing() -> bool {
+    *TRACE
 }
