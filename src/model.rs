@@ -387,7 +387,7 @@ impl Model {
     }
 
     /// ルーター: 上位8個の expert と、正規化して route_scale を掛けた重み
-    fn route(&self, l: &Layer, x: &[f32]) -> ([usize; TOP_K], [f32; TOP_K]) {
+    pub(crate) fn route(&self, l: &Layer, x: &[f32]) -> ([usize; TOP_K], [f32; TOP_K]) {
         let p: Vec<f32> = mv(l.router, x).iter().map(|&z| sigmoid(z)).collect();
         let mut idx: Vec<usize> = (0..N_EXP).collect();
         idx.sort_by(|&a, &b| (p[b] + l.router_bias[b]).total_cmp(&(p[a] + l.router_bias[a])));

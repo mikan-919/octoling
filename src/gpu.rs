@@ -23,6 +23,12 @@ pub const TMAX: usize = 512;
 /// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
 const RING: usize = EXTENT + TMAX;
 
+/// 投機的デコードで一度に検証するトークン数の上限
+pub const SPEC_T: usize = 8;
+
+/// 下書きモデルが読む層出力のスロット (層の適用の 4, 22, 40 番目)
+const TAP_SLOTS: [usize; 3] = [4, 28, 46];
+
 type P = u64; // デバイスのポインタ
 
 trait Arg {
@@ -102,6 +108,7 @@ struct GSlot {
     kc: P,
     vc: P,
     hist: [P; 4], // k, v, attn 出力, mlp 出力
+    seq: [P; 4],  // 検証のバッチの [直前の入力3つ; 入力 SPEC_T 個]。外れた下書きを捨てるとき hist を戻す
 }
 
 // TMAX トークン分の作業領域。並びは gpu.cu の先頭に書いたとおり [種類][T][要素]
@@ -135,6 +142,9 @@ struct Bufs {
     off: P,
     part: P, // [24][NSPLIT][HD + 2]。生成時の注意の部分結果
     logits: P,
+    taps: P,       // [4][TMAX][D]。下書きモデルが読む、スロット 4, 28, 46 の層出力と最後の正規化の出力
+    amax: P,       // [SPEC_T] i32。検証のバッチの各行の、最大の logits の位置
+    logits_all: P, // [SPEC_T][201024]
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -152,8 +162,10 @@ pub struct Gpu {
     output_query: P,
     b: Bufs,
     pos: usize,
-    // 1トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph
-    graphs: RefCell<Vec<CudaGraph>>,
+    // T トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph。(T, 検証か) ごと
+    graphs: RefCell<HashMap<(usize, bool), Vec<CudaGraph>>>,
+    recording: RefCell<Vec<CudaGraph>>,
+    rewind_tab: P, // conv_rewind に渡す (seq, hist, ch) の表
     capturing: Cell<bool>,
     // prefill で、20〜23層の MXFP8 expert の一部を PCIe で送って GPU で計算するための送信用ストリームと置き場
     copy: Arc<CudaStream>,
@@ -175,9 +187,9 @@ const S2: usize = W2 / 32;
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 22] = [
+const KERNELS: [&str; 24] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
-    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel",
+    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -245,13 +257,14 @@ impl Gpu {
                 }
             })
             .collect();
-        let slots = (0..N_SLOT)
+        let slots: Vec<GSlot> = (0..N_SLOT)
             .map(|s| {
                 let rows = if GLOBAL_LAYERS.contains(&phys(s)) { MAX_CTX } else { RING };
                 GSlot {
                     kc: up.zeros(rows * 1024 * 2),
                     vc: up.zeros(rows * 1024 * 2),
                     hist: [1024, 1024, D, D].map(|ch| up.zeros(ch * 3 * 4)),
+                    seq: [1024, 1024, D, D].map(|ch| up.zeros(ch * (SPEC_T + 3) * 4)),
                 }
             })
             .collect();
@@ -287,11 +300,16 @@ impl Gpu {
             off: fz(129, &mut up),
             logits: fz(201024, &mut up),
             part: fz(24 * 16 * 130, &mut up),
+            taps: fz(4 * t * D, &mut up),
+            amax: fz(SPEC_T, &mut up),
+            logits_all: fz(SPEC_T * 201024, &mut up),
         };
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
         let staging = [0; 2].map(|_| up.zeros(GROUP * (W13 + S13 + W2 + S2)));
+        let tab: Vec<u64> = slots.iter().flat_map(|s: &GSlot| (0..4).flat_map(move |k| [s.seq[k], s.hist[k], [1024, 1024, D, D][k] as u64])).collect();
+        let rewind_tab = up.bytes(as_bytes(&tab));
         let (free, _) = result::mem_get_info().unwrap();
         eprintln!("GPU に {:.2} GB 載せた。残り {:.2} GB", up.total as f64 / 1e9, free as f64 / 1e9);
         let ev = || ctx.new_event(None).unwrap();
@@ -312,7 +330,9 @@ impl Gpu {
             output_query,
             b,
             pos: 0,
-            graphs: RefCell::new(vec![]),
+            graphs: RefCell::new(HashMap::new()),
+            recording: RefCell::new(vec![]),
+            rewind_tab,
             capturing: Cell::new(false),
         }
     }
@@ -367,9 +387,9 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize) {
+    fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize, seq: P) {
         let d = dyn_.map_or(-1, |d| d as i32);
-        k!(self, "conv", ch.div_ceil(256), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32);
+        k!(self, "conv", ch.div_ceil(256), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq);
     }
 
     /// トークンの埋め込みと先頭の位置を GPU に送る
@@ -387,36 +407,73 @@ impl Gpu {
         self.htod(self.b.pos, &[self.pos as i32]);
     }
 
-    /// 1トークンを処理して、語彙の logits を返す。
-    /// 最初のトークンでカーネル列を CUDA Graph に記録し、以降は再生する。トレース中は記録せず毎回カーネルを投げる。
-    pub fn forward(&mut self, token: u32) -> Vec<f32> {
-        self.inputs(&[token]);
-        if self.graphs.borrow().is_empty() || model::tracing() {
-            self.capturing.set(!model::tracing());
-            self.begin();
-            self.record(1);
-            self.end();
-            self.capturing.set(false);
-        } else {
-            for (i, g) in self.graphs.borrow().iter().enumerate() {
+    /// 位置 self.pos から T トークンを処理する。T <= SPEC_T なら、最初の1回でカーネル列を CUDA Graph に記録し、
+    /// 以降は再生する。それより多いときとトレース中は、毎回カーネルを投げる。
+    /// verify なら全行の最大の logits の位置を b.amax に、そうでなければ最後の行の logits を b.logits に書く
+    fn run(&self, t: usize, verify: bool) {
+        let key = (t, verify);
+        let small = t <= SPEC_T && !model::tracing();
+        if small && let Some(gs) = self.graphs.borrow().get(&key) {
+            for (i, g) in gs.iter().enumerate() {
                 g.launch().unwrap();
                 if i < N_LAYER - MXFP8_FROM {
-                    self.cpu_moe(MXFP8_FROM + i);
+                    self.cpu_moe(MXFP8_FROM + i, t);
                 }
             }
+            return;
         }
+        self.capturing.set(small);
+        self.begin();
+        self.record(t, verify);
+        self.end();
+        self.capturing.set(false);
+        if small {
+            let gs = std::mem::take(&mut *self.recording.borrow_mut());
+            self.graphs.borrow_mut().insert(key, gs);
+        }
+    }
+
+    /// 1トークンを処理して、語彙の logits を返す。
+    pub fn forward(&mut self, token: u32) -> Vec<f32> {
+        self.inputs(&[token]);
+        self.run(1, false);
         self.pos += 1;
         self.dtoh(self.b.logits, VOCAB)
     }
 
     /// プロンプトを TMAX トークンずつまとめて処理し、最後のトークンの logits を返す。
-    pub fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+    /// after(chunk の長さ) はチャンクごとに呼ばれ、その間 taps にそのチャンクの層出力がある
+    pub fn prefill_with(&mut self, tokens: &[u32], mut after: impl FnMut(&Self, usize)) -> Vec<f32> {
         for chunk in tokens.chunks(TMAX) {
             self.inputs(chunk);
-            self.record(chunk.len());
+            self.run(chunk.len(), false);
+            after(self, chunk.len());
             self.pos += chunk.len();
         }
         self.dtoh(self.b.logits, VOCAB)
+    }
+
+    pub fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.prefill_with(tokens, |_, _| {})
+    }
+
+    /// (投機的デコード) tokens を位置 self.pos から一度に処理し、各行の次のトークン (logits の最大の位置) を返す。
+    /// 外れた下書きは rewind で捨てる
+    pub fn verify(&mut self, tokens: &[u32]) -> Vec<u32> {
+        assert!(tokens.len() <= SPEC_T);
+        self.inputs(tokens);
+        self.run(tokens.len(), true);
+        self.pos += tokens.len();
+        self.dtoh::<i32>(self.b.amax, tokens.len()).into_iter().map(|t| t as u32).collect()
+    }
+
+    /// 直前の verify の t トークンのうち、先頭 keep 個だけを残す。畳み込みの状態を戻し、位置を下げる。
+    /// KV キャッシュは位置で読むので、捨てた位置は次に書くときに上書きされる
+    pub fn rewind(&mut self, keep: usize, t: usize) {
+        if keep < t {
+            k!(self, "conv_rewind", (D.div_ceil(256), self.slots.len() * 4), 256, 0; self.rewind_tab, keep as i32);
+            self.pos -= t - keep;
+        }
     }
 
     /// 次に処理するトークンの位置 (= ここまでに処理したトークン数)
@@ -447,14 +504,22 @@ impl Gpu {
         if self.capturing.get() {
             let g = self.stream.end_capture(sys::CUgraphInstantiate_flags(0)).unwrap().expect("空のグラフ");
             g.launch().unwrap();
-            self.graphs.borrow_mut().push(g);
+            self.recording.borrow_mut().push(g);
         }
     }
 
-    /// (生成) 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
-    fn cpu_moe(&self, il: usize) {
-        let h = self.dtoh(self.b.h, D);
-        let y = self.cpu.moe(&self.cpu.layers[il], &h);
+    /// (生成と検証) 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
+    fn cpu_moe(&self, il: usize, t: usize) {
+        let h: Vec<f32> = self.dtoh(self.b.h, t * D);
+        let l = &self.cpu.layers[il];
+        let y = if t == 1 {
+            self.cpu.moe(l, &h)
+        } else {
+            let routes: Vec<_> = h.chunks(D).map(|x| self.cpu.route(l, x)).collect();
+            let ids: Vec<i32> = routes.iter().flat_map(|r| r.0.map(|e| e as i32)).collect();
+            let wts: Vec<f32> = routes.iter().flat_map(|r| r.1).collect();
+            self.cpu.moe_batch(l, &h, &ids, &wts, |_| true)
+        };
         self.htod(self.b.y, &y);
     }
 
@@ -520,8 +585,8 @@ impl Gpu {
         k!(self, "add", (t * D).div_ceil(256), 256, 0; b.y, b.a, b.y, (t * D) as i32);
     }
 
-    /// T トークン分のカーネル列を投げる。logits は最後のトークンの分だけ求める
-    fn record(&self, t: usize) {
+    /// T トークン分のカーネル列を投げる。logits は、verify なら全行の最大の位置だけ、そうでなければ最後の行を求める
+    fn record(&self, t: usize, verify: bool) {
         let b = &self.b;
         let slab = |i: usize| f4(i * t * D); // [種類][T][D] の i 番目
         let mut nb = 0;
@@ -551,10 +616,17 @@ impl Gpu {
             self.layer(il, il, il, &mut nb, false, t);
         }
         self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t);
-        let last = b.h + f4((t - 1) * D);
-        k!(self, "rmsnorm", 1, 256, 0; last, self.norm, last, D as i32, 0i32, 1i32);
-        self.gemm(self.unembed, last, b.logits, 201024, D, 1);
-        k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32);
+        // 正規化した最後の隠れ状態は、下書きモデルの4つ目の入力でもある
+        let normed = b.taps + f4(3 * TMAX * D);
+        k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, D as i32, 0i32, t as i32);
+        if verify {
+            // softcap は単調なので、最大の位置は変わらない
+            self.gemm(self.unembed, normed, b.logits_all, 201024, D, t);
+            k!(self, "argmax_rows", t, 1024, 0; b.logits_all, 201024i32, VOCAB as i32, b.amax);
+        } else {
+            self.gemm(self.unembed, normed + f4((t - 1) * D), b.logits, 201024, D, 1);
+            k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -587,8 +659,10 @@ impl Gpu {
         self.gemm(l.wk, xk, b.kx, nk, D, t);
         self.gemm(l.wv, xv, b.vx, nk, D, t);
         let dyn_ = l.global.then_some(1024);
-        self.conv(b.kx, nk, l.k_conv, dyn_, s.hist[0], b.kp, 1024, 1024, 128, t);
-        self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t);
+        // 小さいバッチ (生成と検証) では、外れた下書きを捨てられるよう畳み込みの入力を残す
+        let seq = |k: usize| if t <= SPEC_T { s.seq[k] } else { 0 };
+        self.conv(b.kx, nk, l.k_conv, dyn_, s.hist[0], b.kp, 1024, 1024, 128, t, seq(0));
+        self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t, seq(1));
         let ring = if l.global { 0 } else { RING as i32 };
         k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
         if t == 1 {
@@ -598,7 +672,7 @@ impl Gpu {
             k!(self, "attn_tile", (24, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
         }
         self.gemm(l.wo, b.o, b.a, D, 3072, t);
-        self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.a, D, D, D, t);
+        self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.a, D, D, D, t, seq(2));
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む
         if ip % BLOCK == 0 {
             self.copy(b.blocks + slab(*nb), b.x, t * D);
@@ -630,15 +704,18 @@ impl Gpu {
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }
-            None if t == 1 => {
+            None if t <= SPEC_T => {
                 self.end();
-                self.cpu_moe(il);
+                self.cpu_moe(il, t);
                 self.begin();
             }
             None => self.hybrid_moe(il, t),
         }
-        self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t);
+        self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t, seq(3));
         k!(self, "add", (t * D).div_ceil(256), 256, 0; b.x, b.y, b.x, (t * D) as i32);
+        if let Some(j) = TAP_SLOTS.iter().position(|&s| s == slot) {
+            self.copy(b.taps + f4(j * TMAX * D), b.x, t * D);
+        }
         if model::tracing() && t == 1 {
             model::trace(slot, &self.dtoh(b.x, D));
         }

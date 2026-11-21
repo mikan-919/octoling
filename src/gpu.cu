@@ -265,14 +265,21 @@ extern "C" __global__ void control(float* cur, const float* msg, const float* gf
 
 // 因果的な短い畳み込みと残差。トークンを順に流す。w は [ch][4] で k=3 が現在、hist は [ch][3]
 // 入力の行は cs 要素おき、出力の行は os 要素おき。dyn >= 0 なら入力の行の dyn 番目からがヘッドごとの [lag] のタップ
-extern "C" __global__ void conv(const float* cur, int cs, const float* w, int dyn, float* hist, float* out, int os, int ch, int cph, int T) {
+// seq が 0 でなければ、[直前の入力3つ; このバッチの入力 T 個] を seq [3 + T][ch] に残す。投機的デコードで、受け入れた位置までの状態に戻すため
+extern "C" __global__ void conv(const float* cur, int cs, const float* w, int dyn, float* hist, float* out, int os, int ch, int cph, int T, float* seq) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
     float h0 = hist[c * 3], h1 = hist[c * 3 + 1], h2 = hist[c * 3 + 2];
+    if (seq) {
+        seq[c] = h0;
+        seq[ch + c] = h1;
+        seq[2 * ch + c] = h2;
+    }
     float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     for (int t = 0; t < T; t++) {
         const float* row = cur + (size_t)t * cs;
         float x = row[c];
+        if (seq) seq[(size_t)(3 + t) * ch + c] = x;
         float o = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x;
         if (dyn >= 0) {
             const float* d = row + dyn + (c / cph) * 4;
@@ -671,4 +678,44 @@ extern "C" __global__ void moe_sum(const float* yd, const float* wts, float* y, 
     float s = 0.f;
     for (int k = 0; k < TOPK; k++) s += wts[t * TOPK + k] * yd[((size_t)t * TOPK + k) * D + d];
     y[i] = s;
+}
+
+// ---- 投機的デコードの検証 ----
+
+// 畳み込みの状態を、検証したバッチのうち先頭 a 個の入力を受け入れた時点に戻す。
+// tab[3e .. 3e+2] = (seq, hist, ch)。新しい状態は seq の行 a, a+1, a+2。グリッドは (ch/256, 項目の数)
+extern "C" __global__ void conv_rewind(const unsigned long long* tab, int a) {
+    const float* seq = (const float*)tab[3 * blockIdx.y];
+    float* hist = (float*)tab[3 * blockIdx.y + 1];
+    int ch = (int)tab[3 * blockIdx.y + 2], c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ch) return;
+    for (int k = 0; k < 3; k++) hist[c * 3 + k] = seq[(size_t)(a + k) * ch + c];
+}
+
+// 行ごとの、先頭 n 個のうち最大の値の位置 (同じ値なら小さい位置)。行は stride 個おき。ブロックは行ごと、1024スレッド
+extern "C" __global__ void argmax_rows(const float* x, int stride, int n, int* out) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const float* r = x + (size_t)blockIdx.x * stride;
+    float v = -INFINITY;
+    int i = 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x)
+        if (r[j] > v) v = r[j], i = j;
+    for (int o = 16; o > 0; o >>= 1) {
+        float v2 = __shfl_xor_sync(0xffffffffu, v, o);
+        int i2 = __shfl_xor_sync(0xffffffffu, i, o);
+        if (v2 > v || (v2 == v && i2 < i)) v = v2, i = i2;
+    }
+    if ((threadIdx.x & 31) == 0) bv[threadIdx.x >> 5] = v, bi[threadIdx.x >> 5] = i;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = threadIdx.x < (blockDim.x >> 5) ? bv[threadIdx.x] : -INFINITY;
+        i = threadIdx.x < (blockDim.x >> 5) ? bi[threadIdx.x] : 0;
+        for (int o = 16; o > 0; o >>= 1) {
+            float v2 = __shfl_xor_sync(0xffffffffu, v, o);
+            int i2 = __shfl_xor_sync(0xffffffffu, i, o);
+            if (v2 > v || (v2 == v && i2 < i)) v = v2, i = i2;
+        }
+        if (threadIdx.x == 0) out[blockIdx.x] = i;
+    }
 }
