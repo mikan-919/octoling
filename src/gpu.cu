@@ -17,6 +17,25 @@
 
 typedef unsigned short bf16;
 typedef unsigned char u8;
+typedef unsigned short half_t; // KV キャッシュは f16
+
+__device__ __forceinline__ half_t f2h(float f) {
+    half_t h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    return h;
+}
+
+__device__ __forceinline__ float h2f(half_t h) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+// f16 4つを f32 4つに
+__device__ __forceinline__ float4 h4(const half_t* p) {
+    uint2 u = *(const uint2*)p;
+    return make_float4(h2f(u.x & 0xffff), h2f(u.x >> 16), h2f(u.y & 0xffff), h2f(u.y >> 16));
+}
 
 __device__ __forceinline__ float bf(unsigned x) { return __uint_as_float(x << 16); }
 
@@ -278,7 +297,7 @@ __device__ float clip_scale(float v, float threshold) {
 // 位置はデバイスのメモリから読む (先頭トークンの位置)。CUDA Graph で同じカーネル列を毎トークン再生するため
 // ring > 0 なら SWA で、キャッシュは ring 行のリングバッファ
 extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp, const float* qclip, const float* rclip, const int* posp,
-                                    int ring, float* kc, float* vc) {
+                                    int ring, half_t* kc, half_t* vc) {
     int b = blockIdx.x, t = threadIdx.x, pos = *posp + blockIdx.y;
     float* q = qx + (size_t)blockIdx.y * QX;
     float* r = q + R_OFF;
@@ -300,11 +319,11 @@ extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp,
     } else if (b < 56) {
         int h = b - 48;
         float x = k[h * HD + t];
-        kc[h * HD + t] = x * clip_scale(x, 22.627416997969522f);
+        kc[h * HD + t] = f2h(x * clip_scale(x, 22.627416997969522f));
     } else {
         int h = b - 56;
         float x = v[h * HD + t];
-        vc[h * HD + t] = x * rsqrtf(block_sum(x * x) / HD + 1e-6f);
+        vc[h * HD + t] = f2h(x * rsqrtf(block_sum(x * x) / HD + 1e-6f));
     }
 }
 
@@ -326,7 +345,7 @@ __device__ __forceinline__ size_t kv_row(int j, int ring) { return (size_t)(ring
 // グリッドは (ヘッド, NSPLIT) で固定なので、CUDA Graph でも位置に応じて分け方が変わる。128スレッド
 #define NSPLIT 16
 #define PART (HD + 2)
-extern "C" __global__ void attn_part(const float* qx, const float* kc, const float* vc, const float* rel_proj, float* part, const int* posp, int ring) {
+extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* part, const int* posp, int ring) {
     __shared__ float sc[(MAX_CTX_DEV + NSPLIT - 1) / NSPLIT];
     int pos = *posp, first = ring ? max(0, pos + 1 - EXTENT) : 0, n = pos + 1;
     int h = blockIdx.x, kvh = h / 3, t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -336,7 +355,7 @@ extern "C" __global__ void attn_part(const float* qx, const float* kc, const flo
     for (int i = 0; i < NREL; i++) rh[i] = qx[R_OFF + h * NREL + i];
     float4 qv = ((const float4*)(qx + h * HD))[lane];
     for (int j = j0 + warp; j < j1; j += blockDim.x >> 5) {
-        float4 kv = ((const float4*)(kc + kv_row(j, ring) + kvh * HD))[lane];
+        float4 kv = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
         float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
         if (lane == 0) sc[j - j0] = s * rsqrtf((float)HD) + rel_bias(rh, rel_proj, pos - j);
     }
@@ -349,7 +368,7 @@ extern "C" __global__ void attn_part(const float* qx, const float* kc, const flo
         for (int i = t; i < j1 - j0; i += blockDim.x) z += sc[i] = expf(sc[i] - m);
     z = block_sum(z);
     float o = 0.f;
-    for (int j = j0; j < j1; j++) o += sc[j - j0] * vc[kv_row(j, ring) + kvh * HD + t];
+    for (int j = j0; j < j1; j++) o += sc[j - j0] * h2f(vc[kv_row(j, ring) + kvh * HD + t]);
     out[2 + t] = o;
     if (t == 0) {
         out[0] = m;
@@ -376,7 +395,7 @@ extern "C" __global__ void attn_combine(const float* qx, const float* part, floa
 // グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
 #define QT 32
 #define KT 16
-extern "C" __global__ void attn_tile(const float* qx, const float* kc, const float* vc, const float* rel_proj, float* out, const int* posp, int ring, int T) {
+extern "C" __global__ void attn_tile(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* out, const int* posp, int ring, int T) {
     __shared__ __align__(16) float Qs[QT][HD];
     __shared__ __align__(16) float Ks[KT][HD + 4];
     __shared__ __align__(16) float Vs[KT][HD];
@@ -404,8 +423,8 @@ extern "C" __global__ void attn_tile(const float* qx, const float* kc, const flo
             int k = i / HD, j = j0 + k;
             float kv = 0.f, vv = 0.f;
             if (j <= pmax) {
-                kv = kc[kv_row(j, ring) + kvh * HD + i % HD];
-                vv = vc[kv_row(j, ring) + kvh * HD + i % HD];
+                kv = h2f(kc[kv_row(j, ring) + kvh * HD + i % HD]);
+                vv = h2f(vc[kv_row(j, ring) + kvh * HD + i % HD]);
             }
             Ks[k][i % HD] = kv;
             Vs[k][i % HD] = vv;

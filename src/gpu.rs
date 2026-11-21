@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-/// global 層の KV キャッシュの長さ。8192 にすると VRAM の予算を超え、Windows が GPU メモリを退避して遅くなる。
+/// global 層の KV キャッシュの長さ。KV は f16 で、8192 トークンで global 層 268 MB、SWA 層のリング 250 MB。
+/// f32 のときは 2048 が上限だった (8192 にすると VRAM の予算を超え、Windows が GPU メモリを退避して遅くなった)。
 /// attn_part は分割1つ分のスコア (MAX_CTX / 16 個) を共有メモリに置く。
-/// ponytail: 文脈長の上限。伸ばすなら KV を BF16 にして VRAM を空ける
-pub const MAX_CTX: usize = 2048;
+/// ponytail: 文脈長の上限。伸ばすなら KV を 8 ビットにするか、SWA 層のリングだけ残して global 層の KV を主記憶に置く
+pub const MAX_CTX: usize = 8192;
 
 /// prefill で一度に処理するトークン数の上限
 pub const TMAX: usize = 512;
@@ -248,8 +249,8 @@ impl Gpu {
             .map(|s| {
                 let rows = if GLOBAL_LAYERS.contains(&phys(s)) { MAX_CTX } else { RING };
                 GSlot {
-                    kc: up.zeros(rows * 1024 * 4),
-                    vc: up.zeros(rows * 1024 * 4),
+                    kc: up.zeros(rows * 1024 * 2),
+                    vc: up.zeros(rows * 1024 * 2),
                     hist: [1024, 1024, D, D].map(|ch| up.zeros(ch * 3 * 4)),
                 }
             })
