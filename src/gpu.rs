@@ -653,7 +653,8 @@ impl Gpu {
     /// (prefill、主記憶の KV) 位置 0..pos+t の KV を KB 位置ずつ置き場に送り、塊ごとに注意を足し込む。
     /// GPU が主記憶を直接読むと、クエリのタイルごとに同じ KV を読み直すことになり遅い
     fn attn_host(&self, host: [usize; 2], l: &GLayer, t: usize) {
-        const KB: usize = 16384; // 置き場 1 つ (66 MB) に K と V が入る位置数 (1 位置 2 KB ずつ)
+        // 置き場 1 つ (65.7 MB) に K と V が入る位置数 (1 位置 2 KB ずつ)。16 の倍数に切り下げる
+        const KB: usize = GROUP * (W13 + S13 + W2 + S2) / 4096 / 16 * 16;
         let (b, st, end) = (&self.b, self.staging[0], self.pos + t);
         for (i, b0) in (0..end).step_by(KB).enumerate() {
             let nb = KB.min(end - b0);
