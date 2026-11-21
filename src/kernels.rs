@@ -69,6 +69,59 @@ pub fn dot_mxfp8(w: &[u8], scales: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// f32 どうしの内積。n は 32 の倍数。
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    assert!(a.len() == b.len() && a.len() % 32 == 0);
+    // SAFETY: 長さは上で検査した
+    unsafe {
+        let (mut a0, mut a1) = (_mm512_setzero_ps(), _mm512_setzero_ps());
+        for i in (0..a.len()).step_by(32) {
+            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(i)), _mm512_loadu_ps(b.as_ptr().add(i)), a0);
+            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(i + 16)), _mm512_loadu_ps(b.as_ptr().add(i + 16)), a1);
+        }
+        _mm512_reduce_add_ps(_mm512_add_ps(a0, a1))
+    }
+}
+
+/// 1本の w と4本の x それぞれの内積。w を1回読むあいだに4本と積和し、FMA の待ち時間を4本の独立な積和で埋める。
+pub fn dot_f32_x4(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
+    assert!(w.len() % 16 == 0 && x.iter().all(|x| x.len() == w.len()));
+    // SAFETY: 長さは上で検査した
+    unsafe {
+        let mut acc = [_mm512_setzero_ps(); 4];
+        for i in (0..w.len()).step_by(16) {
+            let wv = _mm512_loadu_ps(w.as_ptr().add(i));
+            for j in 0..4 {
+                acc[j] = _mm512_fmadd_ps(wv, _mm512_loadu_ps(x[j].as_ptr().add(i)), acc[j]);
+            }
+        }
+        acc.map(|a| _mm512_reduce_add_ps(a))
+    }
+}
+
+/// MXFP8 の1行を f32 に展開する。
+pub fn dequant_mxfp8(w: &[u8], scales: &[u8], out: &mut [f32]) {
+    assert!(w.len() == out.len() && scales.len() * 32 == out.len());
+    // SAFETY: 長さは上で検査した。dot_mxfp8 と同じビットの置き換え
+    unsafe {
+        let m7f = _mm512_set1_epi32(0x7f);
+        let m80 = _mm512_set1_epi32(0x80);
+        for (blk, &s) in scales.iter().enumerate() {
+            // 2^120 を先に掛けて E4M3 の値に戻してから、2^(s-127) を掛ける (逆順だと s が大きいとき溢れる)
+            let sc = _mm512_set1_ps(f32::from_bits((s as u32) << 23));
+            let k = _mm512_set1_ps(2f32.powi(120));
+            for half in 0..2 {
+                let i = blk * 32 + half * 16;
+                let b = _mm512_cvtepu8_epi32(_mm_loadu_si128(w.as_ptr().add(i).cast()));
+                let mag = _mm512_slli_epi32(_mm512_and_si512(b, m7f), 20);
+                let sign = _mm512_slli_epi32(_mm512_and_si512(b, m80), 24);
+                let v = _mm512_mul_ps(_mm512_castsi512_ps(_mm512_or_si512(mag, sign)), k);
+                _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_mul_ps(v, sc));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +171,9 @@ mod tests {
         let scales: Vec<u8> = rand_bytes(36, 4).iter().map(|b| 110 + b % 30).collect();
         let want: f32 = (0..1152).map(|i| e4m3(w[i]) * 2f32.powi(scales[i / 32] as i32 - 127) * x[i]).sum();
         close(dot_mxfp8(&w, &scales, &x), want);
+        let mut row = vec![0.0; 1152];
+        dequant_mxfp8(&w, &scales, &mut row);
+        close(dot_f32(&row, &x), want);
+        close(dot_f32_x4(&row, [&x; 4])[3], want);
     }
 }

@@ -1,7 +1,7 @@
 //! Inkling 2 Mini のテキスト部の順伝播。1トークンずつ処理する。
 //! 仕様は llama.cpp の src/models/inkling2.cpp と inkling2-loop.cpp に合わせている。
 
-use crate::kernels::{dot_bf16, dot_mxfp8, dot_nvfp4};
+use crate::kernels::{dequant_mxfp8, dot_bf16, dot_f32, dot_f32_x4, dot_mxfp8, dot_nvfp4};
 use crate::st::SafeTensors;
 
 pub const D: usize = 2304;
@@ -440,30 +440,52 @@ impl Model {
         let chunks = 2 * FF / 64;
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
+            let mut w = vec![0.0; D];
             for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
-                for &a in &lists[ex] {
-                    let v = e.dot(e.w13, e.s13, ex * 2 * FF + row, &xs[a / TOP_K * D..][..D]) * e.g13(ex);
+                // 行を1回だけ展開し、その expert に割り当てられた全トークンに掛ける
+                e.dequant(e.w13, e.s13, ex * 2 * FF + row, &mut w);
+                dots(&w, &lists[ex], |a| &xs[a / TOP_K * D..][..D], |a, v| {
                     // SAFETY: (expert, 行) ごとに書く場所は重ならない
-                    unsafe { *out.at(a * 2 * FF + row) = v };
-                }
+                    unsafe { *out.at(a * 2 * FF + row) = v * e.g13(ex) };
+                });
             }
         });
-        let act = situ_pairs(&gu);
+        let mut act = vec![0.0; n_assign * FF];
+        crate::pool::chunks_mut(&mut act, FF, |a, o| o.copy_from_slice(&situ_pairs(&gu[a * 2 * FF..][..2 * FF])));
 
         let mut yd = vec![0.0; n_assign * D];
         let out = Shared(yd.as_mut_ptr());
         let chunks = D / 64;
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
+            let mut w = vec![0.0; FF];
             for row in (task % chunks) * 64..(task % chunks + 1) * 64 {
-                for &a in &lists[ex] {
-                    let v = e.dot(e.w2, e.s2, ex * D + row, &act[a * FF..][..FF]) * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K];
+                e.dequant(e.w2, e.s2, ex * D + row, &mut w);
+                dots(&w, &lists[ex], |a| &act[a * FF..][..FF], |a, v| {
                     // SAFETY: 同上
-                    unsafe { *out.at(a * D + row) = v };
-                }
+                    unsafe { *out.at(a * D + row) = v * e.g2(ex) * routes[a / TOP_K].1[a % TOP_K] };
+                });
             }
         });
-        (0..t * D).map(|i| (0..TOP_K).map(|k| yd[(i / D * TOP_K + k) * D + i % D]).sum()).collect()
+        let mut y = vec![0.0; t * D];
+        crate::pool::chunks_mut(&mut y, D, |tok, o| {
+            for k in 0..TOP_K {
+                o.iter_mut().zip(&yd[(tok * TOP_K + k) * D..][..D]).for_each(|(o, v)| *o += v);
+            }
+        });
+        y
+    }
+}
+
+/// w と、list の各割り当ての入力 x(a) との内積を out(a, 値) に渡す。4本ずつまとめて計算する
+fn dots<'a>(w: &[f32], list: &[usize], x: impl Fn(usize) -> &'a [f32], mut out: impl FnMut(usize, f32)) {
+    let mut it = list.chunks_exact(4);
+    for c in &mut it {
+        let v = dot_f32_x4(w, [x(c[0]), x(c[1]), x(c[2]), x(c[3])]);
+        (0..4).for_each(|j| out(c[j], v[j]));
+    }
+    for &a in it.remainder() {
+        out(a, dot_f32(w, x(a)));
     }
 }
 
@@ -521,6 +543,16 @@ impl Experts {
 
     fn g2(&self, ex: usize) -> f32 {
         if self.mx { 1.0 } else { self.a2[ex] / 2688.0 }
+    }
+
+    /// 行 row を f32 に展開する。NVFP4 は amax の大域スケールを掛ける前の値
+    fn dequant(&self, w: &[u8], s: &[u8], row: usize, out: &mut [f32]) {
+        let n = out.len();
+        if self.mx {
+            dequant_mxfp8(&w[row * n..][..n], &s[row * n / 32..][..n / 32], out)
+        } else {
+            crate::nvfp4::dequant_row(&w[row * n / 2..][..n / 2], &s[row * n / 16..][..n / 16], 1.0, out)
+        }
     }
 
     /// 行 row と x の内積。NVFP4 は amax の大域スケールを掛ける前の値を返す。
