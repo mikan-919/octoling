@@ -19,9 +19,10 @@ fn main() {
     for &t in &tokens {
         let t0 = Instant::now();
         let logits = step(t);
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
         let mut idx: Vec<usize> = (0..logits.len()).collect();
         idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
         let top: Vec<String> = idx[..5].iter().map(|&i| format!("{i}:{:.3}", logits[i])).collect();
-        println!("tok {t:>6} -> {} ({:.0} ms, first [{:.4} {:.4} {:.4}] sum {:.4})", top.join(" "), t0.elapsed().as_secs_f64() * 1e3, logits[0], logits[1], logits[2], logits.iter().sum::<f32>());
+        println!("tok {t:>6} -> {} ({:.0} ms, first [{:.4} {:.4} {:.4}] sum {:.4})", top.join(" "), ms, logits[0], logits[1], logits[2], logits.iter().sum::<f32>());
     }
 }
