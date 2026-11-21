@@ -254,6 +254,7 @@ impl Model {
         let mut blocks: Vec<Vec<f32>> = vec![];
         for il in 0..CORE.0 {
             x = self.layer(il, il, &mut st.slots[il], pos, x, &mut blocks, None);
+            trace(il, &x);
         }
         let prelude = x.clone();
         let prelude_blocks = blocks.clone();
@@ -268,10 +269,12 @@ impl Model {
                 let slot = if pass == 0 { ip } else { N_LAYER + (pass - 1) * (CORE.1 - CORE.0) + ip - CORE.0 };
                 let msgs = (pass > 0).then(|| mix(&bank, self.layers[ip].msg_query.as_ref().unwrap()));
                 x = self.layer(ip, ip, &mut st.slots[slot], pos, x, &mut blocks, msgs.as_deref());
+                trace(slot, &x);
             }
         }
         for il in CORE.1..N_LAYER {
             x = self.layer(il, il, &mut st.slots[il], pos, x, &mut blocks, None);
+            trace(il, &x);
         }
         blocks.push(x);
         let mut h = mix(&blocks, self.output_query).pop().unwrap();
@@ -586,4 +589,13 @@ fn control(cur: &[f32], msg: &[f32], c: &Ctrl) -> Vec<f32> {
     let gain = mv(c.gain, &g);
     let forget = mv(c.forget, &g);
     (0..D).map(|i| cur[i] - forget[i].tanh() * cur[i] + gain[i].tanh() * msg[i]).collect()
+}
+
+static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("OCTO_TRACE").is_some());
+
+/// OCTO_TRACE を設定すると、各キャッシュスロットの層出力を llama.cpp の l_out-N と比べられる形で出す。
+fn trace(slot: usize, x: &[f32]) {
+    if *TRACE {
+        eprintln!("l_out-{slot} [{:.4} {:.4} {:.4}] sum {:.6}", x[0], x[1], x[2], x.iter().sum::<f32>());
+    }
 }
