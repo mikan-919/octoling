@@ -10,6 +10,8 @@ use crate::st::SafeTensors;
 use std::path::Path;
 
 const B: usize = 8; // ブロックの行数
+/// 下書きモデルが扱う文脈の長さ。global 層の KV を VRAM に置く (gpu.cu の DRAFT_CTX と同じ)
+pub const DRAFT_CTX: usize = 8192;
 const DRING: usize = 2048; // 局所層の文脈 K/V のリングバッファの行数
 const LOCAL_WIN: usize = 1025; // 局所層が見る文脈の位置数
 /// 下書きの top-1 確率の積がこれを下回ったら下書きを止める。OCTO_TAU で変えられる (既定 0.35 は Xolotl と同じ)
@@ -112,7 +114,7 @@ impl Drafter {
                 let p = |s: &str| format!("layers.{l}.{s}");
                 let v = |s: &str, n: usize, up: &mut Uploader| up.bytes(as_bytes(&bfv(&p(s), &[n])));
                 let ring = if l == 1 { 0 } else { DRING };
-                let rows = if ring == 0 { MAX_CTX } else { DRING };
+                let rows = if ring == 0 { DRAFT_CTX } else { DRING };
                 DLayer {
                     attn_norm: v("input_layernorm.weight", D, &mut up),
                     ffn_norm: v("post_attention_layernorm.weight", D, &mut up),

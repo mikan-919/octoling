@@ -12,8 +12,9 @@ const USAGE: &str = "使い方:
   octoling chat <重みのディレクトリ> <メッセージ> [reasoning_effort (既定 high)]
       1回だけ質問し、答えを流して表示する。思考は灰色で出す
   octoling bench <重みのディレクトリ> <トークンID,トークンID,...> [生成するトークン数]
-      prefill と貪欲法の生成の速さを測る。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
-重みのディレクトリには model-00001-of-00001.safetensors と tokenizer.json を置く";
+      prefill と貪欲法の生成の速さを測る。@ファイル名 でファイルから読む。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
+重みのディレクトリには model-00001-of-00001.safetensors と tokenizer.json を置く
+文脈長の上限は OCTO_CTX (既定 8192)。それより長くすると global 層の KV を主記憶に置く (1 トークン 32 KB)";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,11 +26,11 @@ fn main() {
     let model = Model::load(SafeTensors::open(dir.join("model-00001-of-00001.safetensors")).expect("重みを開けない"));
     match args[1].as_str() {
         "serve" => {
-            let mut engine = Engine::new(Gpu::new(model), dir);
+            let mut engine = Engine::new(Gpu::new(model, n_ctx()), dir);
             serve(&mut engine, args.get(3).map_or("127.0.0.1:8080", String::as_str)).expect("待ち受けできない");
         }
         "chat" if args.len() >= 4 => {
-            let mut engine = Engine::new(Gpu::new(model), dir);
+            let mut engine = Engine::new(Gpu::new(model, n_ctx()), dir);
             let e = effort(&serde_json::json!(args.get(4).map_or("high", String::as_str))).unwrap_or_else(|e| panic!("{e}"));
             let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], reasoning: None }];
             let prompt = engine.prompt(&msgs, e).unwrap();
@@ -57,13 +58,17 @@ fn main() {
 }
 
 fn bench(model: Model, ids: &str, n_gen: usize) {
-    let tokens: Vec<u32> = ids.split(',').map(|t| t.trim().parse().unwrap()).collect();
+    let ids = match ids.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).expect("トークン ID のファイルを読めない"),
+        None => ids.to_string(),
+    };
+    let tokens: Vec<u32> = ids.trim().split(',').map(|t| t.trim().parse().unwrap()).collect();
     if std::env::var_os("OCTO_CPU").is_some() {
         let mut st = State::new();
         step_all(&tokens, |t| model.forward(&mut st, t));
         return;
     }
-    let mut gpu = Gpu::new(model);
+    let mut gpu = Gpu::new(model, n_ctx());
     if std::env::var_os("OCTO_STEP").is_some() {
         step_all(&tokens, |t| gpu.forward(t));
         return;
@@ -108,4 +113,9 @@ fn report(t: u32, logits: &[f32], ms: f64) {
     idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
     let top: Vec<String> = idx[..5].iter().map(|&i| format!("{i}:{:.3}", logits[i])).collect();
     println!("tok {t:>6} -> {} ({ms:.0} ms, first [{:.4} {:.4} {:.4}] sum {:.4})", top.join(" "), logits[0], logits[1], logits[2], logits.iter().sum::<f32>());
+}
+
+/// 文脈長の上限。OCTO_CTX で変えられる。VRAM_CTX (8192) より長いと、global 層の KV を主記憶に置く
+fn n_ctx() -> usize {
+    std::env::var("OCTO_CTX").ok().map_or(octoling::gpu::VRAM_CTX, |s| s.parse().expect("OCTO_CTX は数"))
 }

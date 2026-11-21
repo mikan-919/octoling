@@ -4,7 +4,7 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let m = octoling::model::Model::load(octoling::st::SafeTensors::open(format!("{}/model-00001-of-00001.safetensors", a[1])).unwrap());
     let prompt: Vec<u32> = std::fs::read_to_string(&a[2]).unwrap().trim().split(',').map(|t| t.parse().unwrap()).collect();
-    let mut g = Gpu::new(m);
+    let mut g = Gpu::new(m, octoling::gpu::VRAM_CTX);
     // 基準: prefill して 24 トークンを1つずつ貪欲に
     let mut next = argmax(&g.prefill(&prompt));
     let mut want: Vec<u32> = vec![];

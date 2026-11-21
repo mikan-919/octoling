@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-/// global 層の KV キャッシュの長さ。KV は f16 で、8192 トークンで global 層 268 MB、SWA 層のリング 250 MB。
-/// f32 のときは 2048 が上限だった (8192 にすると VRAM の予算を超え、Windows が GPU メモリを退避して遅くなった)。
-/// attn_part は分割1つ分のスコア (MAX_CTX / 16 個) を共有メモリに置く。
-/// ponytail: 文脈長の上限。伸ばすなら KV を 8 ビットにするか、SWA 層のリングだけ残して global 層の KV を主記憶に置く
-pub const MAX_CTX: usize = 8192;
+/// global 層の KV キャッシュを VRAM に置ける文脈の長さ。KV は f16 で、8192 トークンで global 層 268 MB、SWA 層のリング 250 MB。
+/// 文脈長 (Gpu::new の ctx) がこれより長いと、global 層の KV を GPU から直接読める主記憶 (ページ固定) に置く。
+/// 1 位置あたり 8 スロット x (K + V) x 2 KB = 32 KB で、256K トークンなら 8.6 GB。
+/// ponytail: 主記憶の KV は f16 のまま。8 ビットにすれば量も生成時の読み出しも半分になる
+pub const VRAM_CTX: usize = 8192;
 
 /// prefill で一度に処理するトークン数の上限
 pub const TMAX: usize = 512;
@@ -107,6 +107,7 @@ struct GLayer {
 struct GSlot {
     kc: P,
     vc: P,
+    host: Option<[usize; 2]>, // KV が主記憶にあれば、その K と V の主記憶側のアドレス
     hist: [P; 4], // k, v, attn 出力, mlp 出力
     seq: [P; 4],  // 検証のバッチの [直前の入力3つ; 入力 SPEC_T 個]。外れた下書きを捨てるとき hist を戻す
 }
@@ -145,6 +146,7 @@ struct Bufs {
     taps: P,       // [4][TMAX][D]。下書きモデルが読む、スロット 4, 28, 46 の層出力と最後の正規化の出力
     amax: P,       // [SPEC_T] i32。検証のバッチの各行の、最大の logits の位置
     logits_all: P, // [SPEC_T][201024]
+    acc: P,        // [TMAX][24][HD + 2]。主記憶の KV の塊ごとに足し込む注意の途中結果
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -162,6 +164,7 @@ pub struct Gpu {
     output_query: P,
     b: Bufs,
     pos: usize,
+    ctx: usize,
     // T トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph。(T, 検証か) ごと
     graphs: RefCell<HashMap<(usize, bool), Vec<CudaGraph>>>,
     recording: RefCell<Vec<CudaGraph>>,
@@ -187,10 +190,10 @@ const S2: usize = W2 / 32;
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 36] = [
+const KERNELS: [&str; 38] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -203,7 +206,8 @@ fn f4(n: usize) -> u64 {
 }
 
 impl Gpu {
-    pub fn new(mut cpu: Model) -> Self {
+    /// n_ctx は文脈長の上限。VRAM_CTX より長ければ、global 層の KV を主記憶に置く
+    pub fn new(mut cpu: Model, n_ctx: usize) -> Self {
         let ctx = CudaContext::new(0).expect("GPU を開けない");
         ctx.bind_to_thread().unwrap();
         // 20〜23層の MXFP8 expert (4.2 GB) をページ固定メモリに写す。prefill で PCIe から非同期に送るため。
@@ -213,8 +217,7 @@ impl Gpu {
             (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
         }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
-        let src = format!("#define MAX_CTX_DEV {MAX_CTX}\n{}", include_str!("gpu.cu"));
-        let ptx = compile_ptx_with_opts(src, CompileOptions { arch: Some("sm_120"), ..Default::default() })
+        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"),CompileOptions { arch: Some("sm_120"), ..Default::default() })
             .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
         // 既定のストリームは CUDA Graph に記録できない
         let stream = ctx.new_stream().unwrap();
@@ -260,10 +263,17 @@ impl Gpu {
             .collect();
         let slots: Vec<GSlot> = (0..N_SLOT)
             .map(|s| {
-                let rows = if GLOBAL_LAYERS.contains(&phys(s)) { MAX_CTX } else { RING };
+                let rows = if GLOBAL_LAYERS.contains(&phys(s)) { n_ctx } else { RING };
+                let ([kc, vc], host) = if rows > VRAM_CTX {
+                    let [(kd, kh), (vd, vh)] = [0; 2].map(|_| mapped(rows * 1024 * 2));
+                    ([kd, vd], Some([kh, vh]))
+                } else {
+                    ([0; 2].map(|_| up.zeros(rows * 1024 * 2)), None)
+                };
                 GSlot {
-                    kc: up.zeros(rows * 1024 * 2),
-                    vc: up.zeros(rows * 1024 * 2),
+                    kc,
+                    vc,
+                    host,
                     hist: [1024, 1024, D, D].map(|ch| up.zeros(ch * 3 * 4)),
                     seq: [1024, 1024, D, D].map(|ch| up.zeros(ch * (SPEC_T + 3) * 4)),
                 }
@@ -304,6 +314,7 @@ impl Gpu {
             taps: fz(4 * t * D, &mut up),
             amax: fz(SPEC_T, &mut up),
             logits_all: fz(SPEC_T * 201024, &mut up),
+            acc: if n_ctx > VRAM_CTX { fz(t * 24 * 130, &mut up) } else { 0 },
         };
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
@@ -331,6 +342,7 @@ impl Gpu {
             output_query,
             b,
             pos: 0,
+            ctx: n_ctx,
             graphs: RefCell::new(HashMap::new()),
             recording: RefCell::new(vec![]),
             rewind_tab,
@@ -398,7 +410,7 @@ impl Gpu {
 
     /// トークンの埋め込みと先頭の位置を GPU に送る
     fn inputs(&self, tokens: &[u32]) {
-        assert!(self.pos + tokens.len() <= MAX_CTX, "文脈長の上限 {MAX_CTX} を超えた");
+        assert!(self.pos + tokens.len() <= self.ctx, "文脈長の上限 {} を超えた", self.ctx);
         let e: Vec<f32> = tokens
             .iter()
             .flat_map(|&tok| {
@@ -483,6 +495,11 @@ impl Gpu {
     /// 次に処理するトークンの位置 (= ここまでに処理したトークン数)
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// 文脈長の上限
+    pub fn max_ctx(&self) -> usize {
+        self.ctx
     }
 
     /// 文脈を捨てて位置 0 から始め直す。畳み込みが持つ直前3トークンの入力を 0 に戻す。
@@ -633,6 +650,26 @@ impl Gpu {
         }
     }
 
+    /// (prefill、主記憶の KV) 位置 0..pos+t の KV を KB 位置ずつ置き場に送り、塊ごとに注意を足し込む。
+    /// GPU が主記憶を直接読むと、クエリのタイルごとに同じ KV を読み直すことになり遅い
+    fn attn_host(&self, host: [usize; 2], l: &GLayer, t: usize) {
+        const KB: usize = 16384; // 置き場 1 つ (66 MB) に K と V が入る位置数 (1 位置 2 KB ずつ)
+        let (b, st, end) = (&self.b, self.staging[0], self.pos + t);
+        for (i, b0) in (0..end).step_by(KB).enumerate() {
+            let nb = KB.min(end - b0);
+            for (j, &h) in host.iter().enumerate() {
+                // SAFETY: host はページ固定の主記憶で、end 行以上ある。置き場は K と V で 2 * KB 行ある
+                unsafe {
+                    let src = std::slice::from_raw_parts((h as *const u16).add(b0 * 1024), nb * 1024);
+                    result::memcpy_htod_async(st + (j * KB * 2048) as u64, src, self.stream.cu_stream()).unwrap();
+                }
+            }
+            k!(self, "attn_blk", (24, t.div_ceil(32)), 128, 0;
+                b.qx, st, st + (KB * 2048) as u64, b0 as i32, nb as i32, l.rel_proj, b.acc, b.pos, t as i32, (i == 0) as i32);
+        }
+        k!(self, "attn_fin", (24, t), 128, 0; b.qx, b.acc, b.o);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool, t: usize) {
         let (l, s, b) = (&self.layers[il], &self.slots[slot], &self.b);
@@ -670,8 +707,11 @@ impl Gpu {
         let ring = if l.global { 0 } else { RING as i32 };
         k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
         if t <= SPEC_T {
+            // 主記憶の KV も GPU から直接読む
             k!(self, "attn_part", (24, 16 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring);
             k!(self, "attn_combine", (24, t), 128, 0; b.qx, b.part, b.o);
+        } else if let Some(host) = s.host {
+            self.attn_host(host, l, t);
         } else {
             k!(self, "attn_tile", (24, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
         }
@@ -785,4 +825,15 @@ fn pin(src: &[u8]) -> &'static [u8] {
 }
 
 mod draft;
-pub use draft::Drafter;
+pub use draft::{DRAFT_CTX, Drafter};
+
+/// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
+fn mapped(bytes: usize) -> (P, usize) {
+    // SAFETY: 確保に失敗したら止まる。DEVICEMAP で確保した領域の GPU 側のアドレスを得る
+    unsafe {
+        let h = result::malloc_host(bytes, sys::CU_MEMHOSTALLOC_DEVICEMAP).unwrap_or_else(|e| panic!("主記憶を {bytes} バイト固定できない: {e}"));
+        let mut d: sys::CUdeviceptr = 0;
+        sys::cuMemHostGetDevicePointer_v2(&mut d, h, 0).result().unwrap();
+        (d, h as usize)
+    }
+}

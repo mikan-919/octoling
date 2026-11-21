@@ -352,8 +352,11 @@ __device__ __forceinline__ size_t kv_row(int j, int ring) { return (size_t)(ring
 // グリッドは (ヘッド, NSPLIT * T) で固定なので、CUDA Graph でも位置に応じて分け方が変わる。128スレッド
 #define NSPLIT 16
 #define PART (HD + 2)
+// 分割の中は SUB 個ずつスコアを共有メモリに置き、オンライン softmax でまとめる (文脈が長くても共有メモリは一定)。
+// kc, vc は VRAM でも、GPU から直接読める主記憶 (長い文脈の global 層) でもよい
+#define SUB 2048
 extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* part, const int* posp, int ring) {
-    __shared__ float sc[(MAX_CTX_DEV + NSPLIT - 1) / NSPLIT];
+    __shared__ float sc[SUB];
     int tt = blockIdx.y / NSPLIT, split = blockIdx.y % NSPLIT;
     qx += (size_t)tt * QX;
     int pos = *posp + tt, first = ring ? max(0, pos + 1 - EXTENT) : 0, n = pos + 1;
@@ -363,26 +366,121 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
     float rh[NREL];
     for (int i = 0; i < NREL; i++) rh[i] = qx[R_OFF + h * NREL + i];
     float4 qv = ((const float4*)(qx + h * HD))[lane];
-    for (int j = j0 + warp; j < j1; j += blockDim.x >> 5) {
-        float4 kv = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
-        float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
-        if (lane == 0) sc[j - j0] = s * rsqrtf((float)HD) + rel_bias(rh, rel_proj, pos - j);
+    float m = -INFINITY, z = 0.f, o = 0.f;
+    for (int s0 = j0; s0 < j1; s0 += SUB) {
+        int s1 = min(j1, s0 + SUB);
+        for (int j = s0 + warp; j < s1; j += blockDim.x >> 5) {
+            float4 kv = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
+            float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
+            if (lane == 0) sc[j - s0] = s * rsqrtf((float)HD) + rel_bias(rh, rel_proj, pos - j);
+        }
+        __syncthreads();
+        float bm = -INFINITY;
+        for (int i = t; i < s1 - s0; i += blockDim.x) bm = fmaxf(bm, sc[i]);
+        float mn = fmaxf(m, block_max(bm)), f = m == -INFINITY ? 0.f : expf(m - mn), zs = 0.f;
+        for (int i = t; i < s1 - s0; i += blockDim.x) zs += sc[i] = expf(sc[i] - mn);
+        z = z * f + block_sum(zs);
+        o *= f;
+        for (int j = s0; j < s1; j++) o += sc[j - s0] * h2f(vc[kv_row(j, ring) + kvh * HD + t]);
+        m = mn;
+        __syncthreads();
     }
-    __syncthreads();
-    float m = -INFINITY;
-    for (int i = t; i < j1 - j0; i += blockDim.x) m = fmaxf(m, sc[i]);
-    m = block_max(m);
-    float z = 0.f;
-    if (j1 > j0)
-        for (int i = t; i < j1 - j0; i += blockDim.x) z += sc[i] = expf(sc[i] - m);
-    z = block_sum(z);
-    float o = 0.f;
-    for (int j = j0; j < j1; j++) o += sc[j - j0] * h2f(vc[kv_row(j, ring) + kvh * HD + t]);
     out[2 + t] = o;
     if (t == 0) {
         out[0] = m;
         out[1] = z;
     }
+}
+
+#define QT 32
+#define KT 16
+// (prefill、長い文脈の global 層) VRAM に送った KV の塊 (位置 b0 から nb 個、kb [nb][1024]、vb 同じ) の分だけ注意を計算し、
+// acc [T][24][HD + 2] の (最大値, 指数和, 重み付き和) に足す。first なら sink から始める。
+// グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
+extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const half_t* vb, int b0, int nb, const float* rel_proj, float* acc,
+                                    const int* posp, int T, int first) {
+    __shared__ __align__(16) float Qs[QT][HD];
+    __shared__ __align__(16) float Ks[KT][HD + 4];
+    __shared__ __align__(16) float Vs[KT][HD];
+    __shared__ float Ps[QT][KT];
+    __shared__ float Rs[QT][NREL];
+    int h = blockIdx.x, kvh = h / 3, tid = threadIdx.x, qi = tid / 4, part = tid % 4;
+    int t0 = blockIdx.y * QT, nq = min(QT, T - t0), p0 = *posp + t0;
+    for (int i = tid; i < QT * HD; i += blockDim.x) {
+        int q = i / HD;
+        Qs[q][i % HD] = q < nq ? qx[(size_t)(t0 + q) * QX + h * HD + i % HD] : 0.f;
+    }
+    for (int i = tid; i < QT * NREL; i += blockDim.x) {
+        int q = i / NREL;
+        Rs[q][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + h * NREL + i % NREL] : 0.f;
+    }
+    int pq = p0 + qi;
+    bool valid = qi < nq;
+    float* a = acc + ((size_t)(t0 + qi) * 24 + h) * PART;
+    float m, z, o[32];
+    if (first) {
+        m = valid ? qx[(size_t)(t0 + qi) * QX + SINK_OFF + h] : 0.f, z = 1.f;
+        for (int d = 0; d < 32; d++) o[d] = 0.f;
+    } else {
+        m = valid ? a[0] : 0.f, z = valid ? a[1] : 1.f;
+        for (int d = 0; d < 32; d++) o[d] = valid ? a[2 + part * 32 + d] : 0.f;
+    }
+    int jmax = min(b0 + nb - 1, p0 + nq - 1);
+    for (int j0 = b0; j0 <= jmax; j0 += KT) {
+        __syncthreads();
+        for (int i = tid; i < KT * HD; i += blockDim.x) {
+            int k = i / HD, j = j0 + k;
+            bool in = j <= jmax;
+            Ks[k][i % HD] = in ? h2f(kb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
+            Vs[k][i % HD] = in ? h2f(vb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
+        }
+        __syncthreads();
+        float s[4], tmax = -INFINITY;
+        for (int kk = 0; kk < 4; kk++) {
+            int k = part * 4 + kk, j = j0 + k, d = pq - j;
+            bool ok = valid && j <= jmax && j <= pq;
+            float ac = 0.f;
+            if (ok) {
+                for (int e = 0; e < HD; e += 4) {
+                    float4 x = *(const float4*)&Qs[qi][e], y = *(const float4*)&Ks[k][e];
+                    ac += x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
+                }
+                ac = ac * rsqrtf((float)HD) + rel_bias(Rs[qi], rel_proj, d);
+            }
+            s[kk] = ok ? ac : -INFINITY;
+            tmax = fmaxf(tmax, s[kk]);
+        }
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
+        float mn = fmaxf(m, tmax), f = expf(m - mn), ps = 0.f;
+        for (int kk = 0; kk < 4; kk++) {
+            float p = expf(s[kk] - mn);
+            Ps[qi][part * 4 + kk] = p;
+            ps += p;
+        }
+        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+        ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+        z = z * f + ps;
+        m = mn;
+        __syncwarp();
+        for (int d = 0; d < 32; d++) o[d] *= f;
+        for (int k = 0; k < KT; k++) {
+            float p = Ps[qi][k];
+            const float* vr = &Vs[k][part * 32];
+            for (int d = 0; d < 32; d++) o[d] += p * vr[d];
+        }
+    }
+    if (valid) {
+        if (part == 0) a[0] = m, a[1] = z;
+        for (int d = 0; d < 32; d++) a[2 + part * 32 + d] = o[d];
+    }
+}
+
+// attn_blk の結果を正規化し、出力ゲートをかける。グリッドは (ヘッド, T)、128スレッド
+extern "C" __global__ void attn_fin(const float* qx, const float* acc, float* out) {
+    int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const float* a = acc + ((size_t)t * 24 + h) * PART;
+    out[(size_t)t * 3072 + h * HD + d] = a[2 + d] / a[1] * sigmoidf(qx[(size_t)t * QX + GATE_OFF + h * HD + d]);
 }
 
 // (T <= 8 用) 部分結果と sink をまとめ、出力ゲートをかける。グリッドは (ヘッド, T)、128スレッド
@@ -755,6 +853,7 @@ extern "C" __global__ void argmax_rows(const float* x, int stride, int n, int* o
 // 重みは読み込み時に行ごとのスケール付き FP8 (E4M3) にする。下書きは本体が必ず確かめるので、精度は受け入れ率にしか効かない
 
 #define DQKV 5120   // q 3072 + k 1024 + v 1024
+#define DRAFT_CTX 8192 // 下書きモデルが扱う文脈の長さ (global 層の KV を VRAM に置く)
 #define DFF 9216
 
 __device__ __forceinline__ unsigned char f2e4m3(float x) {
@@ -860,7 +959,7 @@ extern "C" __global__ void dr_qk(float* qkv, const float* qn, const float* kn, i
 
 // ブロック 8 行の注意。キーは文脈の位置 lo..hi (キャッシュ) とブロックの 8 行で、マスクなし。グリッドは (ヘッド 24, 8)、128スレッド
 extern "C" __global__ void dr_attn(const float* qkv, const half_t* kc, const half_t* vc, int ring, int lo, int hi, float* out) {
-    __shared__ float sc[MAX_CTX_DEV + 8];
+    __shared__ float sc[DRAFT_CTX + 8];
     int h = blockIdx.x, t = blockIdx.y, kvh = h / 3, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int nc = hi - lo, n = nc + 8;
     float4 qv = ((const float4*)(qkv + (size_t)t * DQKV + h * HD))[lane];

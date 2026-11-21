@@ -2,7 +2,7 @@
 //! テンプレートは models/official/chat_template.jinja のうち、文章だけのメッセージを扱う部分を Rust で書いたもの。
 //! ツール呼び出しと画像は扱わない。
 
-use crate::gpu::{Drafter, Gpu, MAX_CTX, SPEC_T};
+use crate::gpu::{DRAFT_CTX, Drafter, Gpu, SPEC_T};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -57,7 +57,11 @@ impl Engine {
     pub fn new(gpu: Gpu, dir: &std::path::Path) -> Self {
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json を読めない");
         let mtp = dir.join("mtp.safetensors");
-        let draft = (mtp.exists() && std::env::var_os("OCTO_DRAFT").is_some()).then(|| Drafter::load(&gpu, &mtp));
+        let want = mtp.exists() && std::env::var_os("OCTO_DRAFT").is_some();
+        if want && gpu.max_ctx() > DRAFT_CTX {
+            eprintln!("文脈長が {DRAFT_CTX} を超えるので下書きモデルは使わない");
+        }
+        let draft = (want && gpu.max_ctx() <= DRAFT_CTX).then(|| Drafter::load(&gpu, &mtp));
         let id = |s: &str| tok.token_to_id(s).unwrap_or_else(|| panic!("{s} がない"));
         let sp = Special {
             user: id("<|message_user|>"),
@@ -123,8 +127,9 @@ impl Engine {
     /// プロンプトの続きを生成し、断片ができるたびに on に渡す。on が false を返したら止める。
     /// 返り値は (終わった理由 "stop" か "length", 生成したトークン数)
     pub fn generate(&mut self, prompt: &[u32], p: &Params, mut on: impl FnMut(Piece) -> bool) -> Result<(&'static str, usize), String> {
-        if prompt.len() >= MAX_CTX {
-            return Err(format!("プロンプトが {} トークンあり、文脈長の上限 {MAX_CTX} を超えている", prompt.len()));
+        let max_ctx = self.gpu.max_ctx();
+        if prompt.len() >= max_ctx {
+            return Err(format!("プロンプトが {} トークンあり、文脈長の上限 {max_ctx} を超えている", prompt.len()));
         }
         let reuse = !self.cached.is_empty() && prompt.len() > self.cached.len() && prompt.starts_with(&self.cached);
         if !reuse {
@@ -154,14 +159,14 @@ impl Engine {
             // 投機的デコード: 下書きをまとめて検証し、一致した先頭までを受け入れる。出力は1トークンずつの貪欲法と同じ
             let mut next = argmax(&logits);
             loop {
-                if n >= p.max_tokens || self.gpu.pos() >= MAX_CTX {
+                if n >= p.max_tokens || self.gpu.pos() >= max_ctx {
                     break "length";
                 }
                 if next == self.sp.end_sampling {
                     n += 1;
                     break "stop";
                 }
-                let room = (p.max_tokens - n).min(MAX_CTX - self.gpu.pos()).min(SPEC_T);
+                let room = (p.max_tokens - n).min(max_ctx - self.gpu.pos()).min(SPEC_T);
                 let anchor = *self.cached.last().unwrap();
                 let mut chunk = vec![next];
                 let tm = std::time::Instant::now();
@@ -194,7 +199,7 @@ impl Engine {
         } else {
             let mut rng = p.seed | 1;
             loop {
-                if n == p.max_tokens || self.gpu.pos() >= MAX_CTX {
+                if n == p.max_tokens || self.gpu.pos() >= max_ctx {
                     break "length";
                 }
                 let t = sample(&logits, p, &mut rng);
@@ -445,7 +450,7 @@ fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<
     };
     let num = |k: &str| req[k].as_f64();
     let params = Params {
-        max_tokens: num("max_completion_tokens").or(num("max_tokens")).map_or(MAX_CTX, |n| n as usize),
+        max_tokens: num("max_completion_tokens").or(num("max_tokens")).map_or(engine.gpu.max_ctx(), |n| n as usize),
         temperature: num("temperature").unwrap_or(1.0) as f32,
         top_p: num("top_p").unwrap_or(1.0) as f32,
         top_k: num("top_k").unwrap_or(0.0) as usize,
