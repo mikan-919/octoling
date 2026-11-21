@@ -1,17 +1,63 @@
 use octoling::gpu::Gpu;
 use octoling::model::{Model, State};
+use octoling::serve::{Engine, Msg, Params, Piece, effort, serve};
 use octoling::st::SafeTensors;
+use std::io::Write;
+use std::path::Path;
 use std::time::Instant;
 
-// 使い方: octoling <safetensors> <トークンID,トークンID,...> [生成するトークン数]
-// 既定: GPU でプロンプトを prefill し、続けて貪欲法で生成する。
-// OCTO_STEP=1: プロンプトを1トークンずつ処理し、各トークンの top-5 を出す。OCTO_CPU=1 なら CPU で同じことをする。
+const USAGE: &str = "使い方:
+  octoling serve <重みのディレクトリ> [待ち受けアドレス (既定 127.0.0.1:8080)]
+      OpenAI 互換の API (POST /v1/chat/completions, GET /v1/models)
+  octoling chat <重みのディレクトリ> <メッセージ> [reasoning_effort (既定 high)]
+      1回だけ質問し、答えを流して表示する。思考は灰色で出す
+  octoling bench <重みのディレクトリ> <トークンID,トークンID,...> [生成するトークン数]
+      prefill と貪欲法の生成の速さを測る。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
+重みのディレクトリには model-00001-of-00001.safetensors と tokenizer.json を置く";
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let model = Model::load(SafeTensors::open(&args[1]).expect("重みを開けない"));
-    let tokens: Vec<u32> = args[2].split(',').map(|t| t.trim().parse().unwrap()).collect();
-    let n_gen: usize = args.get(3).map_or(0, |n| n.parse().unwrap());
+    if args.len() < 3 {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    }
+    let dir = Path::new(&args[2]);
+    let model = Model::load(SafeTensors::open(dir.join("model-00001-of-00001.safetensors")).expect("重みを開けない"));
+    match args[1].as_str() {
+        "serve" => {
+            let mut engine = Engine::new(Gpu::new(model), &dir.join("tokenizer.json"));
+            serve(&mut engine, args.get(3).map_or("127.0.0.1:8080", String::as_str)).expect("待ち受けできない");
+        }
+        "chat" if args.len() >= 4 => {
+            let mut engine = Engine::new(Gpu::new(model), &dir.join("tokenizer.json"));
+            let e = effort(&serde_json::json!(args.get(4).map_or("high", String::as_str))).unwrap_or_else(|e| panic!("{e}"));
+            let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], reasoning: None }];
+            let prompt = engine.prompt(&msgs, e).unwrap();
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+            let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed };
+            let t0 = Instant::now();
+            let (finish, n) = engine
+                .generate(&prompt, &p, |piece| {
+                    match piece {
+                        Piece::Thinking(t) => print!("\x1b[90m{t}\x1b[0m"),
+                        Piece::Text(t) => print!("{t}"),
+                    }
+                    std::io::stdout().flush().is_ok()
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+            let dt = t0.elapsed().as_secs_f64();
+            eprintln!("\n[{finish}: プロンプト {} トークン、生成 {n} トークン、{dt:.1} 秒、{:.1} tok/s]", prompt.len(), n as f64 / dt);
+        }
+        "bench" if args.len() >= 4 => bench(model, &args[3], args.get(4).map_or(0, |n| n.parse().unwrap())),
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
 
+fn bench(model: Model, ids: &str, n_gen: usize) {
+    let tokens: Vec<u32> = ids.split(',').map(|t| t.trim().parse().unwrap()).collect();
     if std::env::var_os("OCTO_CPU").is_some() {
         let mut st = State::new();
         step_all(&tokens, |t| model.forward(&mut st, t));

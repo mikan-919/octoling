@@ -418,6 +418,24 @@ impl Gpu {
         self.dtoh(self.b.logits, VOCAB)
     }
 
+    /// 次に処理するトークンの位置 (= ここまでに処理したトークン数)
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// 文脈を捨てて位置 0 から始め直す。畳み込みが持つ直前3トークンの入力を 0 に戻す。
+    /// KV キャッシュは、注意が今の文脈の位置しか読まないので消さなくてよい
+    pub fn reset(&mut self) {
+        for s in &self.slots {
+            for (&h, ch) in s.hist.iter().zip([1024, 1024, D, D]) {
+                // SAFETY: hist は ch * 3 個の f32 で確保してある
+                unsafe { result::memset_d8_async(h, 0, ch * 3 * 4, self.stream.cu_stream()) }.unwrap();
+            }
+        }
+        self.stream.synchronize().unwrap();
+        self.pos = 0;
+    }
+
     fn begin(&self) {
         if self.capturing.get() {
             self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
