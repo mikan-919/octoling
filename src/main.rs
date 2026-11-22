@@ -12,7 +12,7 @@ const USAGE: &str = "使い方:
   octoling chat <重みのディレクトリ> <メッセージ> [reasoning_effort (既定 high)]
       1回だけ質問し、答えを流して表示する。思考は灰色で出す
   octoling bench <重みのディレクトリ> <トークンID,トークンID,...> [生成するトークン数]
-      prefill と貪欲法の生成の速さを測る。@ファイル名 でファイルから読む。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
+      prefill と貪欲法の生成の速さを測る。@ファイル名 でファイルから読む。; で区切ると複数のプロンプトを続けて測る (読み込みは1回、OCTO_REPEAT 回繰り返す)。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
 重みのディレクトリには model-00001-of-00001.safetensors と tokenizer.json を置く
 文脈長の上限は OCTO_CTX (既定 8192)。それより長くすると global 層の KV を主記憶に置く (1 トークン 32 KB)";
 
@@ -57,12 +57,19 @@ fn main() {
     }
 }
 
-fn bench(model: Model, ids: &str, n_gen: usize) {
-    let ids = match ids.strip_prefix('@') {
-        Some(path) => std::fs::read_to_string(path).expect("トークン ID のファイルを読めない"),
-        None => ids.to_string(),
-    };
-    let tokens: Vec<u32> = ids.trim().split(',').map(|t| t.trim().parse().unwrap()).collect();
+/// prompts は ; で区切った複数のプロンプト (それぞれトークン ID の列か @ファイル名)。読み込みは1回で、OCTO_REPEAT 回 (既定 1) 繰り返して測る
+fn bench(model: Model, prompts: &str, n_gen: usize) {
+    let prompts: Vec<Vec<u32>> = prompts
+        .split(';')
+        .map(|p| {
+            let ids = match p.strip_prefix('@') {
+                Some(path) => std::fs::read_to_string(path).expect("トークン ID のファイルを読めない"),
+                None => p.to_string(),
+            };
+            ids.trim().split(',').map(|t| t.trim().parse().unwrap()).collect()
+        })
+        .collect();
+    let tokens = &prompts[0];
     if std::env::var_os("OCTO_CPU").is_some() {
         let mut st = State::new();
         step_all(&tokens, |t| model.forward(&mut st, t));
@@ -70,12 +77,21 @@ fn bench(model: Model, ids: &str, n_gen: usize) {
     }
     let mut gpu = Gpu::new(model, n_ctx());
     if std::env::var_os("OCTO_STEP").is_some() {
-        step_all(&tokens, |t| gpu.forward(t));
+        step_all(tokens, |t| gpu.forward(t));
         return;
     }
+    let repeat = std::env::var("OCTO_REPEAT").map_or(1, |s| s.parse().expect("OCTO_REPEAT は数"));
+    for _ in 0..repeat {
+        for tokens in &prompts {
+            gpu.reset();
+            bench_one(&mut gpu, tokens, n_gen);
+        }
+    }
+}
 
+fn bench_one(gpu: &mut Gpu, tokens: &[u32], n_gen: usize) {
     let t0 = Instant::now();
-    let logits = gpu.prefill(&tokens);
+    let logits = gpu.prefill(tokens);
     let dt = t0.elapsed().as_secs_f64();
     println!("prefill {} tokens: {:.0} ms, {:.1} tok/s", tokens.len(), dt * 1e3, tokens.len() as f64 / dt);
     report(*tokens.last().unwrap(), &logits, dt * 1e3);
