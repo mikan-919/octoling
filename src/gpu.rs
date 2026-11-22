@@ -191,7 +191,7 @@ impl Bufs {
             order: fz(t * TOP_K),
             off: fz(129),
             logits: fz(201024),
-            part: fz(SPEC_T * 24 * 16 * 130),
+            part: fz(SPEC_T * 24 * 32 * 130),
             taps: fz(4 * t * D),
             amax: fz(SPEC_T),
             logits_all: fz(SPEC_T * 201024),
@@ -1115,7 +1115,7 @@ impl Gpu {
         }
         if t <= SPEC_T {
             // 主記憶の KV も GPU から直接読む
-            k!(self, "attn_part", (24, 16 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
+            k!(self, "attn_part", (8, 32 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
         } else {

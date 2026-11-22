@@ -411,64 +411,96 @@ __device__ __forceinline__ float rel_bias(const float* rh, const float* rel_proj
 
 __device__ __forceinline__ size_t kv_row(int j, int ring) { return (size_t)(ring ? j % ring : j) * 1024; }
 
-// (T <= 8 用) キーの範囲を NSPLIT 個に分けて、部分ごとの (最大値 m、指数和 z、重み付き和 o[HD]) を part に書く。
-// グリッドは (ヘッド, NSPLIT * T) で固定なので、CUDA Graph でも位置に応じて分け方が変わる。128スレッド
-#define NSPLIT 16
+// (T <= 8 用) キーの範囲を NSPLIT 個に分けて、部分ごとの (最大値 m、指数和 z、重み付き和 o[HD]) をクエリのヘッドごとに part に書く。
+// GQA で KV ヘッドを共有する 3 つのクエリのヘッドを 1 ブロックでまとめて計算し、KV を一度だけ読む。
+// グリッドは (KV ヘッド 8, NSPLIT * T) で固定なので、CUDA Graph でも位置に応じて分け方が変わる。128 スレッド (4 ワープ)
+#define NSPLIT 32
 #define PART (HD + 2)
 // 分割の中は SUB 個ずつスコアを共有メモリに置き、オンライン softmax でまとめる (文脈が長くても共有メモリは一定)。
 // kc, vc は VRAM でも、GPU から直接読める主記憶 (長い文脈の global 層) でもよい
-#define SUB 2048
+#define SUB 1024
 __device__ void attn_combine(const float* qx, const float* part, float* out, int h, int tt);
 
-// 最後に終わった分割のブロックが、そのヘッドの部分結果を合わせて ob [T][3072] に書く。done はヘッドごとの終わった分割の数 [T][24] (最後のブロックが 0 に戻す)
+// 最後に終わった分割のブロックが、その 3 ヘッドの部分結果を合わせて ob [T][3072] に書く。done は KV ヘッドごとの終わった分割の数 [T][24] (最後のブロックが 0 に戻す)
 extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* part, const int* posp, int ring,
                                      float* ob, unsigned* done) {
     PDL();
-    __shared__ float sc[SUB];
-    int tt = blockIdx.y / NSPLIT, split = blockIdx.y % NSPLIT;
-    qx += (size_t)tt * QX;
+    __shared__ float sc[3][SUB];
+    __shared__ float osum[4][3][HD];
+    int tt = blockIdx.y / NSPLIT, split = blockIdx.y % NSPLIT, kvh = blockIdx.x;
+    const float* q0 = qx + (size_t)tt * QX;
     int pos = *posp + tt, first = ring ? max(0, pos + 1 - EXTENT) : 0, n = pos + 1;
-    int h = blockIdx.x, kvh = h / 3, t = threadIdx.x, lane = t & 31, warp = t >> 5;
     int chunk = (n - first + NSPLIT - 1) / NSPLIT, j0 = first + split * chunk, j1 = min(n, j0 + chunk);
-    float* out = part + ((tt * 24 + h) * NSPLIT + split) * PART;
-    float rh[NREL];
-    for (int i = 0; i < NREL; i++) rh[i] = qx[R_OFF + h * NREL + i];
-    float4 qv = ((const float4*)(qx + h * HD))[lane];
-    float m = -INFINITY, z = 0.f, o = 0.f;
+    int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    // レーンは次元 4 * lane..+3 と、相対位置の成分 lane (< NREL) を持つ
+    float4 q[3];
+    float rl[3];
+    #pragma unroll
+    for (int h = 0; h < 3; h++) {
+        int head = kvh * 3 + h;
+        q[h] = ((const float4*)(q0 + head * HD))[lane];
+        rl[h] = lane < NREL ? q0[R_OFF + head * NREL + lane] : 0.f;
+    }
+    float m[3] = {-INFINITY, -INFINITY, -INFINITY}, z[3] = {}, o[3][4] = {};
     for (int s0 = j0; s0 < j1; s0 += SUB) {
         int s1 = min(j1, s0 + SUB);
+        // スコア: ワープがキーを 1 つずつ受け持つ。q.k / sqrt(HD) と相対位置バイアスを、ワープの和で一度に求める
         #pragma unroll 4
-        for (int j = s0 + warp; j < s1; j += blockDim.x >> 5) {
-            float4 kv = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
-            float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
-            if (lane == 0) sc[j - s0] = s * rsqrtf((float)HD) + rel_bias(rh, rel_proj, pos - j);
+        for (int j = s0 + warp; j < s1; j += 4) {
+            float4 k = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
+            int d = pos - j;
+            float rp = lane < NREL && d < EXTENT ? rel_proj[lane * EXTENT + d] : 0.f;
+            #pragma unroll
+            for (int h = 0; h < 3; h++) {
+                float p = warp_sum((q[h].x * k.x + q[h].y * k.y + q[h].z * k.z + q[h].w * k.w) * rsqrtf((float)HD) + rl[h] * rp);
+                if (lane == 0) sc[h][j - s0] = p;
+            }
         }
         __syncthreads();
-        float bm = -INFINITY;
-        for (int i = t; i < s1 - s0; i += blockDim.x) bm = fmaxf(bm, sc[i]);
-        float mn = fmaxf(m, block_max(bm)), f = m == -INFINITY ? 0.f : expf(m - mn), zs = 0.f;
-        for (int i = t; i < s1 - s0; i += blockDim.x) zs += sc[i] = expf(sc[i] - mn);
-        z = z * f + block_sum(zs);
-        o *= f;
+        #pragma unroll
+        for (int h = 0; h < 3; h++) {
+            float bm = -INFINITY;
+            for (int i = t; i < s1 - s0; i += blockDim.x) bm = fmaxf(bm, sc[h][i]);
+            float mn = fmaxf(m[h], block_max(bm)), f = m[h] == -INFINITY ? 0.f : expf(m[h] - mn), zs = 0.f;
+            for (int i = t; i < s1 - s0; i += blockDim.x) zs += sc[h][i] = expf(sc[h][i] - mn);
+            z[h] = z[h] * f + block_sum(zs);
+            #pragma unroll
+            for (int c = 0; c < 4; c++) o[h][c] *= f;
+            m[h] = mn;
+        }
+        // 値: ワープがキーを分け、レーンが 4 次元ずつ積和する
         #pragma unroll 8
-        for (int j = s0; j < s1; j++) o += sc[j - s0] * h2f(vc[kv_row(j, ring) + kvh * HD + t]);
-        m = mn;
+        for (int i = warp; i < s1 - s0; i += 4) {
+            float4 v = h4(vc + kv_row(s0 + i, ring) + kvh * HD + lane * 4);
+            #pragma unroll
+            for (int h = 0; h < 3; h++) {
+                float p = sc[h][i];
+                o[h][0] += p * v.x, o[h][1] += p * v.y, o[h][2] += p * v.z, o[h][3] += p * v.w;
+            }
+        }
         __syncthreads();
     }
-    out[2 + t] = o;
-    if (t == 0) {
-        out[0] = m;
-        out[1] = z;
+    #pragma unroll
+    for (int h = 0; h < 3; h++)
+        #pragma unroll
+        for (int c = 0; c < 4; c++) osum[warp][h][lane * 4 + c] = o[h][c];
+    __syncthreads();
+    #pragma unroll
+    for (int h = 0; h < 3; h++) {
+        float* out = part + ((tt * 24 + kvh * 3 + h) * NSPLIT + split) * PART;
+        out[2 + t] = osum[0][h][t] + osum[1][h][t] + osum[2][h][t] + osum[3][h][t];
+        if (t == 0) out[0] = m[h], out[1] = z[h];
     }
     __shared__ bool last;
     __threadfence();
     __syncthreads();
-    if (t == 0) last = atomicAdd(done + tt * 24 + h, 1u) == NSPLIT - 1;
+    if (t == 0) last = atomicAdd(done + tt * 24 + kvh, 1u) == NSPLIT - 1;
     __syncthreads();
     if (!last) return;
     __threadfence();
-    if (t == 0) done[tt * 24 + h] = 0;
-    attn_combine(qx - (size_t)tt * QX, part, ob, h, tt);
+    if (t == 0) done[tt * 24 + kvh] = 0;
+    #pragma unroll
+    for (int h = 0; h < 3; h++) attn_combine(qx, part, ob, kvh * 3 + h, tt);
 }
 
 #define QT 32
