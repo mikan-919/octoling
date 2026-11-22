@@ -173,6 +173,8 @@ pub struct Gpu {
     recording: RefCell<Vec<CudaGraph>>,
     rewind_tab: P, // conv_rewind に渡す (seq, hist, ch) の表
     capturing: Cell<bool>,
+    stamps: RefCell<Vec<&'static str>>, // (OCTO_STAMP) 時刻を書いた順のカーネル名
+    stamp_buf: P,
     // prefill で、20〜23層の MXFP8 expert の一部を PCIe で送って GPU で計算するための送信用ストリームと置き場
     copy: Arc<CudaStream>,
     staging: [P; 2],
@@ -213,10 +215,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 44] = [
+const KERNELS: [&str; 45] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -380,6 +382,8 @@ impl Gpu {
             recording: RefCell::new(vec![]),
             rewind_tab,
             capturing: Cell::new(false),
+            stamps: RefCell::new(vec![]),
+            stamp_buf: up.zeros(8 << 16),
         }
     }
 
@@ -407,6 +411,15 @@ impl Gpu {
         // SAFETY: 引数の数と型は gpu.cu の宣言に合わせてある。ポインタはどれも 64bit
         unsafe { sys::cuLaunchKernelEx(&cfg, self.f[name].cu_function(), ptrs.as_mut_ptr(), std::ptr::null_mut()).result() }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+        if name != "stamp" && self.capturing.get() && stamping() {
+            self.stamp(KERNELS.iter().find(|k| **k == name).unwrap());
+        }
+    }
+
+    fn stamp(&self, name: &'static str) {
+        let i = self.stamps.borrow().len();
+        self.stamps.borrow_mut().push(name);
+        k!(self, "stamp", 1, 32, 0; self.stamp_buf, i as i32);
     }
 
     fn copy(&self, dst: P, src: P, floats: usize) {
@@ -526,6 +539,7 @@ impl Gpu {
             }
             return;
         }
+        self.stamps.borrow_mut().clear();
         self.capturing.set(small);
         self.begin();
         self.record(t, verify);
@@ -549,6 +563,21 @@ impl Gpu {
     pub fn forward_greedy(&mut self, token: u32) -> u32 {
         self.inputs(&[token]);
         self.run(1, false);
+        if stamping() {
+            // (名前, 合計の µs, 回数)。区切りの先頭 (begin) は CPU の時間を含むので数えない
+            let names = self.stamps.borrow();
+            let t: Vec<u64> = self.dtoh(self.stamp_buf, names.len());
+            let mut agg: Vec<(&str, f64, usize)> = vec![];
+            for i in (1..names.len()).filter(|&i| names[i] != "begin") {
+                let us = (t[i] - t[i - 1]) as f64 / 1e3;
+                match agg.iter_mut().find(|a| a.0 == names[i]) {
+                    Some(a) => (a.1, a.2) = (a.1 + us, a.2 + 1),
+                    None => agg.push((names[i], us, 1)),
+                }
+            }
+            agg.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!("stamp {}", agg.iter().map(|a| format!("{}:{:.0}us/{}", a.0, a.1, a.2)).collect::<Vec<_>>().join(" "));
+        }
         self.pos += 1;
         0xffff_ffff - self.dtoh::<u64>(self.b.best, 1)[0] as u32
     }
@@ -614,6 +643,9 @@ impl Gpu {
     fn begin(&self) {
         if self.capturing.get() {
             self.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+            if stamping() {
+                self.stamp("begin");
+            }
         }
     }
 
@@ -935,8 +967,8 @@ impl Gpu {
                     k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
                 }
                 if t <= SPEC_T {
-                    k!(self, "moe_up_nvfp4", (t * TOP_K * FF * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act, ti);
-                    k!(self, "moe_down_nvfp4", (t * D * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y, ti);
+                    k!(self, "moe_up_nvfp4", (t * TOP_K * FF / 4 * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act, ti);
+                    k!(self, "moe_down_nvfp4", (t * D / 2 * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y, ti);
                 } else {
                     let n = (t * TOP_K) as i32;
                     k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
@@ -962,6 +994,12 @@ impl Gpu {
             model::trace(slot, &self.dtoh(b.x, D));
         }
     }
+}
+
+/// OCTO_STAMP を付けると、生成の CUDA Graph の各カーネルのあとに GPU の時刻を記録し、トークンごとにカーネルの種類別の時間 (直前の記録からの差) を出す
+fn stamping() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("OCTO_STAMP").is_some());
+    *ON
 }
 
 fn phys(slot: usize) -> usize {

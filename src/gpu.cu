@@ -739,78 +739,88 @@ extern "C" __global__ void topk(const float* logits, const float* bias, int* ids
     if (threadIdx.x < 32) topk_warp(logits + blockIdx.x * NEXP, bias, ids + blockIdx.x * TOPK, wts + blockIdx.x * TOPK, threadIdx.x);
 }
 
-// NVFP4 の1行 (N 要素) のうち、レーンが受け持つ 16 要素ブロック lane + 32j の重みと scale。読み込みを先にまとめて出す
-template <int N>
-struct Fp4Row {
-    static constexpr int NJ = (N / 16 + 31) / 32;
-    uint2 pk[NJ];
-    unsigned sc[NJ];
-    __device__ __forceinline__ void load(const u8* w, const u8* s, int lane) {
-        #pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            int blk = lane + 32 * j;
-            if (blk < N / 16) pk[j] = __ldg((const uint2*)(w + blk * 8)), sc[j] = __ldg(s + blk);
-        }
+// NVFP4 の 16 要素ブロック1つ (pk) と x[0..16] (xv) の内積。scale は掛けない
+__device__ __forceinline__ float fp4_block(uint2 pk, const float4* xv) {
+    float b = 0.f;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        unsigned u = half ? pk.y : pk.x;
+        float4 x0 = xv[half * 2], x1 = xv[half * 2 + 1];
+        b += e2m1(u) * x0.x + e2m1(u >> 4) * x0.y + e2m1(u >> 8) * x0.z + e2m1(u >> 12) * x0.w;
+        b += e2m1(u >> 16) * x1.x + e2m1(u >> 20) * x1.y + e2m1(u >> 24) * x1.z + e2m1(u >> 28) * x1.w;
     }
-    // x との内積の部分和
-    __device__ __forceinline__ float dot(const float* x, int lane) const {
-        float acc = 0.f;
-        #pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            int blk = lane + 32 * j;
-            if (blk >= N / 16) break;
-            const float4* xx = (const float4*)(x + blk * 16);
-            float b = 0.f;
-            #pragma unroll
-            for (int half = 0; half < 2; half++) {
-                unsigned u = half ? pk[j].y : pk[j].x;
-                float4 x0 = xx[half * 2], x1 = xx[half * 2 + 1];
-                b += e2m1(u) * x0.x + e2m1(u >> 4) * x0.y + e2m1(u >> 8) * x0.z + e2m1(u >> 12) * x0.w;
-                b += e2m1(u >> 16) * x1.x + e2m1(u >> 20) * x1.y + e2m1(u >> 24) * x1.z + e2m1(u >> 28) * x1.w;
-            }
-            acc += b * e4m3(sc[j]);
-        }
-        return acc;
-    }
-};
-
-// (T <= 8 用) 選ばれた8 expert の gate と up を計算して SITU をかける。1ワープが、割り当て a = t*8+k の gate の行 2i と up の行 2i+1 を受け持つ
-extern "C" __global__ void moe_up_nvfp4(const u8* w13, const u8* s13, const float* a13, const int* ids, const float* x, float* act, int T) {
-    PDL();
-    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (gw >= T * TOPK * FF) return;
-    int a = gw / FF, i = gw % FF, ex = ids[a];
-    const float* xt = x + (size_t)(a / TOPK) * D;
-    size_t row = (size_t)ex * 2 * FF + 2 * i;
-    Fp4Row<D> rg, ru;
-    rg.load(w13 + row * (D / 2), s13 + row * (D / 16), lane);
-    ru.load(w13 + (row + 1) * (D / 2), s13 + (row + 1) * (D / 16), lane);
-    float g = warp_sum(rg.dot(xt, lane));
-    float u = warp_sum(ru.dot(xt, lane));
-    float sc = a13[ex] / 2688.f;
-    if (lane == 0) act[(size_t)a * FF + i] = situ(g * sc, u * sc);
+    return b;
 }
 
-// (T <= 8 用) down 射影と8 expert の重み付き和。1ワープが、トークン t の出力の1行を受け持つ
+// 生成の MoE は、レーンが 16 要素ブロック lane + 32j を受け持ち、ブロックごとに b * scale を足してからワープで和をとる。
+// 1ワープが複数の行を受け持ち、読んだ x のブロックを全部の行で使う (行ごとに x を読み直すと L1 の処理が律速になる)。各行の足す順は1行ずつのときと同じ
+
+// (T <= 8 用) 選ばれた8 expert の gate と up を計算して SITU をかける。1ワープが、割り当て a = t*8+k の i0..i0+3 番目
+// (gate と up が交互に並んだ連続 8 行) を受け持つ
+extern "C" __global__ void moe_up_nvfp4(const u8* w13, const u8* s13, const float* a13, const int* ids, const float* x, float* act, int T) {
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= T * TOPK * FF / 4) return;
+    PDL();
+    int a = gw / (FF / 4), i0 = gw % (FF / 4) * 4, ex = ids[a];
+    const float* xt = x + (size_t)(a / TOPK) * D;
+    size_t row0 = (size_t)ex * 2 * FF + 2 * i0;
+    const u8* w = w13 + row0 * (D / 2);
+    const u8* s = s13 + row0 * (D / 16);
+    float acc[8] = {};
+    #pragma unroll 1
+    for (int j = 0; j < (D / 16 + 31) / 32; j++) {
+        int blk = lane + 32 * j;
+        if (blk >= D / 16) break;
+        const float4* xx = (const float4*)(xt + blk * 16);
+        float4 xv[4] = {xx[0], xx[1], xx[2], xx[3]};
+        uint2 pk[8];
+        unsigned sc[8];
+        #pragma unroll
+        for (int r = 0; r < 8; r++) pk[r] = __ldg((const uint2*)(w + r * (D / 2) + blk * 8)), sc[r] = __ldg(s + r * (D / 16) + blk);
+        #pragma unroll
+        for (int r = 0; r < 8; r++) acc[r] += fp4_block(pk[r], xv) * e4m3(sc[r]);
+    }
+    float sca = a13[ex] / 2688.f;
+    #pragma unroll
+    for (int r = 0; r < 8; r += 2) {
+        float g = warp_sum(acc[r]), u = warp_sum(acc[r + 1]);
+        if (lane == 0) act[(size_t)a * FF + i0 + r / 2] = situ(g * sca, u * sca);
+    }
+}
+
+// (T <= 8 用) down 射影と8 expert の重み付き和。1ワープが、トークン t の出力の連続 2 行 r0, r0+1 を受け持つ
 extern "C" __global__ void moe_down_nvfp4(const u8* w2, const u8* s2, const float* a2, const int* ids, const float* wts, const float* act, float* y, int T) {
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (gw >= T * D) return;
-    int t = gw / D, row = gw % D;
+    if (gw >= T * D / 2) return;
+    int t = gw / (D / 2), r0 = gw % (D / 2) * 2;
     PDL();
-    Fp4Row<FF> r[TOPK];
-    #pragma unroll
-    for (int k = 0; k < TOPK; k++) {
-        size_t rr = (size_t)ids[t * TOPK + k] * D + row;
-        r[k].load(w2 + rr * (FF / 2), s2 + rr * (FF / 16), lane);
-    }
-    float acc = 0.f;
-    #pragma unroll
+    float acc[2] = {};
+    #pragma unroll 2
     for (int k = 0; k < TOPK; k++) {
         int a = t * TOPK + k, ex = ids[a];
-        acc += r[k].dot(act + (size_t)a * FF, lane) * wts[a] * a2[ex] / 2688.f;
+        const float* xk = act + (size_t)a * FF;
+        size_t rr = (size_t)ex * D + r0;
+        const u8* w = w2 + rr * (FF / 2);
+        const u8* s = s2 + rr * (FF / 16);
+        float d[2] = {};
+        #pragma unroll
+        for (int j = 0; j < (FF / 16 + 31) / 32; j++) {
+            int blk = lane + 32 * j;
+            if (blk >= FF / 16) break;
+            const float4* xx = (const float4*)(xk + blk * 16);
+            float4 xv[4] = {xx[0], xx[1], xx[2], xx[3]};
+            #pragma unroll
+            for (int r = 0; r < 2; r++)
+                d[r] += fp4_block(__ldg((const uint2*)(w + r * (FF / 2) + blk * 8)), xv) * e4m3(__ldg(s + r * (FF / 16) + blk));
+        }
+        #pragma unroll
+        for (int r = 0; r < 2; r++) acc[r] += d[r] * wts[a] * a2[ex] / 2688.f;
     }
-    acc = warp_sum(acc);
-    if (lane == 0) y[(size_t)t * D + row] = acc;
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        float v = warp_sum(acc[r]);
+        if (lane == 0) y[(size_t)t * D + r0 + r] = v;
+    }
 }
 
 // (T <= 8 用) y[t][r] = sum_c W[r][c] x[t][c]。W は BF16。重みを1回読むあいだに T 本と積和する。1行を1ワープで計算する
@@ -1430,4 +1440,12 @@ extern "C" __global__ void router_topk(const bf16* __restrict__ w, const float* 
     __threadfence();
     if (threadIdx.x == 0) *done = 0;
     if (threadIdx.x < 32) topk_warp(rl, bias, ids, wts, lane);
+}
+
+// (測定用) 前のカーネルの終わりを待って、GPU の時刻 (ns) を t[i] に書く
+extern "C" __global__ void stamp(unsigned long long* t, int i) {
+    PDL();
+    unsigned long long g;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g));
+    t[i] = g;
 }
