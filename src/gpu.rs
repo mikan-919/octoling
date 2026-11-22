@@ -1163,7 +1163,7 @@ impl Gpu {
         match l.experts {
             Some([w13, s13, a13, w2, s2, a2]) => {
                 if t == 1 {
-                    k!(self, "router_topk", 16, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24));
+                    k!(self, "router_topk", 64, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24));
                 } else {
                     self.gemm(l.router, b.h, b.rl, 128, D, t);
                     k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);

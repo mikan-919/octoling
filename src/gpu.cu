@@ -1475,26 +1475,30 @@ extern "C" __global__ void qkv_conv_post(float* qx, const float* kx, const float
     else vc[row + c] = f2h(y * rsqrtf(block_sum(y * y) / HD + 1e-6f));
 }
 
-// (T = 1 用) ルーターの行列×ベクトル (128 行、mv_bf16 と同じ計算) と topk を1回の起動で。16 ブロック x 256 スレッド。
-// 各ブロックが 8 行を書き、最後に終わったブロックが topk をとる。done はブロックの数を数える (最後のブロックが 0 に戻す)
+// (T = 1 用) ルーターの行列×ベクトル (128 行) と topk を1回の起動で。64 ブロック x 256 スレッド。
+// 各ブロックが 2 行を書き、最後に終わったブロックが topk をとる。done はブロックの数を数える (最後のブロックが 0 に戻す)
 extern "C" __global__ void router_topk(const bf16* __restrict__ w, const float* __restrict__ x, float* rl, const float* bias, int* ids, float* wts,
                                        unsigned* done) {
-    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    const uint4* wr = (const uint4*)(w + (size_t)row * D);
-    asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + lane * 8));
-    if (lane < 4) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + 256 + lane * 8));
+    // 1 行を 4 ワープで分ける (ワープ q が 16 バイト単位の 72q..72q+71 番目)。ブロック (8 ワープ) は 2 行
+    __shared__ float part[2][4];
+    int lane = threadIdx.x & 31, wq = (threadIdx.x >> 5) & 3, rb = threadIdx.x >> 7, row = blockIdx.x * 2 + rb;
+    const uint4* wr = (const uint4*)(w + (size_t)row * D) + wq * (D / 32);
+    const float* xq = x + wq * (D / 4);
+    if (lane < 9) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + lane * 8));
     PDL();
     float s = 0.f;
-    #pragma unroll 4
-    for (int i = lane; i < D / 8; i += 32) {
+    #pragma unroll
+    for (int i = lane; i < D / 32; i += 32) {
         uint4 v = __ldg(wr + i);
-        const float4* xx = (const float4*)(x + i * 8);
+        const float4* xx = (const float4*)(xq + i * 8);
         float4 a = xx[0], b = xx[1];
         s += bf(v.x & 0xffffu) * a.x + bf(v.x >> 16) * a.y + bf(v.y & 0xffffu) * a.z + bf(v.y >> 16) * a.w;
         s += bf(v.z & 0xffffu) * b.x + bf(v.z >> 16) * b.y + bf(v.w & 0xffffu) * b.z + bf(v.w >> 16) * b.w;
     }
     s = warp_sum(s);
-    if (lane == 0) rl[row] = s;
+    if (lane == 0) part[rb][wq] = s;
+    __syncthreads();
+    if (threadIdx.x < 2) rl[blockIdx.x * 2 + threadIdx.x] = part[threadIdx.x][0] + part[threadIdx.x][1] + part[threadIdx.x][2] + part[threadIdx.x][3];
     __shared__ bool last;
     __threadfence();
     __syncthreads();
