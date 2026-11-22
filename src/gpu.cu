@@ -675,13 +675,17 @@ extern "C" __global__ void add(const float* a, const float* b, float* out, int n
 
 // logits に softcap をかけ、最大の位置 (同じ値なら番号の小さい方) を best に残す (先に 0 にしておく)。
 // 値の大小がそのまま 64 ビットの大小になるよう、上位 32 ビットを並べ替えた値、下位を 0xffffffff - 位置にして atomicMax をとる
-extern "C" __global__ void softcap(float* x, int n, unsigned long long* best) {
+extern "C" __global__ void softcap(float* x, int n, unsigned long long* best, float* host) {
     PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned long long key = 0;
     if (i < n) {
         float v = 30.f * tanhf(x[i] / 30.f);
         x[i] = v;
+        if (host) {
+            host[i] = v; // 主記憶にも写す (生成)。CPU は done_host の旗を見てから読む
+            __threadfence_system();
+        }
         unsigned u = __float_as_uint(v);
         u = u & 0x80000000u ? ~u : u | 0x80000000u;
         key = (unsigned long long)u << 32 | (0xffffffffu - (unsigned)i);
@@ -1237,11 +1241,14 @@ __device__ __forceinline__ float mx_row(const u8* w, const u8* s, const float* x
     return acc;
 }
 
-// n 個の枠の expert の gate と up に SITU をかけ、act [n][FF] に書く。1ワープが j 番目の expert の行 2i (gate) と 2i+1 (up) を受け持つ
-extern "C" __global__ void moe_up_mx(const u8* cache, int n, unsigned long long slots, const float* x, float* act) {
+// 枠の expert の gate と up に SITU をかけ、act [n][FF] に書く。使う枠の数 n、枠の番号 (8 ビットずつ)、重みは route にある
+// (route: n u32、+8 に slots u64、+16 に重み f32 x 8。CPU が主記憶に書き、wait_host が VRAM に写したもの)。1ワープが j 番目の expert の行 2i (gate) と 2i+1 (up) を受け持つ
+extern "C" __global__ void moe_up_mx(const u8* cache, const u8* route, const float* x, float* act) {
     PDL();
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int n = *(const int*)route;
     if (gw >= n * FF) return;
+    unsigned long long slots = *(const unsigned long long*)(route + 8);
     int j = gw / FF, i = gw % FF;
     const u8* w13 = cache + (size_t)((slots >> (8 * j)) & 255) * XSLOT;
     const u8* s13 = w13 + XW13;
@@ -1251,20 +1258,54 @@ extern "C" __global__ void moe_up_mx(const u8* cache, int n, unsigned long long 
     if (lane == 0) act[gw] = situ(g, u);
 }
 
-// n 個の枠の expert の down 射影の、重み g0..g7 での和。1ワープが出力の1行を受け持つ
-extern "C" __global__ void moe_down_mx(const u8* cache, int n, unsigned long long slots, const float* act, float g0, float g1, float g2, float g3,
-                                       float g4, float g5, float g6, float g7, float* y) {
+// 枠の expert の down 射影の、重みつきの和。1ワープが出力の1行を受け持つ
+extern "C" __global__ void moe_down_mx(const u8* cache, const u8* route, const float* act, float* y) {
     PDL();
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (row >= D) return;
-    float g[8] = {g0, g1, g2, g3, g4, g5, g6, g7}, acc = 0.f;
+    int n = *(const int*)route;
+    unsigned long long slots = *(const unsigned long long*)(route + 8);
+    float acc = 0.f;
     for (int j = 0; j < n; j++) {
         const u8* w2 = cache + (size_t)((slots >> (8 * j)) & 255) * XSLOT + XW13 + XS13;
         const u8* s2 = w2 + XW2;
-        acc += mx_row(w2 + (size_t)row * FF, s2 + (size_t)row * (FF / 32), act + j * FF, FF, lane) * g[j];
+        acc += mx_row(w2 + (size_t)row * FF, s2 + (size_t)row * (FF / 32), act + j * FF, FF, lane) * ((const float*)(route + 16))[j];
     }
     acc = warp_sum(acc);
     if (lane == 0) y[row] = acc;
+}
+
+// ---- 生成時の CPU との受け渡し ----
+// 20〜23層の MoE は、1トークン分の CUDA Graph の中で CPU と受け渡す。場所は GPU から直接読み書きできる主記憶で、
+// 旗 (u32) で待ち合わせる。旗は書いた側が 1 にし、待っていた側が 0 に戻す。主記憶の値はキャッシュを通さずに読む
+
+// x [D] を主記憶の out に写し、旗を立てる。1 ブロック
+extern "C" __global__ void to_host(const float* x, float* out, unsigned* flag) {
+    PDL();
+    for (int i = threadIdx.x; i < D; i += blockDim.x) out[i] = x[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*)flag = 1;
+}
+
+// 旗が立つまで待ち、0 に戻す。n (<= 32) が 0 でなければ、続けて主記憶の src から u32 を n 個 dst (VRAM) に写す。1 ワープ
+// (主記憶を多くのスレッドが直接読むと、PCIe の小さい読み出しが大量に出て遅い)
+extern "C" __global__ void wait_host(unsigned* flag, const unsigned* src, unsigned* dst, int n) {
+    PDL();
+    if (threadIdx.x == 0) {
+        while (*(volatile unsigned*)flag == 0) __nanosleep(200);
+        *(volatile unsigned*)flag = 0;
+        __threadfence_system();
+    }
+    __syncwarp();
+    if (threadIdx.x < n) dst[threadIdx.x] = __ldcv(src + threadIdx.x);
+}
+
+// out = a + 主記憶の b
+extern "C" __global__ void add_host(const float* a, const float* b, float* out) {
+    PDL();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) out[i] = a[i] + __ldcv(b + i);
 }
 
 // ---- control (T = 1 用) ----
@@ -1448,4 +1489,20 @@ extern "C" __global__ void stamp(unsigned long long* t, int i) {
     unsigned long long g;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(g));
     t[i] = g;
+}
+
+// (生成) 主記憶に CPU が書いた入力 x [D] と位置を VRAM に写す。1トークン分の CUDA Graph の最初のカーネル
+extern "C" __global__ void from_host(const float* xh, const int* posh, float* x, int* pos) {
+    PDL();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D) x[i] = __ldcv(xh + i);
+    if (i == 0) *pos = __ldcv(posh);
+}
+
+// (生成) 最大の logits の (値, 位置) を主記憶に写し、終わりの旗を立てる。CUDA Graph の最後のカーネル
+extern "C" __global__ void done_host(const unsigned long long* best, unsigned long long* out, unsigned* flag) {
+    PDL();
+    *(volatile unsigned long long*)out = *best;
+    __threadfence_system();
+    *(volatile unsigned*)flag = 1;
 }
