@@ -85,7 +85,7 @@ fn bench(model: Model, ids: &str, n_gen: usize) {
     let t0 = Instant::now();
     for _ in 0..n_gen {
         out.push(next);
-        next = argmax(&gpu.forward(next));
+        next = gpu.forward_greedy(next);
     }
     if n_gen > 0 {
         let dt = t0.elapsed().as_secs_f64();

@@ -198,16 +198,22 @@ impl Engine {
             }
         } else {
             let mut rng = p.seed | 1;
+            // 貪欲法なら、次のトークンは GPU が logits から選ぶ
+            let mut next = greedy.then(|| argmax(&logits));
             loop {
                 if n == p.max_tokens || self.gpu.pos() >= max_ctx {
                     break "length";
                 }
-                let t = sample(&logits, p, &mut rng);
+                let t = next.take().unwrap_or_else(|| sample(&logits, p, &mut rng));
                 n += 1;
                 if t == self.sp.end_sampling || !self.emit(t, &mut out, &mut on) {
                     break "stop";
                 }
-                logits = self.gpu.forward(t);
+                if greedy {
+                    next = Some(self.gpu.forward_greedy(t));
+                } else {
+                    logits = self.gpu.forward(t);
+                }
                 if let Some(d) = &mut self.draft {
                     d.add_ctx(&self.gpu, 1);
                 }

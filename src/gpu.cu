@@ -673,10 +673,21 @@ extern "C" __global__ void add(const float* a, const float* b, float* out, int n
     if (i < n) out[i] = a[i] + b[i];
 }
 
-extern "C" __global__ void softcap(float* x, int n) {
+// logits に softcap をかけ、最大の位置 (同じ値なら番号の小さい方) を best に残す (先に 0 にしておく)。
+// 値の大小がそのまま 64 ビットの大小になるよう、上位 32 ビットを並べ替えた値、下位を 0xffffffff - 位置にして atomicMax をとる
+extern "C" __global__ void softcap(float* x, int n, unsigned long long* best) {
     PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = 30.f * tanhf(x[i] / 30.f);
+    unsigned long long key = 0;
+    if (i < n) {
+        float v = 30.f * tanhf(x[i] / 30.f);
+        x[i] = v;
+        unsigned u = __float_as_uint(v);
+        u = u & 0x80000000u ? ~u : u | 0x80000000u;
+        key = (unsigned long long)u << 32 | (0xffffffffu - (unsigned)i);
+    }
+    for (int o = 16; o > 0; o >>= 1) key = max(key, __shfl_xor_sync(0xffffffffu, key, o));
+    if ((threadIdx.x & 31) == 0 && key) atomicMax(best, key);
 }
 
 // ルーター: sigmoid、バイアス込みで上位8個を選び、重みを正規化して route_scale (8) を掛ける。ブロックはトークンごとで、先頭の1ワープが計算する。

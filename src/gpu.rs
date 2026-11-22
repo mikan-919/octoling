@@ -149,6 +149,7 @@ struct Bufs {
     logits_all: P, // [SPEC_T][201024]
     acc: P,        // [TMAX][24][HD + 2]。主記憶の KV の塊ごとに足し込む注意の途中結果
     done: P,       // u32 [SPEC_T * 24 + 1]。最後に終わったブロックを決める数 (attn_part のヘッドごと、router_topk)。使い終わると 0 に戻る
+    best: P,       // u64。最後の行の最大の logits の (値, 位置) を並べたもの (softcap が書く)
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -337,6 +338,7 @@ impl Gpu {
             logits_all: fz(SPEC_T * 201024, &mut up),
             acc: if n_ctx > VRAM_CTX { fz(t * 24 * 130, &mut up) } else { 0 },
             done: fz(SPEC_T * 24 + 1, &mut up),
+            best: fz(2, &mut up),
         };
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
@@ -540,6 +542,14 @@ impl Gpu {
         self.run(1, false);
         self.pos += 1;
         self.dtoh(self.b.logits, VOCAB)
+    }
+
+    /// 1トークンを処理して、logits の最大の位置 (貪欲法の次のトークン) を返す。logits は GPU で調べ、位置だけを読む
+    pub fn forward_greedy(&mut self, token: u32) -> u32 {
+        self.inputs(&[token]);
+        self.run(1, false);
+        self.pos += 1;
+        0xffff_ffff - self.dtoh::<u64>(self.b.best, 1)[0] as u32
     }
 
     /// プロンプトを TMAX トークンずつまとめて処理し、最後のトークンの logits を返す。
@@ -811,7 +821,9 @@ impl Gpu {
             k!(self, "argmax_rows", t, 1024, 0; b.logits_all, 201024i32, VOCAB as i32, b.amax);
         } else {
             self.gemm(self.unembed, normed + f4((t - 1) * D), b.logits, 201024, D, 1);
-            k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32);
+            // SAFETY: best は 8 バイトある
+            unsafe { result::memset_d8_async(b.best, 0, 8, self.stream.cu_stream()) }.unwrap();
+            k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; b.logits, VOCAB as i32, b.best);
         }
     }
 
