@@ -414,7 +414,8 @@ impl Model {
                 *o = e.dot(e.w13, e.s13, ex * 2 * FF + r % (2 * FF), x) * e.g13(ex);
             }
         });
-        let act = situ_pairs(&gu);
+        let mut act = vec![0.0; n * FF];
+        crate::pool::chunks_mut(&mut act, 256, |c, o| o.copy_from_slice(&situ_pairs(&gu[c * 512..][..2 * o.len()])));
         let g2: Vec<f32> = (0..n).map(|k| wts[k] * e.g2(sel[k])).collect();
         let mut y = vec![0.0; D];
         crate::pool::chunks_mut(&mut y, 64, |c, o| {
