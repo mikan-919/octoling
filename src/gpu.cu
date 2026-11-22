@@ -234,14 +234,15 @@ extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int
 // 各スレッドは要素 threadIdx.x + 256j を受け持ち、全状態の値を先にまとめて読む (読み込みを1つずつ待つと L2 の待ちが積み重なる)。
 // 足す順は、状態ごとに block_sum で足していたときと同じ
 #define MIX_NS 5
+#define MIX_TH 768 // スレッド数 (D の約数で 32 の倍数)
 extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
     PDL();
     int t = blockIdx.y, ns = nb + 1;
     const float* q = queries + blockIdx.x * D;
-    float v[D / 256][MIX_NS], qv[D / 256];
+    float v[D / MIX_TH][MIX_NS], qv[D / MIX_TH];
     #pragma unroll
-    for (int j = 0; j < D / 256; j++) {
-        int i = threadIdx.x + j * 256;
+    for (int j = 0; j < D / MIX_TH; j++) {
+        int i = threadIdx.x + j * MIX_TH;
         qv[j] = q[i];
         #pragma unroll
         for (int s = 0; s < MIX_NS; s++)
@@ -249,7 +250,7 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
     }
     float ss[MIX_NS] = {}, dq[MIX_NS] = {}, sc[MIX_NS], inv[MIX_NS];
     #pragma unroll
-    for (int j = 0; j < D / 256; j++) {
+    for (int j = 0; j < D / MIX_TH; j++) {
         #pragma unroll
         for (int s = 0; s < MIX_NS; s++)
             if (s < ns) {
@@ -257,7 +258,7 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
                 dq[s] += v[j][s] * qv[j];
             }
     }
-    __shared__ float red[8][2 * MIX_NS];
+    __shared__ float red[MIX_TH / 32][2 * MIX_NS];
     int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     #pragma unroll
     for (int s = 0; s < MIX_NS; s++) {
@@ -267,7 +268,7 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
     __syncthreads();
     #pragma unroll
     for (int s = 0; s < MIX_NS; s++) {
-        float a = warp_sum(lane < 8 ? red[lane][s] : 0.f), b = warp_sum(lane < 8 ? red[lane][MIX_NS + s] : 0.f);
+        float a = warp_sum(lane < MIX_TH / 32 ? red[lane][s] : 0.f), b = warp_sum(lane < MIX_TH / 32 ? red[lane][MIX_NS + s] : 0.f);
         inv[s] = rsqrtf(a / D + 1e-6f);
         sc[s] = b * inv[s] * rsqrtf((float)D);
     }
@@ -278,9 +279,9 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
     #pragma unroll
     for (int s = 0; s < MIX_NS; s++)
         if (s < ns) z += sc[s] = expf(sc[s] - m);
-    float o[D / 256], oss = 0.f;
+    float o[D / MIX_TH], oss = 0.f;
     #pragma unroll
-    for (int j = 0; j < D / 256; j++) {
+    for (int j = 0; j < D / MIX_TH; j++) {
         o[j] = 0.f;
         #pragma unroll
         for (int s = 0; s < MIX_NS; s++)
@@ -292,8 +293,8 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
     if (rms && threadIdx.x == 0) rms[blockIdx.x * T + t] = k;
     if (nw) nw += blockIdx.x * nws;
     #pragma unroll
-    for (int j = 0; j < D / 256; j++) {
-        int i = threadIdx.x + j * 256;
+    for (int j = 0; j < D / MIX_TH; j++) {
+        int i = threadIdx.x + j * MIX_TH;
         out[((size_t)blockIdx.x * T + t) * D + i] = nw ? o[j] * k * nw[i] : o[j];
     }
 }

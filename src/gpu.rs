@@ -518,7 +518,7 @@ impl Gpu {
     fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>, rms: P) {
         assert!(nb < 5, "mix は状態 5 個まで (MIX_NS)");
         let (nw, nws) = norm.unwrap_or((0, 0));
-        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        k!(self, "mix", (nq, t), 768, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
     }
 
     /// control cs[j] (j < 3) を、入力 j に メッセージ msg + slab(j) でかけて out + slab(j) に書く。並びは [j][T][D]。
