@@ -122,7 +122,7 @@ struct Bufs {
     blocks: P, // [8][T][D]
     prelude: P,
     bank: P, // [2][T][D]
-    msgs: P, // [4][T][D]
+    msgs: P, // [4][T][D]。T <= SPEC_T なら、ループの 12 層分を周の始めにまとめて作るので [12][4][T][D]
     inp: P,  // [3][T][D]
     qx: P,
     kx: P,
@@ -168,7 +168,7 @@ impl Bufs {
             blocks: fz(8 * t * D),
             prelude: fz(t * D),
             bank: fz(2 * t * D),
-            msgs: fz(4 * t * D),
+            msgs: fz(if t <= SPEC_T { (CORE.1 - CORE.0) * 4 * t * D } else { 4 * t * D }),
             inp: fz(3 * t * D),
             qx: fz(t * QX),
             kx: fz(t * (1024 + 32)),
@@ -214,6 +214,7 @@ pub struct Gpu {
     unembed: P,
     norm: P,
     output_query: P,
+    msg_queries: P, // ループの 12 層の msg_query を並べたもの [12][4][D]
     small: Bufs,
     big: Bufs, // expert の枠と同じ場所
     pos: usize,
@@ -381,6 +382,8 @@ impl Gpu {
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
+        let mq: Vec<f32> = cpu.layers[CORE.0..CORE.1].iter().flat_map(|l| l.msg_query.as_ref().unwrap().iter().copied()).collect();
+        let msg_queries = f32s(&mq, &mut up);
         // 残りの VRAM で expert の枠をとる。OCTO_EXPERT_SLOTS で数を決められる。
         // 先頭の枠は prefill の置き場 (staging、2 * GROUP 枠) と prefill 用の作業領域を兼ねる
         let align = |n: usize| n.div_ceil(256) * 256;
@@ -427,6 +430,7 @@ impl Gpu {
             unembed,
             norm,
             output_query,
+            msg_queries,
             small,
             big,
             pos: 0,
@@ -1002,7 +1006,7 @@ impl Gpu {
         let slab = |i: usize| f4(i * t * D); // [種類][T][D] の i 番目
         let mut nb = 0;
         for il in 0..CORE.0 {
-            self.layer(il, il, il, &mut nb, false, t);
+            self.layer(il, il, il, &mut nb, None, t);
         }
         self.copy(b.prelude, b.x, t * D);
         let prelude_nb = nb;
@@ -1017,14 +1021,23 @@ impl Gpu {
             }
             for ip in CORE.0..CORE.1 {
                 let slot = if pass == 0 { ip } else { N_LAYER + (pass - 1) * (CORE.1 - CORE.0) + ip - CORE.0 };
-                if pass > 0 {
+                // メッセージはその周のバンクだけから決まる。小さいバッチでは 12 層分を周の始めに1回で作る
+                let msgs = if pass == 0 {
+                    None
+                } else if t <= SPEC_T {
+                    if ip == CORE.0 {
+                        self.mix(b.bank, 1, b.bank + slab(1), self.msg_queries, 4 * (CORE.1 - CORE.0), b.msgs, t, None);
+                    }
+                    Some(b.msgs + slab(4 * (ip - CORE.0)))
+                } else {
                     self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t, None);
-                }
-                self.layer(ip, ip, slot, &mut nb, pass > 0, t);
+                    Some(b.msgs)
+                };
+                self.layer(ip, ip, slot, &mut nb, msgs, t);
             }
         }
         for il in CORE.1..N_LAYER {
-            self.layer(il, il, il, &mut nb, false, t);
+            self.layer(il, il, il, &mut nb, None, t);
         }
         self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t, None);
         // 正規化した最後の隠れ状態は、下書きモデルの4つ目の入力でもある
@@ -1068,7 +1081,9 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool, t: usize) {
+    /// msgs はループの 2 周目以降のメッセージ [4][T][D] の場所
+    fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msg: Option<P>, t: usize) {
+        let msgs = msg.is_some();
         let (l, s, b) = (&self.layers[il], &self.slots[slot], self.bufs(t));
         let slab = |i: usize| f4(i * t * D);
         let ti = t as i32;
@@ -1084,7 +1099,7 @@ impl Gpu {
         let separate = l.global || msgs;
         if msgs {
             // SWA は1本の入力から Q, K, V の3本を作る
-            self.control(b.inp, !l.global, b.inp, b.msgs, &l.ctrl[..3], t);
+            self.control(b.inp, !l.global, b.inp, msg.unwrap(), &l.ctrl[..3], t);
         }
         let n_in = if separate { 3 } else { 1 };
         if !fused {
@@ -1134,7 +1149,7 @@ impl Gpu {
         let mlp_fused = !msgs;
         self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t, mlp_fused.then_some((l.mlp_norm, 0)));
         if msgs {
-            self.control(b.h, false, b.h, b.msgs + slab(3), &l.ctrl[3..], t);
+            self.control(b.h, false, b.h, msg.unwrap() + slab(3), &l.ctrl[3..], t);
         }
         if !mlp_fused {
             k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, 0i32, ti);
