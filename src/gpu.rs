@@ -153,6 +153,7 @@ struct Bufs {
     done: P,       // u32 [SPEC_T * 24 + 1]。最後に終わったブロックを決める数 (attn_part のヘッドごと、router_topk)。使い終わると 0 に戻る
     best: P,       // u64。最後の行の最大の logits の (値, 位置) を並べたもの (softcap が書く)
     route: P,      // 生成の 20〜23層で、GPU で計算する枠 (CPU との受け渡しの route を写したもの、u32 x 12)
+    rms: P,        // (T = 1) RMS の逆数: [0..3] 注意の入力、[3] FFN の入力、[4..52] ループ 12 層のメッセージ
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -199,6 +200,7 @@ impl Bufs {
             done: fz(SPEC_T * 24 + 1),
             best: fz(2),
             route: fz(16),
+            rms: fz(64),
         }
     }
 }
@@ -512,21 +514,24 @@ impl Gpu {
 
     #[allow(clippy::too_many_arguments)]
     /// norm が (重み, query ごとのずれ) なら、続けて rmsnorm をかける
-    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>) {
+    /// rms が 0 でなければ、出力の RMS の逆数を rms [nq][T] に書く
+    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>, rms: P) {
         assert!(nb < 5, "mix は状態 5 個まで (MIX_NS)");
         let (nw, nws) = norm.unwrap_or((0, 0));
-        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32);
+        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
     }
 
     /// control cs[j] (j < 3) を、入力 j に メッセージ msg + slab(j) でかけて out + slab(j) に書く。並びは [j][T][D]。
     /// 入力 j は shared なら cur (全部共通)、そうでなければ cur + slab(j) で、out と同じでよい。T = 1 なら全部を1組の起動で計算する
-    fn control(&self, cur: P, shared: bool, out: P, msg: P, cs: &[GCtrl], t: usize) {
+    /// (T = 1) cur_rms, msg_rms は入力とメッセージの RMS の逆数 (mix が書いたもの)
+    #[allow(clippy::too_many_arguments)]
+    fn control(&self, cur: P, shared: bool, out: P, msg: P, cs: &[GCtrl], t: usize, cur_rms: P, msg_rms: P) {
         let b = self.bufs(t);
         let slab = |j: usize| f4(j * t * D);
         if t == 1 {
             let w = |j: usize, f: fn(&GCtrl) -> P| cs.get(j).map_or(0, f);
             let stride = if shared { 0 } else { D as i32 };
-            k!(self, "ctrl_down", (8, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g);
+            k!(self, "ctrl_down", (8, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g, cur_rms, msg_rms);
             k!(self, "ctrl_up", (D * 32).div_ceil(256), 256, 0;
                 cur, stride, out, msg, w(0, |c| c.gf), w(1, |c| c.gf), w(2, |c| c.gf), b.g, cs.len() as i32);
             return;
@@ -1026,11 +1031,11 @@ impl Gpu {
                     None
                 } else if t <= SPEC_T {
                     if ip == CORE.0 {
-                        self.mix(b.bank, 1, b.bank + slab(1), self.msg_queries, 4 * (CORE.1 - CORE.0), b.msgs, t, None);
+                        self.mix(b.bank, 1, b.bank + slab(1), self.msg_queries, 4 * (CORE.1 - CORE.0), b.msgs, t, None, if t == 1 { b.rms + f4(4) } else { 0 });
                     }
                     Some(b.msgs + slab(4 * (ip - CORE.0)))
                 } else {
-                    self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t, None);
+                    self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t, None, 0);
                     Some(b.msgs)
                 };
                 self.layer(ip, ip, slot, &mut nb, msgs, t);
@@ -1039,7 +1044,7 @@ impl Gpu {
         for il in CORE.1..N_LAYER {
             self.layer(il, il, il, &mut nb, None, t);
         }
-        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t, None);
+        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t, None, 0);
         // 正規化した最後の隠れ状態は、下書きモデルの4つ目の入力でもある
         let normed = b.taps + f4(3 * b.cap * D);
         k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, 0i32, t as i32);
@@ -1092,14 +1097,15 @@ impl Gpu {
         let wstride = if l.global { D } else { 0 };
         let fused = il > 0 && !msgs;
         if il > 0 {
-            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t, fused.then_some((l.norms, wstride)));
+            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t, fused.then_some((l.norms, wstride)), if msgs && t == 1 { b.rms } else { 0 });
         } else {
             self.copy(b.inp, b.x, t * D);
         }
         let separate = l.global || msgs;
         if msgs {
             // SWA は1本の入力から Q, K, V の3本を作る
-            self.control(b.inp, !l.global, b.inp, msg.unwrap(), &l.ctrl[..3], t);
+            let mr = b.rms + f4(4 + 4 * (ip - CORE.0));
+            self.control(b.inp, !l.global, b.inp, msg.unwrap(), &l.ctrl[..3], t, b.rms, mr);
         }
         let n_in = if separate { 3 } else { 1 };
         if !fused {
@@ -1147,9 +1153,9 @@ impl Gpu {
         }
 
         let mlp_fused = !msgs;
-        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t, mlp_fused.then_some((l.mlp_norm, 0)));
+        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t, mlp_fused.then_some((l.mlp_norm, 0)), if msgs && t == 1 { b.rms + f4(3) } else { 0 });
         if msgs {
-            self.control(b.h, false, b.h, msg.unwrap() + slab(3), &l.ctrl[3..], t);
+            self.control(b.h, false, b.h, msg.unwrap() + slab(3), &l.ctrl[3..], t, b.rms + f4(3), b.rms + f4(4 + 4 * (ip - CORE.0) + 3));
         }
         if !mlp_fused {
             k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, 0i32, ti);

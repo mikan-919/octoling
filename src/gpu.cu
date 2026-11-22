@@ -234,7 +234,7 @@ extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int
 // 各スレッドは要素 threadIdx.x + 256j を受け持ち、全状態の値を先にまとめて読む (読み込みを1つずつ待つと L2 の待ちが積み重なる)。
 // 足す順は、状態ごとに block_sum で足していたときと同じ
 #define MIX_NS 5
-extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws) {
+extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
     PDL();
     int t = blockIdx.y, ns = nb + 1;
     const float* q = queries + blockIdx.x * D;
@@ -287,11 +287,10 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
             if (s < ns) o[j] += sc[s] / z * inv[s] * v[j][s];
         oss += o[j] * o[j];
     }
-    float k = 1.f;
-    if (nw) {
-        k = rsqrtf(block_sum(oss) / D + 1e-6f);
-        nw += blockIdx.x * nws;
-    }
+    // rms が 0 でなければ、出力の RMS の逆数を rms[query][T] に書く (control が使う)
+    float k = nw || rms ? rsqrtf(block_sum(oss) / D + 1e-6f) : 1.f;
+    if (rms && threadIdx.x == 0) rms[blockIdx.x * T + t] = k;
+    if (nw) nw += blockIdx.x * nws;
     #pragma unroll
     for (int j = 0; j < D / 256; j++) {
         int i = threadIdx.x + j * 256;
@@ -1344,25 +1343,17 @@ extern "C" __global__ void add_host(const float* a, const float* b, float* out) 
 // norm2、down の行列×ベクトル、gf の行列×ベクトル、control の4カーネルを2つにまとめ、さらに n (<= 3) 本の control を1回の起動で計算する。
 // control j の入力は cur + j * cs (cs = 0 なら共通)、メッセージは msg + j * D、出力は out + j * D。足す順はまとめる前と同じ
 
-// g[j][r] = down_j[r] . [rmsnorm(cur_j), rmsnorm(msg_j)] (r < 64)。グリッドは (8, n)。各ブロックが正規化の係数を求め直す。256 スレッド
-extern "C" __global__ void ctrl_down(const float* cur, int cs, const float* msg, const bf16* w0, const bf16* w1, const bf16* w2, float* g) {
+// g[j][r] = down_j[r] . [rmsnorm(cur_j), rmsnorm(msg_j)] (r < 64)。グリッドは (8, n)。正規化の係数は cur_rms, msg_rms から読む。256 スレッド
+extern "C" __global__ void ctrl_down(const float* cur, int cs, const float* msg, const bf16* w0, const bf16* w1, const bf16* w2, float* g,
+                                     const float* cur_rms, const float* msg_rms) {
     PDL();
     int jc = blockIdx.y;
     cur += jc * cs;
     msg += jc * D;
     g += jc * 64;
     const bf16* w = jc == 0 ? w0 : jc == 1 ? w1 : w2;
-    float k[2], xv[2][D / 256];
-    #pragma unroll
-    for (int h = 0; h < 2; h++)
-        #pragma unroll
-        for (int j = 0; j < D / 256; j++) xv[h][j] = (h ? msg : cur)[threadIdx.x + j * 256];
-    for (int h = 0; h < 2; h++) {
-        float ss = 0.f;
-        #pragma unroll
-        for (int j = 0; j < D / 256; j++) ss += xv[h][j] * xv[h][j];
-        k[h] = rsqrtf(block_sum(ss) / D + 1e-6f);
-    }
+    // 正規化の係数は、入力とメッセージを作った mix が書いたもの
+    float k[2] = {cur_rms[cs ? jc : 0], msg_rms[jc]};
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (row >= 64) return;
     const uint4* wr = (const uint4*)(w + (size_t)row * 2 * D);
