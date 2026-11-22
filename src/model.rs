@@ -398,9 +398,15 @@ impl Model {
 
     pub(crate) fn moe(&self, l: &Layer, x: &[f32]) -> Vec<f32> {
         let (sel, wts) = self.route(l, x);
+        self.moe_some(l, x, &sel, &wts)
+    }
+
+    /// 1トークンの MoE のうち、expert sel (重み wts、route_scale 込み) の分の和
+    pub(crate) fn moe_some(&self, l: &Layer, x: &[f32], sel: &[usize], wts: &[f32]) -> Vec<f32> {
+        let n = sel.len();
         let e = &l.experts;
-        // 8 expert の行をまとめて分割し、全スレッドに配る
-        let mut gu = vec![0.0; TOP_K * 2 * FF];
+        // 選ばれた expert の行をまとめて分割し、全スレッドに配る
+        let mut gu = vec![0.0; n * 2 * FF];
         crate::pool::chunks_mut(&mut gu, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
                 let r = c * 64 + i;
@@ -409,12 +415,12 @@ impl Model {
             }
         });
         let act = situ_pairs(&gu);
-        let g2: Vec<f32> = (0..TOP_K).map(|k| wts[k] * e.g2(sel[k])).collect();
+        let g2: Vec<f32> = (0..n).map(|k| wts[k] * e.g2(sel[k])).collect();
         let mut y = vec![0.0; D];
         crate::pool::chunks_mut(&mut y, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
                 let row = c * 64 + i;
-                *o = (0..TOP_K).map(|k| e.dot(e.w2, e.s2, sel[k] * D + row, &act[k * FF..][..FF]) * g2[k]).sum();
+                *o = (0..n).map(|k| e.dot(e.w2, e.s2, sel[k] * D + row, &act[k * FF..][..FF]) * g2[k]).sum();
             }
         });
         y

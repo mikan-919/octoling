@@ -14,6 +14,9 @@
 #define GATE_OFF 3456
 #define SINK_OFF 6528
 #define INFINITY __int_as_float(0x7f800000)
+// PDL (Programmatic Dependent Launch)。前のカーネルが終わる (書いたものが見える) まで待ち、すぐ次のカーネルの起動を許す。
+// 次のカーネルのブロックは、このカーネルの最後の波と重なって SM に載り、ここで待つ。起動の待ちが隠れる
+#define PDL() asm volatile("griddepcontrol.wait;\n\tgriddepcontrol.launch_dependents;" ::: "memory")
 
 typedef unsigned short bf16;
 typedef unsigned char u8;
@@ -89,7 +92,11 @@ extern "C" __global__ void mv_bf16(const bf16* __restrict__ w, const float* __re
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (row >= rows) return;
     const uint4* wr = (const uint4*)(w + (size_t)row * cols);
+    // 重みは前のカーネルに依存しないので、待つあいだに L2 へ読み込んでおく (128 バイトずつ)
+    for (int i = lane * 8; i < cols / 8; i += 256) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + i));
+    PDL();
     float s = 0.f;
+    #pragma unroll 4
     for (int i = lane; i < cols / 8; i += 32) {
         uint4 v = __ldg(wr + i);
         const float4* xx = (const float4*)(x + i * 8);
@@ -178,6 +185,7 @@ __device__ __forceinline__ void store_y(float acc[4][4], int r0, F put) {
 
 // Y[t][r] = sum_c W[r][c] X[t][c]。W は BF16 の [rows, cols]、cols は 32 の倍数。グリッドは (rows/64, T/32)
 extern "C" __global__ void gemm_bf16(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
+    PDL();
     __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
     int r0 = blockIdx.x * 64, t0 = blockIdx.y * 32, tid = threadIdx.x;
     float acc[4][4] = {};
@@ -204,47 +212,96 @@ extern "C" __global__ void gemm_bf16(const bf16* __restrict__ w, const float* __
     });
 }
 
-// 長さ n のベクトル gridDim.x 本をそれぞれ RMS 正規化する。並びは [種類][T][n] で、重みは種類ごとに wstride ずつずれる (0 なら共通)
-extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int n, int wstride, int T) {
-    x += (size_t)blockIdx.x * n;
-    y += (size_t)blockIdx.x * n;
+// 長さ D のベクトル gridDim.x 本をそれぞれ RMS 正規化する。並びは [種類][T][D] で、重みは種類ごとに wstride ずつずれる (0 なら共通)
+extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int wstride, int T) {
+    PDL();
+    x += (size_t)blockIdx.x * D;
+    y += (size_t)blockIdx.x * D;
     if (w) w += (blockIdx.x / T) * wstride;
-    float ss = 0.f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
-    float k = rsqrtf(block_sum(ss) / n + 1e-6f);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * k * (w ? w[i] : 1.f);
+    // 256 スレッド。値を先にまとめて読む
+    float v[D / 256], ss = 0.f;
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) v[j] = x[threadIdx.x + j * 256];
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) ss += v[j] * v[j];
+    float k = rsqrtf(block_sum(ss) / D + 1e-6f);
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) y[threadIdx.x + j * 256] = v[j] * k * (w ? w[threadIdx.x + j * 256] : 1.f);
 }
 
-// 深さ方向の注意。状態は blocks[0..nb] と cur。ブロックは (query, トークン)。out は [query][T][D]
-extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T) {
-    int t = blockIdx.y;
+// 深さ方向の注意。状態は blocks[0..nb] と cur (nb + 1 <= MIX_NS)。ブロックは (query, トークン) で 256 スレッド。out は [query][T][D]
+// nw が 0 でなければ、続けて rmsnorm (重みは query ごとに nws ずつずれる) をかける。
+// 各スレッドは要素 threadIdx.x + 256j を受け持ち、全状態の値を先にまとめて読む (読み込みを1つずつ待つと L2 の待ちが積み重なる)。
+// 足す順は、状態ごとに block_sum で足していたときと同じ
+#define MIX_NS 5
+extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws) {
+    PDL();
+    int t = blockIdx.y, ns = nb + 1;
     const float* q = queries + blockIdx.x * D;
-    float sc[8], inv[8];
-    int ns = nb + 1;
-    for (int s = 0; s < ns; s++) {
-        const float* st = s < nb ? blocks + ((size_t)s * T + t) * D : cur + (size_t)t * D;
-        float ss = 0.f, dq = 0.f;
-        for (int i = threadIdx.x; i < D; i += blockDim.x) {
-            ss += st[i] * st[i];
-            dq += st[i] * q[i];
-        }
-        ss = block_sum(ss);
-        dq = block_sum(dq);
-        inv[s] = rsqrtf(ss / D + 1e-6f);
-        sc[s] = dq * inv[s] * rsqrtf((float)D);
+    float v[D / 256][MIX_NS], qv[D / 256];
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) {
+        int i = threadIdx.x + j * 256;
+        qv[j] = q[i];
+        #pragma unroll
+        for (int s = 0; s < MIX_NS; s++)
+            if (s < ns) v[j][s] = (s < nb ? blocks + ((size_t)s * T + t) * D : cur + (size_t)t * D)[i];
+    }
+    float ss[MIX_NS] = {}, dq[MIX_NS] = {}, sc[MIX_NS], inv[MIX_NS];
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) {
+        #pragma unroll
+        for (int s = 0; s < MIX_NS; s++)
+            if (s < ns) {
+                ss[s] += v[j][s] * v[j][s];
+                dq[s] += v[j][s] * qv[j];
+            }
+    }
+    __shared__ float red[8][2 * MIX_NS];
+    int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    #pragma unroll
+    for (int s = 0; s < MIX_NS; s++) {
+        float a = warp_sum(ss[s]), b = warp_sum(dq[s]);
+        if (lane == 0) red[w][s] = a, red[w][MIX_NS + s] = b;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int s = 0; s < MIX_NS; s++) {
+        float a = warp_sum(lane < 8 ? red[lane][s] : 0.f), b = warp_sum(lane < 8 ? red[lane][MIX_NS + s] : 0.f);
+        inv[s] = rsqrtf(a / D + 1e-6f);
+        sc[s] = b * inv[s] * rsqrtf((float)D);
     }
     float m = -INFINITY, z = 0.f;
-    for (int s = 0; s < ns; s++) m = fmaxf(m, sc[s]);
-    for (int s = 0; s < ns; s++) z += sc[s] = expf(sc[s] - m);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float o = 0.f;
-        for (int s = 0; s < ns; s++) o += sc[s] / z * inv[s] * (s < nb ? blocks + ((size_t)s * T + t) * D : cur + (size_t)t * D)[i];
-        out[((size_t)blockIdx.x * T + t) * D + i] = o;
+    #pragma unroll
+    for (int s = 0; s < MIX_NS; s++)
+        if (s < ns) m = fmaxf(m, sc[s]);
+    #pragma unroll
+    for (int s = 0; s < MIX_NS; s++)
+        if (s < ns) z += sc[s] = expf(sc[s] - m);
+    float o[D / 256], oss = 0.f;
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) {
+        o[j] = 0.f;
+        #pragma unroll
+        for (int s = 0; s < MIX_NS; s++)
+            if (s < ns) o[j] += sc[s] / z * inv[s] * v[j][s];
+        oss += o[j] * o[j];
+    }
+    float k = 1.f;
+    if (nw) {
+        k = rsqrtf(block_sum(oss) / D + 1e-6f);
+        nw += blockIdx.x * nws;
+    }
+    #pragma unroll
+    for (int j = 0; j < D / 256; j++) {
+        int i = threadIdx.x + j * 256;
+        out[((size_t)blockIdx.x * T + t) * D + i] = nw ? o[j] * k * nw[i] : o[j];
     }
 }
 
 // control の前半: トークンごとに [rmsnorm(cur), rmsnorm(msg)] を out [T][2D] に並べる。ブロックは (2, T)
 extern "C" __global__ void norm2(const float* cur, const float* msg, float* out) {
+    PDL();
     int t = blockIdx.y;
     const float* x = (blockIdx.x ? msg : cur) + (size_t)t * D;
     float ss = 0.f;
@@ -255,6 +312,7 @@ extern "C" __global__ void norm2(const float* cur, const float* msg, float* out)
 
 // control の後半: gf は [T][gain D, forget D]。cur を上書きしてよい。ブロックは (D/256, T)
 extern "C" __global__ void control(float* cur, const float* msg, const float* gf) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= D) return;
     size_t j = (size_t)t * D + i;
@@ -267,6 +325,7 @@ extern "C" __global__ void control(float* cur, const float* msg, const float* gf
 // 入力の行は cs 要素おき、出力の行は os 要素おき。dyn >= 0 なら入力の行の dyn 番目からがヘッドごとの [lag] のタップ
 // seq が 0 でなければ、[直前の入力3つ; このバッチの入力 T 個] を seq [3 + T][ch] に残す。投機的デコードで、受け入れた位置までの状態に戻すため
 extern "C" __global__ void conv(const float* cur, int cs, const float* w, int dyn, float* hist, float* out, int os, int ch, int cph, int T, float* seq) {
+    PDL();
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
     float h0 = hist[c * 3], h1 = hist[c * 3 + 1], h2 = hist[c * 3 + 2];
@@ -305,6 +364,7 @@ __device__ float clip_scale(float v, float threshold) {
 // ring > 0 なら SWA で、キャッシュは ring 行のリングバッファ
 extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp, const float* qclip, const float* rclip, const int* posp,
                                     int ring, half_t* kc, half_t* vc) {
+    PDL();
     int b = blockIdx.x, t = threadIdx.x, pos = *posp + blockIdx.y;
     float* q = qx + (size_t)blockIdx.y * QX;
     float* r = q + R_OFF;
@@ -356,6 +416,7 @@ __device__ __forceinline__ size_t kv_row(int j, int ring) { return (size_t)(ring
 // kc, vc は VRAM でも、GPU から直接読める主記憶 (長い文脈の global 層) でもよい
 #define SUB 2048
 extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* part, const int* posp, int ring) {
+    PDL();
     __shared__ float sc[SUB];
     int tt = blockIdx.y / NSPLIT, split = blockIdx.y % NSPLIT;
     qx += (size_t)tt * QX;
@@ -369,6 +430,7 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
     float m = -INFINITY, z = 0.f, o = 0.f;
     for (int s0 = j0; s0 < j1; s0 += SUB) {
         int s1 = min(j1, s0 + SUB);
+        #pragma unroll 4
         for (int j = s0 + warp; j < s1; j += blockDim.x >> 5) {
             float4 kv = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
             float s = warp_sum(qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w);
@@ -381,6 +443,7 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
         for (int i = t; i < s1 - s0; i += blockDim.x) zs += sc[i] = expf(sc[i] - mn);
         z = z * f + block_sum(zs);
         o *= f;
+        #pragma unroll 8
         for (int j = s0; j < s1; j++) o += sc[j - s0] * h2f(vc[kv_row(j, ring) + kvh * HD + t]);
         m = mn;
         __syncthreads();
@@ -399,6 +462,7 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
 // グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
 extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const half_t* vb, int b0, int nb, const float* rel_proj, float* acc,
                                     const int* posp, int T, int first) {
+    PDL();
     __shared__ __align__(16) float Qs[QT][HD];
     __shared__ __align__(16) float Ks[KT][HD + 4];
     __shared__ __align__(16) float Vs[KT][HD];
@@ -478,6 +542,7 @@ extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const hal
 
 // attn_blk の結果を正規化し、出力ゲートをかける。グリッドは (ヘッド, T)、128スレッド
 extern "C" __global__ void attn_fin(const float* qx, const float* acc, float* out) {
+    PDL();
     int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     const float* a = acc + ((size_t)t * 24 + h) * PART;
     out[(size_t)t * 3072 + h * HD + d] = a[2 + d] / a[1] * sigmoidf(qx[(size_t)t * QX + GATE_OFF + h * HD + d]);
@@ -485,6 +550,7 @@ extern "C" __global__ void attn_fin(const float* qx, const float* acc, float* ou
 
 // (T <= 8 用) 部分結果と sink をまとめ、出力ゲートをかける。グリッドは (ヘッド, T)、128スレッド
 extern "C" __global__ void attn_combine(const float* qx, const float* part, float* out) {
+    PDL();
     int h = blockIdx.x, t = threadIdx.x, tt = blockIdx.y;
     qx += (size_t)tt * QX;
     out += (size_t)tt * 3072;
@@ -505,6 +571,7 @@ extern "C" __global__ void attn_combine(const float* qx, const float* part, floa
 #define QT 32
 #define KT 16
 extern "C" __global__ void attn_tile(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* out, const int* posp, int ring, int T) {
+    PDL();
     __shared__ __align__(16) float Qs[QT][HD];
     __shared__ __align__(16) float Ks[KT][HD + 4];
     __shared__ __align__(16) float Vs[KT][HD];
@@ -584,68 +651,114 @@ extern "C" __global__ void attn_tile(const float* qx, const half_t* kc, const ha
 }
 
 extern "C" __global__ void add(const float* a, const float* b, float* out, int n) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
 
 extern "C" __global__ void softcap(float* x, int n) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = 30.f * tanhf(x[i] / 30.f);
 }
 
-// ルーター: sigmoid、バイアス込みで上位8個を選び、重みを正規化して route_scale (8) を掛ける。ブロックはトークンごと、128スレッド
+// ルーター: sigmoid、バイアス込みで上位8個を選び、重みを正規化して route_scale (8) を掛ける。ブロックはトークンごとで、先頭の1ワープが計算する。
+// レーンは expert lane + 32j (j = 0..3) を持ち、ワープ内で最大を8回求める。同じ値なら番号の小さい方を選ぶ (CPU 版と同じ)
 extern "C" __global__ void topk(const float* logits, const float* bias, int* ids, float* wts) {
-    __shared__ float p[NEXP], s[NEXP];
-    int t = threadIdx.x;
+    PDL();
+    int lane = threadIdx.x;
+    if (lane >= 32) return;
     logits += blockIdx.x * NEXP;
     ids += blockIdx.x * TOPK;
     wts += blockIdx.x * TOPK;
-    p[t] = sigmoidf(logits[t]);
-    s[t] = p[t] + bias[t];
-    __syncthreads();
-    if (t == 0) {
-        float sum = 0.f;
-        for (int k = 0; k < TOPK; k++) {
-            int bi = 0;
-            for (int e = 1; e < NEXP; e++)
-                if (s[e] > s[bi]) bi = e;
-            ids[k] = bi;
-            wts[k] = p[bi];
-            sum += p[bi];
-            s[bi] = -INFINITY;
+    float p[4], s[4], w[TOPK], sum = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        p[j] = sigmoidf(logits[lane + 32 * j]);
+        s[j] = p[j] + bias[lane + 32 * j];
+    }
+    #pragma unroll
+    for (int k = 0; k < TOPK; k++) {
+        float bv = s[0];
+        int bi = lane;
+        #pragma unroll
+        for (int j = 1; j < 4; j++)
+            if (s[j] > bv) bv = s[j], bi = lane + 32 * j;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
         }
-        for (int k = 0; k < TOPK; k++) wts[k] = wts[k] / (sum + 1e-20f) * 8.f;
+        float pj = p[0];
+        #pragma unroll
+        for (int j = 1; j < 4; j++)
+            if (bi >> 5 == j) pj = p[j];
+        w[k] = __shfl_sync(0xffffffffu, pj, bi & 31);
+        sum += w[k];
+        if (lane == (bi & 31)) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                if (bi >> 5 == j) s[j] = -INFINITY;
+        }
+        if (lane == k) ids[k] = bi;
+    }
+    if (lane < TOPK) {
+        float wk = w[0];
+        #pragma unroll
+        for (int k = 1; k < TOPK; k++)
+            if (lane == k) wk = w[k];
+        wts[lane] = wk / (sum + 1e-20f) * 8.f;
     }
 }
 
-// NVFP4 の1行 (n 要素) と x の内積の部分和。ワープの各レーンが 16 要素ブロックを分担する
-__device__ float nvfp4_row(const u8* w, const u8* s, const float* x, int n, int lane) {
-    float acc = 0.f;
-    for (int blk = lane; blk < n / 16; blk += 32) {
-        uint2 pk = *(const uint2*)(w + blk * 8);
-        const float4* xx = (const float4*)(x + blk * 16);
-        float b = 0.f;
+// NVFP4 の1行 (N 要素) のうち、レーンが受け持つ 16 要素ブロック lane + 32j の重みと scale。読み込みを先にまとめて出す
+template <int N>
+struct Fp4Row {
+    static constexpr int NJ = (N / 16 + 31) / 32;
+    uint2 pk[NJ];
+    unsigned sc[NJ];
+    __device__ __forceinline__ void load(const u8* w, const u8* s, int lane) {
         #pragma unroll
-        for (int half = 0; half < 2; half++) {
-            unsigned u = half ? pk.y : pk.x;
-            float4 x0 = xx[half * 2], x1 = xx[half * 2 + 1];
-            b += e2m1(u) * x0.x + e2m1(u >> 4) * x0.y + e2m1(u >> 8) * x0.z + e2m1(u >> 12) * x0.w;
-            b += e2m1(u >> 16) * x1.x + e2m1(u >> 20) * x1.y + e2m1(u >> 24) * x1.z + e2m1(u >> 28) * x1.w;
+        for (int j = 0; j < NJ; j++) {
+            int blk = lane + 32 * j;
+            if (blk < N / 16) pk[j] = __ldg((const uint2*)(w + blk * 8)), sc[j] = __ldg(s + blk);
         }
-        acc += b * e4m3(s[blk]);
     }
-    return acc;
-}
+    // x との内積の部分和
+    __device__ __forceinline__ float dot(const float* x, int lane) const {
+        float acc = 0.f;
+        #pragma unroll
+        for (int j = 0; j < NJ; j++) {
+            int blk = lane + 32 * j;
+            if (blk >= N / 16) break;
+            const float4* xx = (const float4*)(x + blk * 16);
+            float b = 0.f;
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                unsigned u = half ? pk[j].y : pk[j].x;
+                float4 x0 = xx[half * 2], x1 = xx[half * 2 + 1];
+                b += e2m1(u) * x0.x + e2m1(u >> 4) * x0.y + e2m1(u >> 8) * x0.z + e2m1(u >> 12) * x0.w;
+                b += e2m1(u >> 16) * x1.x + e2m1(u >> 20) * x1.y + e2m1(u >> 24) * x1.z + e2m1(u >> 28) * x1.w;
+            }
+            acc += b * e4m3(sc[j]);
+        }
+        return acc;
+    }
+};
 
 // (T <= 8 用) 選ばれた8 expert の gate と up を計算して SITU をかける。1ワープが、割り当て a = t*8+k の gate の行 2i と up の行 2i+1 を受け持つ
 extern "C" __global__ void moe_up_nvfp4(const u8* w13, const u8* s13, const float* a13, const int* ids, const float* x, float* act, int T) {
+    PDL();
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (gw >= T * TOPK * FF) return;
     int a = gw / FF, i = gw % FF, ex = ids[a];
     const float* xt = x + (size_t)(a / TOPK) * D;
     size_t row = (size_t)ex * 2 * FF + 2 * i;
-    float g = warp_sum(nvfp4_row(w13 + row * (D / 2), s13 + row * (D / 16), xt, D, lane));
-    float u = warp_sum(nvfp4_row(w13 + (row + 1) * (D / 2), s13 + (row + 1) * (D / 16), xt, D, lane));
+    Fp4Row<D> rg, ru;
+    rg.load(w13 + row * (D / 2), s13 + row * (D / 16), lane);
+    ru.load(w13 + (row + 1) * (D / 2), s13 + (row + 1) * (D / 16), lane);
+    float g = warp_sum(rg.dot(xt, lane));
+    float u = warp_sum(ru.dot(xt, lane));
     float sc = a13[ex] / 2688.f;
     if (lane == 0) act[(size_t)a * FF + i] = situ(g * sc, u * sc);
 }
@@ -655,11 +768,18 @@ extern "C" __global__ void moe_down_nvfp4(const u8* w2, const u8* s2, const floa
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (gw >= T * D) return;
     int t = gw / D, row = gw % D;
+    PDL();
+    Fp4Row<FF> r[TOPK];
+    #pragma unroll
+    for (int k = 0; k < TOPK; k++) {
+        size_t rr = (size_t)ids[t * TOPK + k] * D + row;
+        r[k].load(w2 + rr * (FF / 2), s2 + rr * (FF / 16), lane);
+    }
     float acc = 0.f;
+    #pragma unroll
     for (int k = 0; k < TOPK; k++) {
         int a = t * TOPK + k, ex = ids[a];
-        size_t r = (size_t)ex * D + row;
-        acc += nvfp4_row(w2 + r * (FF / 2), s2 + r * (FF / 16), act + (size_t)a * FF, FF, lane) * wts[a] * a2[ex] / 2688.f;
+        acc += r[k].dot(act + (size_t)a * FF, lane) * wts[a] * a2[ex] / 2688.f;
     }
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t)t * D + row] = acc;
@@ -667,6 +787,7 @@ extern "C" __global__ void moe_down_nvfp4(const u8* w2, const u8* s2, const floa
 
 // (T <= 8 用) y[t][r] = sum_c W[r][c] x[t][c]。W は BF16。重みを1回読むあいだに T 本と積和する。1行を1ワープで計算する
 extern "C" __global__ void mv_bf16_t(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
+    PDL();
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (row >= rows) return;
     const uint4* wr = (const uint4*)(w + (size_t)row * cols);
@@ -692,6 +813,7 @@ extern "C" __global__ void mv_bf16_t(const bf16* __restrict__ w, const float* __
 
 // (prefill 用) T*8 個の割り当て (トークン t の k 番目 = t*8+k) を expert 順に並べる。order[off[e]..off[e+1]] が expert e の割り当て
 extern "C" __global__ void moe_sort(const int* ids, int n, int* order, int* off) {
+    PDL();
     if (threadIdx.x != 0) return;
     int cnt[NEXP] = {};
     for (int a = 0; a < n; a++) cnt[ids[a]]++;
@@ -706,6 +828,7 @@ extern "C" __global__ void moe_sort(const int* ids, int n, int* order, int* off)
 // e2m1 x e4m3 は BF16 で誤差なく表せるので、amax/2688 は最後に掛ける
 extern "C" __global__ void gemm_nvfp4_grouped(const u8* __restrict__ w, const u8* __restrict__ s, const float* amax, int rows, int cols,
                                               const float* __restrict__ x, int xdiv, const int* order, const int* off, float* y) {
+    PDL();
     __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
     __shared__ int as[32];
     int e = blockIdx.y, beg = off[e], end = off[e + 1];
@@ -748,6 +871,7 @@ extern "C" __global__ void gemm_nvfp4_grouped(const u8* __restrict__ w, const u8
 // E4M3 x 2^(s-127) は BF16 で誤差なく表せる
 extern "C" __global__ void gemm_mxfp8_grouped(const u8* __restrict__ w, const u8* __restrict__ s, int rows, int cols, const float* __restrict__ x, int xdiv,
                                               const int* order, const int* off, int e0, float* y) {
+    PDL();
     __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
     __shared__ int as[32];
     int e = e0 + blockIdx.y, beg = off[e], end = off[e + 1];
@@ -785,6 +909,7 @@ extern "C" __global__ void gemm_mxfp8_grouped(const u8* __restrict__ w, const u8
 
 // (prefill 用) order[base..base+n] の割り当てだけ SITU をかける
 extern "C" __global__ void situ_sel(const float* gu, float* act, const int* order, int base, int n) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * FF) return;
     int a = order[base + i / FF], j = i % FF;
@@ -793,6 +918,7 @@ extern "C" __global__ void situ_sel(const float* gu, float* act, const int* orde
 
 // (prefill 用) gate/up が交互に並ぶ [n][2FF] に SITU をかけて [n][FF] にする
 extern "C" __global__ void situ_rows(const float* gu, float* act, int n) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * FF) return;
     int a = i / FF, j = i % FF;
@@ -801,6 +927,7 @@ extern "C" __global__ void situ_rows(const float* gu, float* act, int n) {
 
 // (prefill 用) y[t] = sum_k wts[t][k] yd[t*8+k]
 extern "C" __global__ void moe_sum(const float* yd, const float* wts, float* y, int T) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
     int t = i / D, d = i % D;
@@ -814,6 +941,7 @@ extern "C" __global__ void moe_sum(const float* yd, const float* wts, float* y, 
 // 畳み込みの状態を、検証したバッチのうち先頭 a 個の入力を受け入れた時点に戻す。
 // tab[3e .. 3e+2] = (seq, hist, ch)。新しい状態は seq の行 a, a+1, a+2。グリッドは (ch/256, 項目の数)
 extern "C" __global__ void conv_rewind(const unsigned long long* tab, int a) {
+    PDL();
     const float* seq = (const float*)tab[3 * blockIdx.y];
     float* hist = (float*)tab[3 * blockIdx.y + 1];
     int ch = (int)tab[3 * blockIdx.y + 2], c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -823,6 +951,7 @@ extern "C" __global__ void conv_rewind(const unsigned long long* tab, int a) {
 
 // 行ごとの、先頭 n 個のうち最大の値の位置 (同じ値なら小さい位置)。行は stride 個おき。ブロックは行ごと、1024スレッド
 extern "C" __global__ void argmax_rows(const float* x, int stride, int n, int* out) {
+    PDL();
     __shared__ float bv[32];
     __shared__ int bi[32];
     const float* r = x + (size_t)blockIdx.x * stride;
@@ -864,6 +993,7 @@ __device__ __forceinline__ unsigned char f2e4m3(float x) {
 
 // BF16 の行を、行の最大の絶対値が 448 になるスケールで FP8 にする。ブロックは行ごと、256スレッド
 extern "C" __global__ void quant_rows_bf16(const bf16* src, int cols, u8* dst, float* scale) {
+    PDL();
     const bf16* r = src + (size_t)blockIdx.x * cols;
     float m = 0.f;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, fabsf(bf(r[c])));
@@ -875,6 +1005,7 @@ extern "C" __global__ void quant_rows_bf16(const bf16* src, int cols, u8* dst, f
 
 // y [k][ld] の列 v (長さ k) を FP8 の行 v にする。ブロックは列ごと、k (= 256) スレッド
 extern "C" __global__ void quant_cols_f32(const float* y, int ld, int k, u8* dst, float* scale) {
+    PDL();
     int v = blockIdx.x, j = threadIdx.x;
     float x = j < k ? y[(size_t)j * ld + v] : 0.f;
     float m = block_max(fabsf(x));
@@ -886,6 +1017,7 @@ extern "C" __global__ void quant_cols_f32(const float* y, int ld, int k, u8* dst
 // y[t][r] = scale[r] * sum_c W[r][c] x[t][c] (t < T <= 8)。W は FP8 の [rows, cols]、cols は 16 の倍数。1行を1ワープで計算する
 extern "C" __global__ void mv_fp8(const u8* __restrict__ w, const float* __restrict__ sc, const float* __restrict__ x, float* __restrict__ y,
                                   int rows, int cols, int T) {
+    PDL();
     int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (row >= rows) return;
     const uint4* wr = (const uint4*)(w + (size_t)row * cols);
@@ -919,6 +1051,7 @@ extern "C" __global__ void mv_fp8(const u8* __restrict__ w, const float* __restr
 
 // out[t] = sum_j a_j taps[j][t] (taps の種類は tstride 要素おき)
 extern "C" __global__ void tapmix(const float* taps, int tstride, float a0, float a1, float a2, float a3, int n, float* out) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * D) return;
     out[i] = a0 * taps[i] + a1 * taps[tstride + i] + a2 * taps[2 * tstride + i] + a3 * taps[3 * tstride + i];
@@ -942,6 +1075,7 @@ __device__ float head_norm_rope(float x, const float* w, int pos) {
 // 文脈の K/V: kv [n][2048] (k 1024, v 1024) の K を正規化と RoPE、位置 pos0+t の行に f16 で書く。ring > 0 ならリングバッファ。
 // グリッドは (KV ヘッド 8, n)、128スレッド
 extern "C" __global__ void dr_ctx_store(const float* kv, const float* knorm, int pos0, int ring, half_t* kc, half_t* vc) {
+    PDL();
     int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x, pos = pos0 + t;
     float k = head_norm_rope(kv[(size_t)t * 2048 + h * HD + d], knorm, pos);
     size_t at = (size_t)(ring ? pos % ring : pos) * 1024 + h * HD + d;
@@ -951,6 +1085,7 @@ extern "C" __global__ void dr_ctx_store(const float* kv, const float* knorm, int
 
 // ブロック 8 行の q と k (qkv [8][5120]) を正規化と RoPE (位置 pos0+行)。グリッドは (q 24 + k 8, 8)、128スレッド
 extern "C" __global__ void dr_qk(float* qkv, const float* qn, const float* kn, int pos0) {
+    PDL();
     int hh = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float* p = qkv + (size_t)t * DQKV + (hh < 24 ? hh * HD : 3072 + (hh - 24) * HD);
     float r = head_norm_rope(p[d], hh < 24 ? qn : kn, pos0 + t);
@@ -959,6 +1094,7 @@ extern "C" __global__ void dr_qk(float* qkv, const float* qn, const float* kn, i
 
 // ブロック 8 行の注意。キーは文脈の位置 lo..hi (キャッシュ) とブロックの 8 行で、マスクなし。グリッドは (ヘッド 24, 8)、128スレッド
 extern "C" __global__ void dr_attn(const float* qkv, const half_t* kc, const half_t* vc, int ring, int lo, int hi, float* out) {
+    PDL();
     __shared__ float sc[DRAFT_CTX + 8];
     int h = blockIdx.x, t = blockIdx.y, kvh = h / 3, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int nc = hi - lo, n = nc + 8;
@@ -984,6 +1120,7 @@ extern "C" __global__ void dr_attn(const float* qkv, const half_t* kc, const hal
 
 // act[t][j] = silu(gu[t][j]) * gu[t][DFF + j]
 extern "C" __global__ void silu_mul(const float* gu, float* act, int T) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * DFF) return;
     int t = i / DFF, j = i % DFF;
@@ -993,6 +1130,7 @@ extern "C" __global__ void silu_mul(const float* gu, float* act, int T) {
 
 // x2[t] = [hidden[t], frnn] (8 行)
 extern "C" __global__ void concat_frnn(const float* hidden, const float* frnn, float* x2) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 8 * 2 * D) return;
     int t = i / (2 * D), j = i % (2 * D);
@@ -1000,12 +1138,14 @@ extern "C" __global__ void concat_frnn(const float* hidden, const float* frnn, f
 }
 
 extern "C" __global__ void add_bias_rows(float* y, const float* b, int cols, int n) {
+    PDL();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += b[i % cols];
 }
 
 // Markov ヘッドの1手: logits = softcap(l + fb + base)、その最大の位置と sum exp(logits - max)。1ブロック 1024スレッド
 extern "C" __global__ void fold_finish(float* l, const float* fb, const float* base, int n, int* best, float* sumexp) {
+    PDL();
     __shared__ int bi[32];
     float v = -INFINITY;
     int i = 0;
@@ -1031,4 +1171,134 @@ extern "C" __global__ void fold_finish(float* l, const float* fb, const float* b
         *best = b;
         *sumexp = z;
     }
+}
+
+// ---- 生成時の 20〜23層 (MXFP8) の一部の expert ----
+// CPU が計算するあいだに、選ばれた expert の一部を PCIe で置き場に送り、GPU で計算する。置き場の並びは [w13 x 8][s13 x 8][w2 x 8][s2 x 8]
+
+// MXFP8 の1行 (n 要素、32 要素ごとに UE8M0 の scale) と x の内積の部分和。レーンは 16 要素ずつ分担する
+__device__ __forceinline__ float mx_row(const u8* w, const u8* s, const float* x, int n, int lane) {
+    float acc = 0.f;
+    for (int c = lane; c < n / 16; c += 32) {
+        uint4 pk = __ldg((const uint4*)(w + c * 16));
+        const float4* xx = (const float4*)(x + c * 16);
+        unsigned u[4] = {pk.x, pk.y, pk.z, pk.w};
+        float b = 0.f;
+        #pragma unroll
+        for (int q = 0; q < 4; q++) {
+            float4 v = xx[q];
+            b += e4m3(u[q]) * v.x + e4m3(u[q] >> 8) * v.y + e4m3(u[q] >> 16) * v.z + e4m3(u[q] >> 24) * v.w;
+        }
+        acc += b * __uint_as_float((unsigned)s[c / 2] << 23);
+    }
+    return acc;
+}
+
+// 置き場の n 個の expert の gate と up に SITU をかける。1ワープが expert j の行 2i (gate) と 2i+1 (up) を受け持つ
+extern "C" __global__ void moe_up_mx(const u8* w13, const u8* s13, int n, const float* x, float* act) {
+    PDL();
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= n * FF) return;
+    size_t row = (size_t)(gw / FF) * 2 * FF + 2 * (gw % FF);
+    float g = warp_sum(mx_row(w13 + row * D, s13 + row * (D / 32), x, D, lane));
+    float u = warp_sum(mx_row(w13 + (row + 1) * D, s13 + (row + 1) * (D / 32), x, D, lane));
+    if (lane == 0) act[gw] = situ(g, u);
+}
+
+// 置き場の n (<= 4) 個の expert の down 射影の、重み g0..g3 での和。1ワープが出力の1行を受け持つ
+extern "C" __global__ void moe_down_mx(const u8* w2, const u8* s2, int n, const float* act, float g0, float g1, float g2, float g3, float* y) {
+    PDL();
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= D) return;
+    float g[4] = {g0, g1, g2, g3}, acc = 0.f;
+    for (int j = 0; j < n; j++) {
+        size_t r = (size_t)j * D + row;
+        acc += mx_row(w2 + r * FF, s2 + r * (FF / 32), act + j * FF, FF, lane) * g[j];
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+// ---- control (T = 1 用) ----
+// norm2、down の行列×ベクトル、gf の行列×ベクトル、control の4カーネルを2つにまとめたもの。足す順はまとめる前と同じ
+
+// g[r] = down[r] . [rmsnorm(cur), rmsnorm(msg)] (r < 64)。各ブロックが正規化の係数を求め直す。256 スレッド
+extern "C" __global__ void ctrl_down(const float* cur, const float* msg, const bf16* __restrict__ w, float* g) {
+    PDL();
+    float k[2], xv[2][D / 256];
+    #pragma unroll
+    for (int h = 0; h < 2; h++)
+        #pragma unroll
+        for (int j = 0; j < D / 256; j++) xv[h][j] = (h ? msg : cur)[threadIdx.x + j * 256];
+    for (int h = 0; h < 2; h++) {
+        float ss = 0.f;
+        #pragma unroll
+        for (int j = 0; j < D / 256; j++) ss += xv[h][j] * xv[h][j];
+        k[h] = rsqrtf(block_sum(ss) / D + 1e-6f);
+    }
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= 64) return;
+    const uint4* wr = (const uint4*)(w + (size_t)row * 2 * D);
+    float s = 0.f;
+    #pragma unroll
+    for (int i = lane; i < 2 * D / 8; i += 32) {
+        uint4 v = __ldg(wr + i);
+        int h = i >= D / 8;
+        const float* xs = (h ? msg : cur) + (i * 8 - h * D);
+        float kh = k[h];
+        float4 a0 = ((const float4*)xs)[0], b0 = ((const float4*)xs)[1];
+        float4 a = make_float4(a0.x * kh, a0.y * kh, a0.z * kh, a0.w * kh), b = make_float4(b0.x * kh, b0.y * kh, b0.z * kh, b0.w * kh);
+        s += bf(v.x & 0xffffu) * a.x + bf(v.x >> 16) * a.y + bf(v.y & 0xffffu) * a.z + bf(v.y >> 16) * a.w;
+        s += bf(v.z & 0xffffu) * b.x + bf(v.z >> 16) * b.y + bf(v.w & 0xffffu) * b.z + bf(v.w >> 16) * b.w;
+    }
+    s = warp_sum(s);
+    if (lane == 0) g[row] = s;
+}
+
+// 1ワープが i 番目の gain (gf の行 i) と forget (行 D + i) を求め、cur[i] を上書きする。gf は [2D][64]
+extern "C" __global__ void ctrl_up(float* cur, const float* msg, const bf16* __restrict__ w, const float* g) {
+    PDL();
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (i >= D) return;
+    float s[2];
+    for (int h = 0; h < 2; h++) {
+        float v = 0.f;
+        if (lane < 8) {
+            uint4 u = __ldg((const uint4*)(w + (size_t)(h * D + i) * 64) + lane);
+            float4 a = ((const float4*)g)[lane * 2], b = ((const float4*)g)[lane * 2 + 1];
+            v += bf(u.x & 0xffffu) * a.x + bf(u.x >> 16) * a.y + bf(u.y & 0xffffu) * a.z + bf(u.y >> 16) * a.w;
+            v += bf(u.z & 0xffffu) * b.x + bf(u.z >> 16) * b.y + bf(u.w & 0xffffu) * b.z + bf(u.w >> 16) * b.w;
+        }
+        s[h] = warp_sum(v);
+    }
+    if (lane == 0) {
+        float c = cur[i];
+        cur[i] = c - tanhf(s[1]) * c + tanhf(s[0]) * msg[i];
+    }
+}
+
+// (T = 1 用) Q, K, V の3つの行列×ベクトルを1回の起動で。行 r < r0 は (w0, x0, y0)、r < r0 + r1 は (w1, x1, y1)、残りは (w2, x2, y2)。列は D
+extern "C" __global__ void mv3_bf16(const bf16* w0, const float* x0, float* y0, int r0, const bf16* w1, const float* x1, float* y1, int r1,
+                                    const bf16* w2, const float* x2, float* y2, int r2) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= r0 + r1 + r2) return;
+    const bf16* w = w0;
+    const float* x = x0;
+    float* y = y0;
+    if (row >= r0 + r1) w = w2, x = x2, y = y2, row -= r0 + r1;
+    else if (row >= r0) w = w1, x = x1, y = y1, row -= r0;
+    const uint4* wr = (const uint4*)(w + (size_t)row * D);
+    for (int i = lane * 8; i < D / 8; i += 256) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + i));
+    PDL();
+    float s = 0.f;
+    #pragma unroll 4
+    for (int i = lane; i < D / 8; i += 32) {
+        uint4 v = __ldg(wr + i);
+        const float4* xx = (const float4*)(x + i * 8);
+        float4 a = xx[0], b = xx[1];
+        s += bf(v.x & 0xffffu) * a.x + bf(v.x >> 16) * a.y + bf(v.y & 0xffffu) * a.z + bf(v.y >> 16) * a.w;
+        s += bf(v.z & 0xffffu) * b.x + bf(v.z >> 16) * b.y + bf(v.w & 0xffffu) * b.z + bf(v.w >> 16) * b.w;
+    }
+    s = warp_sum(s);
+    if (lane == 0) y[row] = s;
 }

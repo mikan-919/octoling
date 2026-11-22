@@ -10,6 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// global 層の KV キャッシュを VRAM に置ける文脈の長さ。KV は f16 で、8192 トークンで global 層 268 MB、SWA 層のリング 250 MB。
 /// 文脈長 (Gpu::new の ctx) がこれより長いと、global 層の KV を GPU から直接読める主記憶 (ページ固定) に置く。
@@ -179,6 +180,13 @@ pub struct Gpu {
 
 /// prefill で1回に PCIe で送る MXFP8 expert の数。置き場は2つあり、片方を送るあいだにもう片方で計算する
 const GROUP: usize = 8;
+/// 生成で、20〜23層の選ばれた 8 expert のうち PCIe で送って GPU で計算する数 (0〜4、既定 2)。OCTO_PCIE_EXPERTS で変えられる。
+/// 1個 8.2 MB を PCIe 4.0 x8 (14.3 GB/s) で送る 0.57 ms と、CPU が1個を計算する約 0.21 ms から、両方が同じころに終わる数にした。別の機械では測り直す
+fn pcie_experts() -> usize {
+    static N: std::sync::LazyLock<usize> =
+        std::sync::LazyLock::new(|| std::env::var("OCTO_PCIE_EXPERTS").map_or(2, |s| s.parse::<usize>().expect("OCTO_PCIE_EXPERTS は数").min(4)));
+    *N
+}
 // MXFP8 の expert 1個あたりのバイト数
 const W13: usize = 2 * FF * D;
 const S13: usize = W13 / 32;
@@ -190,10 +198,10 @@ const S2: usize = W2 / 32;
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 38] = [
+const KERNELS: [&str; 43] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_combine", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -353,8 +361,26 @@ impl Gpu {
     fn launch(&self, name: &str, grid: (u32, u32), block: u32, smem: u32, args: &[u64]) {
         let mut vals = args.to_vec();
         let mut ptrs: Vec<*mut c_void> = vals.iter_mut().map(|v| v as *mut u64 as *mut c_void).collect();
+        // どのカーネルも先頭で PDL() を呼ぶので、前のカーネルが終わる前に起動してよい
+        let mut attr = sys::CUlaunchAttribute {
+            id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+            pad: [0; 4],
+            value: sys::CUlaunchAttributeValue { programmaticStreamSerializationAllowed: 1 },
+        };
+        let cfg = sys::CUlaunchConfig {
+            gridDimX: grid.0,
+            gridDimY: grid.1,
+            gridDimZ: 1,
+            blockDimX: block,
+            blockDimY: 1,
+            blockDimZ: 1,
+            sharedMemBytes: smem,
+            hStream: self.stream.cu_stream(),
+            attrs: &mut attr,
+            numAttrs: 1,
+        };
         // SAFETY: 引数の数と型は gpu.cu の宣言に合わせてある。ポインタはどれも 64bit
-        unsafe { result::launch_kernel(self.f[name].cu_function(), (grid.0, grid.1, 1), (block, 1, 1), smem, self.stream.cu_stream(), &mut ptrs) }
+        unsafe { sys::cuLaunchKernelEx(&cfg, self.f[name].cu_function(), ptrs.as_mut_ptr(), std::ptr::null_mut()).result() }
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 
@@ -390,12 +416,20 @@ impl Gpu {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize) {
-        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32);
+    /// norm が (重み, query ごとのずれ) なら、続けて rmsnorm をかける
+    fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>) {
+        assert!(nb < 5, "mix は状態 5 個まで (MIX_NS)");
+        let (nw, nws) = norm.unwrap_or((0, 0));
+        k!(self, "mix", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32);
     }
 
     fn control(&self, cur: P, msg: P, c: &GCtrl, t: usize) {
         let b = &self.b;
+        if t == 1 {
+            k!(self, "ctrl_down", 8, 256, 0; cur, msg, c.down, b.g);
+            k!(self, "ctrl_up", (D * 32).div_ceil(256), 256, 0; cur, msg, c.gf, b.g);
+            return;
+        }
         k!(self, "norm2", (2, t), 256, 0; cur, msg, b.cat);
         self.gemm(c.down, b.cat, b.g, 64, 2 * D, t);
         self.gemm(c.gf, b.g, b.gf, 2 * D, 64, t);
@@ -430,11 +464,24 @@ impl Gpu {
         let key = (t, verify);
         let small = t <= SPEC_T && !model::tracing();
         if small && let Some(gs) = self.graphs.borrow().get(&key) {
+            // OCTO_PROF を付けると、区切りごとに GPU と CPU の時間 (ms) を交互に出す
+            let prof = std::env::var_os("OCTO_PROF").is_some();
+            let mut ms = vec![];
             for (i, g) in gs.iter().enumerate() {
+                let t0 = Instant::now();
                 g.launch().unwrap();
-                if i < N_LAYER - MXFP8_FROM {
-                    self.cpu_moe(MXFP8_FROM + i, t);
+                if prof {
+                    self.stream.synchronize().unwrap();
+                    ms.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
+                if i < N_LAYER - MXFP8_FROM {
+                    let t0 = Instant::now();
+                    self.cpu_moe(MXFP8_FROM + i, t);
+                    ms.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            if prof {
+                eprintln!("prof {ms:.2?}");
             }
             return;
         }
@@ -533,6 +580,9 @@ impl Gpu {
     fn cpu_moe(&self, il: usize, t: usize) {
         let h: Vec<f32> = self.dtoh(self.b.h, t * D);
         let l = &self.cpu.layers[il];
+        if t == 1 && pcie_experts() > 0 {
+            return self.split_moe(l, &h);
+        }
         let y = if t == 1 {
             self.cpu.moe(l, &h)
         } else {
@@ -542,6 +592,30 @@ impl Gpu {
             self.cpu.moe_batch(l, &h, &ids, &wts, |_| true)
         };
         self.htod(self.b.y, &y);
+    }
+
+    /// (生成) 選ばれた 8 expert のうち pcie_experts() 個を PCIe で送って GPU で、残りを同時に CPU で計算する。
+    /// どちらも主記憶から読むので、主記憶の帯域を分け合う。h は b.h の写しで、b.y に書く
+    fn split_moe(&self, l: &Layer, h: &[f32]) {
+        let (sel, wts) = self.cpu.route(l, h);
+        let (b, e, n, st) = (&self.b, &l.experts, pcie_experts(), self.staging[0]);
+        let at = [0, GROUP * W13, GROUP * (W13 + S13), GROUP * (W13 + S13 + W2)];
+        for (j, &ex) in sel[..n].iter().enumerate() {
+            for ((src, size), at) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)].into_iter().zip(at) {
+                // SAFETY: src はページ固定メモリ。置き場は GROUP 個分ある。前の層の計算は htod の同期で終わっている
+                unsafe { result::memcpy_htod_async(st + (at + j * size) as u64, &src[ex * size..(ex + 1) * size], self.copy.cu_stream()) }.unwrap();
+            }
+        }
+        self.up_done[0].record(&self.copy).unwrap();
+        self.stream.wait(&self.up_done[0]).unwrap();
+        let [w13, s13, w2, s2] = at.map(|a| st + a as u64);
+        let mut g = [0.0f32; 4];
+        g[..n].copy_from_slice(&wts[..n]);
+        k!(self, "moe_up_mx", (n * FF * 32).div_ceil(256), 256, 0; w13, s13, n as i32, b.h, b.act);
+        k!(self, "moe_down_mx", (D * 32).div_ceil(256), 256, 0; w2, s2, n as i32, b.act, g[0], g[1], g[2], g[3], b.yd);
+        let y = self.cpu.moe_some(l, h, &sel[n..], &wts[n..]);
+        self.htod(b.a, &y);
+        k!(self, "add", D.div_ceil(256), 256, 0; b.yd, b.a, b.y, D as i32);
     }
 
     /// (prefill) 20〜23層の MoE を、expert 8個ずつの組に分け、一部の組は PCIe で送って GPU で、残りは CPU で同時に計算する。
@@ -628,7 +702,7 @@ impl Gpu {
             for ip in CORE.0..CORE.1 {
                 let slot = if pass == 0 { ip } else { N_LAYER + (pass - 1) * (CORE.1 - CORE.0) + ip - CORE.0 };
                 if pass > 0 {
-                    self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t);
+                    self.mix(b.bank, 1, b.bank + slab(1), self.layers[ip].msg_query, 4, b.msgs, t, None);
                 }
                 self.layer(ip, ip, slot, &mut nb, pass > 0, t);
             }
@@ -636,10 +710,10 @@ impl Gpu {
         for il in CORE.1..N_LAYER {
             self.layer(il, il, il, &mut nb, false, t);
         }
-        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t);
+        self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t, None);
         // 正規化した最後の隠れ状態は、下書きモデルの4つ目の入力でもある
         let normed = b.taps + f4(3 * TMAX * D);
-        k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, D as i32, 0i32, t as i32);
+        k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, 0i32, t as i32);
         if verify {
             // softcap は単調なので、最大の位置は変わらない
             self.gemm(self.unembed, normed, b.logits_all, 201024, D, t);
@@ -677,8 +751,11 @@ impl Gpu {
         let slab = |i: usize| f4(i * t * D);
         let ti = t as i32;
         // attention の入力: SWA は1本、global は Q, K, V に1本ずつ
+        // control がなければ、正規化も mix のカーネルでかける
+        let wstride = if l.global { D } else { 0 };
+        let fused = il > 0 && !msgs;
         if il > 0 {
-            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t);
+            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t, fused.then_some((l.norms, wstride)));
         } else {
             self.copy(b.inp, b.x, t * D);
         }
@@ -693,13 +770,20 @@ impl Gpu {
             }
         }
         let n_in = if separate { 3 } else { 1 };
-        k!(self, "rmsnorm", n_in * t, 256, 0; b.inp, l.norms, b.inp, D as i32, if l.global { D as i32 } else { 0i32 }, ti);
+        if !fused {
+            k!(self, "rmsnorm", n_in * t, 256, 0; b.inp, l.norms, b.inp, wstride as i32, ti);
+        }
         let (xq, xk, xv) = if separate { (b.inp, b.inp + slab(1), b.inp + slab(2)) } else { (b.inp, b.inp, b.inp) };
 
         let nk = if l.global { 1024 + 32 } else { 1024 };
-        self.gemm(l.wq, xq, b.qx, QX, D, t);
-        self.gemm(l.wk, xk, b.kx, nk, D, t);
-        self.gemm(l.wv, xv, b.vx, nk, D, t);
+        if t == 1 {
+            k!(self, "mv3_bf16", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
+                l.wq, xq, b.qx, QX as i32, l.wk, xk, b.kx, nk as i32, l.wv, xv, b.vx, nk as i32);
+        } else {
+            self.gemm(l.wq, xq, b.qx, QX, D, t);
+            self.gemm(l.wk, xk, b.kx, nk, D, t);
+            self.gemm(l.wv, xv, b.vx, nk, D, t);
+        }
         let dyn_ = l.global.then_some(1024);
         // 小さいバッチ (生成と検証) では、外れた下書きを捨てられるよう畳み込みの入力を残す
         let seq = |k: usize| if t <= SPEC_T { s.seq[k] } else { 0 };
@@ -727,11 +811,14 @@ impl Gpu {
             k!(self, "add", (t * D).div_ceil(256), 256, 0; b.x, b.a, b.x, (t * D) as i32);
         }
 
-        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t);
+        let mlp_fused = !msgs;
+        self.mix(b.blocks, *nb, b.x, l.mlp_query, 1, b.h, t, mlp_fused.then_some((l.mlp_norm, 0)));
         if msgs {
             self.control(b.h, b.msgs + slab(3), &l.ctrl[3], t);
         }
-        k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, D as i32, 0i32, ti);
+        if !mlp_fused {
+            k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, 0i32, ti);
+        }
         match l.experts {
             Some([w13, s13, a13, w2, s2, a2]) => {
                 self.gemm(l.router, b.h, b.rl, 128, D, t);

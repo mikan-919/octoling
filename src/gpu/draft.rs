@@ -203,7 +203,7 @@ impl Drafter {
     }
 
     fn rms(g: &Gpu, x: P, w: P, y: P, t: usize) {
-        k!(g, "rmsnorm", t, 256, 0; x, w, y, D as i32, 0i32, t as i32);
+        k!(g, "rmsnorm", t, 256, 0; x, w, y, 0i32, t as i32);
     }
 
     pub fn reset(&mut self) {
