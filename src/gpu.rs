@@ -179,7 +179,7 @@ pub struct Gpu {
     up_done: [CudaEvent; 2],
     comp_done: [CudaEvent; 2],
     xc: RefCell<XCache>,
-    fill_done: [CudaEvent; 4], // 20〜23層の枠への転送の終わり
+    fill_done: CudaEvent, // 枠への転送の終わり
 }
 
 /// prefill で1回に PCIe で送る MXFP8 expert の数。置き場は2つあり、片方を送るあいだにもう片方で計算する
@@ -205,6 +205,7 @@ struct XCache {
     owner: Vec<Option<(usize, usize)>>, // 枠 → (層 - 20, expert)
     slot: [[Option<usize>; N_EXP]; 4],
     cnt: [[f32; N_EXP]; 4], // 選ばれた回数 (XDECAY で減らす)
+    pending: Vec<(usize, usize, usize)>, // このトークンで入れ替えると決めた (層 - 20, expert, 枠)。23層のあとにまとめて送る
 }
 
 /// GPU と CPU の分担を釣り合わせるための見積もり (秒)。expert 8個 (66 MB) を PCIe で送る時間と、CPU で割り当て1つを計算する時間。
@@ -361,8 +362,8 @@ impl Gpu {
             staging,
             up_done: [ev(), ev()],
             comp_done: [ev(), ev()],
-            xc: RefCell::new(XCache { base: xbase, owner: vec![None; n_slots], slot: [[None; N_EXP]; 4], cnt: [[0.0; N_EXP]; 4] }),
-            fill_done: [ev(), ev(), ev(), ev()],
+            xc: RefCell::new(XCache { base: xbase, owner: vec![None; n_slots], slot: [[None; N_EXP]; 4], cnt: [[0.0; N_EXP]; 4], pending: vec![] }),
+            fill_done: ev(),
             _ctx: ctx.clone(),
             stream,
             _module: module,
@@ -666,8 +667,8 @@ impl Gpu {
             }
         }
         if n > 0 {
-            // 前のトークンで送った枠が届いてから読む
-            self.stream.wait(&self.fill_done[li]).unwrap();
+            // 前のトークンの終わりに送った枠が届いてから読む
+            self.stream.wait(&self.fill_done).unwrap();
             k!(self, "moe_up_mx", (n * FF * 32).div_ceil(256), 256, 0; xc.base, n as i32, slots, b.h, b.act);
             k!(self, "moe_down_mx", (D * 32).div_ceil(256), 256, 0;
                 xc.base, n as i32, slots, b.act, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], b.yd);
@@ -680,9 +681,8 @@ impl Gpu {
             self.htod(b.y, &y);
         }
 
-        // htod で同期したので、GPU はもう枠を読んでいない
+        // 入れ替える枠を決める。転送は、CPU の計算と主記憶の帯域を取り合わないよう、23層のあと (CPU が空く GPU の区間) にまとめて出す
         on_cpu.sort_by(|&a, &c| xc.cnt[li][c].total_cmp(&xc.cnt[li][a]));
-        let e = &l.experts;
         for &ex in on_cpu.iter().take(XFILLS) {
             let score = |xc: &XCache, s: usize| xc.owner[s].map_or(-1.0, |(l2, e2)| xc.cnt[l2][e2]);
             let victim = (0..xc.owner.len()).min_by(|&a, &c| score(&xc, a).total_cmp(&score(&xc, c))).unwrap();
@@ -692,23 +692,28 @@ impl Gpu {
             if let Some((l2, e2)) = xc.owner[victim] {
                 xc.slot[l2][e2] = None;
             }
-                xc.owner[victim] = Some((li, ex));
+            xc.owner[victim] = Some((li, ex));
             xc.slot[li][ex] = Some(victim);
-            let mut at = xc.base + (victim * XSLOT) as u64;
-            for (src, size) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)] {
-                // SAFETY: src はページ固定メモリ。枠は XSLOT バイトある
-                unsafe { result::memcpy_htod_async(at, &src[ex * size..(ex + 1) * size], self.copy.cu_stream()) }.unwrap();
-                at += size as u64;
-            }
+            xc.pending.push((li, ex, victim));
         }
-        self.fill_done[li].record(&self.copy).unwrap();
+        if il == N_LAYER - 1 {
+            // htod で同期したので、GPU はもう枠を読んでいない
+            for (li, ex, victim) in std::mem::take(&mut xc.pending) {
+                let e = &self.cpu.layers[MXFP8_FROM + li].experts;
+                let mut at = xc.base + (victim * XSLOT) as u64;
+                for (src, size) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)] {
+                    // SAFETY: src はページ固定メモリ。枠は XSLOT バイトある
+                    unsafe { result::memcpy_htod_async(at, &src[ex * size..(ex + 1) * size], self.copy.cu_stream()) }.unwrap();
+                    at += size as u64;
+                }
+            }
+            self.fill_done.record(&self.copy).unwrap();
+        }
     }
 
     /// prefill で置き場 (expert の先頭の 2 * GROUP 枠) を使う前に呼ぶ。枠への転送が終わるのを待ち、その枠を空にする
     fn take_staging(&self) {
-        for ev in &self.fill_done {
-            self.stream.wait(ev).unwrap();
-        }
+        self.stream.wait(&self.fill_done).unwrap();
         let mut xc = self.xc.borrow_mut();
         for s in 0..2 * GROUP {
             if let Some((l2, e2)) = xc.owner[s].take() {
