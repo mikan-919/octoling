@@ -113,8 +113,10 @@ struct GSlot {
     seq: [P; 4],  // 検証のバッチの [直前の入力3つ; 入力 SPEC_T 個]。外れた下書きを捨てるとき hist を戻す
 }
 
-// TMAX トークン分の作業領域。並びは gpu.cu の先頭に書いたとおり [種類][T][要素]
+// cap トークン分の作業領域。並びは gpu.cu の先頭に書いたとおり [種類][T][要素]。
+// 生成と検証 (T <= SPEC_T) 用の小さい組と、prefill 用の大きい組がある。大きい組は expert の枠と同じ場所に置き、prefill の間は枠を空にする
 struct Bufs {
+    cap: usize,
     x: P,
     pos: P,    // i32。バッチの先頭トークンの位置。カーネルはここから読む
     blocks: P, // [8][T][D]
@@ -144,15 +146,60 @@ struct Bufs {
     off: P,
     part: P, // [24][NSPLIT][HD + 2]。生成時の注意の部分結果
     logits: P,
-    taps: P,       // [4][TMAX][D]。下書きモデルが読む、スロット 4, 28, 46 の層出力と最後の正規化の出力
+    taps: P,       // [4][cap][D]。下書きモデルが読む、スロット 4, 28, 46 の層出力と最後の正規化の出力
     amax: P,       // [SPEC_T] i32。検証のバッチの各行の、最大の logits の位置
     logits_all: P, // [SPEC_T][201024]
-    acc: P,        // [TMAX][24][HD + 2]。主記憶の KV の塊ごとに足し込む注意の途中結果
+    acc: P,        // [cap][24][HD + 2]。主記憶の KV の塊ごとに足し込む注意の途中結果
     done: P,       // u32 [SPEC_T * 24 + 1]。最後に終わったブロックを決める数 (attn_part のヘッドごと、router_topk)。使い終わると 0 に戻る
     best: P,       // u64。最後の行の最大の logits の (値, 位置) を並べたもの (softcap が書く)
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
+
+impl Bufs {
+    /// t トークン分をとる。alloc(バイト数) が場所を返す。acc は主記憶の KV 用の途中結果をとるか
+    fn new(t: usize, acc: bool, mut alloc: impl FnMut(usize) -> P) -> Self {
+        let mut fz = |n: usize| alloc(n * 4);
+        Bufs {
+            cap: t,
+            x: fz(t * D),
+            pos: fz(1),
+            blocks: fz(8 * t * D),
+            prelude: fz(t * D),
+            bank: fz(2 * t * D),
+            msgs: fz(4 * t * D),
+            inp: fz(3 * t * D),
+            qx: fz(t * QX),
+            kx: fz(t * (1024 + 32)),
+            vx: fz(t * (1024 + 32)),
+            kp: fz(t * 1024),
+            vp: fz(t * 1024),
+            o: fz(t * 3072),
+            a: fz(t * D),
+            h: fz(t * D),
+            y: fz(t * D),
+            cat: fz(t * 2 * D),
+            g: fz(t * 64),
+            gf: fz(t * 2 * D),
+            rl: fz(t * 128),
+            ids: fz(t * TOP_K),
+            wts: fz(t * TOP_K),
+            act: fz(t * TOP_K * FF),
+            gu: fz(t * TOP_K * 2 * FF),
+            yd: fz(t * TOP_K * D),
+            order: fz(t * TOP_K),
+            off: fz(129),
+            logits: fz(201024),
+            part: fz(SPEC_T * 24 * 16 * 130),
+            taps: fz(4 * t * D),
+            amax: fz(SPEC_T),
+            logits_all: fz(SPEC_T * 201024),
+            acc: if acc { fz(t * 24 * 130) } else { 0 },
+            done: fz(SPEC_T * 24 + 1),
+            best: fz(2),
+        }
+    }
+}
 
 pub struct Gpu {
     cpu: &'static Model,
@@ -165,7 +212,8 @@ pub struct Gpu {
     unembed: P,
     norm: P,
     output_query: P,
-    b: Bufs,
+    small: Bufs,
+    big: Bufs, // expert の枠と同じ場所
     pos: usize,
     ctx: usize,
     // T トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph。(T, 検証か) ごと
@@ -204,6 +252,7 @@ const VRAM_MARGIN: usize = 400 << 20;
 /// 枠 j は base + j * XSLOT。先頭の 2 * GROUP 枠は prefill の置き場 (staging) と同じ場所なので、prefill で使ったら空にする
 struct XCache {
     base: P,
+    reserved: usize, // 先頭のこの数の枠は、prefill の置き場と作業領域を兼ねる
     owner: Vec<Option<(usize, usize)>>, // 枠 → (層 - 20, expert)
     slot: [[Option<usize>; N_EXP]; 4],
     cnt: [[f32; N_EXP]; 4], // 選ばれた回数 (XDECAY で減らす)
@@ -304,55 +353,31 @@ impl Gpu {
                 }
             })
             .collect();
-        let fz = |n: usize, up: &mut Uploader| up.zeros(n * 4);
-        let t = TMAX;
-        let b = Bufs {
-            x: fz(t * D, &mut up),
-            pos: fz(1, &mut up),
-            blocks: fz(8 * t * D, &mut up),
-            prelude: fz(t * D, &mut up),
-            bank: fz(2 * t * D, &mut up),
-            msgs: fz(4 * t * D, &mut up),
-            inp: fz(3 * t * D, &mut up),
-            qx: fz(t * QX, &mut up),
-            kx: fz(t * (1024 + 32), &mut up),
-            vx: fz(t * (1024 + 32), &mut up),
-            kp: fz(t * 1024, &mut up),
-            vp: fz(t * 1024, &mut up),
-            o: fz(t * 3072, &mut up),
-            a: fz(t * D, &mut up),
-            h: fz(t * D, &mut up),
-            y: fz(t * D, &mut up),
-            cat: fz(t * 2 * D, &mut up),
-            g: fz(t * 64, &mut up),
-            gf: fz(t * 2 * D, &mut up),
-            rl: fz(t * 128, &mut up),
-            ids: fz(t * TOP_K, &mut up),
-            wts: fz(t * TOP_K, &mut up),
-            act: fz(t * TOP_K * FF, &mut up),
-            gu: fz(t * TOP_K * 2 * FF, &mut up),
-            yd: fz(t * TOP_K * D, &mut up),
-            order: fz(t * TOP_K, &mut up),
-            off: fz(129, &mut up),
-            logits: fz(201024, &mut up),
-            part: fz(SPEC_T * 24 * 16 * 130, &mut up),
-            taps: fz(4 * t * D, &mut up),
-            amax: fz(SPEC_T, &mut up),
-            logits_all: fz(SPEC_T * 201024, &mut up),
-            acc: if n_ctx > VRAM_CTX { fz(t * 24 * 130, &mut up) } else { 0 },
-            done: fz(SPEC_T * 24 + 1, &mut up),
-            best: fz(2, &mut up),
-        };
+        let small = Bufs::new(SPEC_T, false, |n| up.zeros(n));
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
-        // 残りの VRAM で expert の枠をとる。OCTO_EXPERT_SLOTS で数を決められる (prefill の置き場を兼ねるので 2 * GROUP 以上)
+        // 残りの VRAM で expert の枠をとる。OCTO_EXPERT_SLOTS で数を決められる。
+        // 先頭の枠は prefill の置き場 (staging、2 * GROUP 枠) と prefill 用の作業領域を兼ねる
+        let align = |n: usize| n.div_ceil(256) * 256;
+        let mut big_bytes = 0;
+        Bufs::new(TMAX, n_ctx > VRAM_CTX, |n| {
+            big_bytes += align(n);
+            0
+        });
+        let reserved = (2 * GROUP * XSLOT + big_bytes).div_ceil(XSLOT);
         let (free, _) = result::mem_get_info().unwrap();
         let n_slots = std::env::var("OCTO_EXPERT_SLOTS")
             .map_or(free.saturating_sub(VRAM_MARGIN) / XSLOT, |s| s.parse().expect("OCTO_EXPERT_SLOTS は数"))
-            .clamp(2 * GROUP, 255);
+            .clamp(reserved, 255);
         let xbase = up.zeros(n_slots * XSLOT);
         let staging = [xbase, xbase + (GROUP * XSLOT) as u64];
+        let mut at = xbase + (2 * GROUP * XSLOT) as u64;
+        let big = Bufs::new(TMAX, n_ctx > VRAM_CTX, |n| {
+            let p = at;
+            at += align(n) as u64;
+            p
+        });
         let tab: Vec<u64> = slots.iter().flat_map(|s: &GSlot| (0..4).flat_map(move |k| [s.seq[k], s.hist[k], [1024, 1024, D, D][k] as u64])).collect();
         let rewind_tab = up.bytes(as_bytes(&tab));
         let (free, _) = result::mem_get_info().unwrap();
@@ -364,7 +389,7 @@ impl Gpu {
             staging,
             up_done: [ev(), ev()],
             comp_done: [ev(), ev()],
-            xc: RefCell::new(XCache { base: xbase, owner: vec![None; n_slots], slot: [[None; N_EXP]; 4], cnt: [[0.0; N_EXP]; 4], pending: vec![] }),
+            xc: RefCell::new(XCache { base: xbase, reserved, owner: vec![None; n_slots], slot: [[None; N_EXP]; 4], cnt: [[0.0; N_EXP]; 4], pending: vec![] }),
             fill_done: ev(),
             _ctx: ctx.clone(),
             stream,
@@ -375,7 +400,8 @@ impl Gpu {
             unembed,
             norm,
             output_query,
-            b,
+            small,
+            big,
             pos: 0,
             ctx: n_ctx,
             graphs: RefCell::new(HashMap::new()),
@@ -464,7 +490,7 @@ impl Gpu {
     /// control cs[j] (j < 3) を、入力 j に メッセージ msg + slab(j) でかけて out + slab(j) に書く。並びは [j][T][D]。
     /// 入力 j は shared なら cur (全部共通)、そうでなければ cur + slab(j) で、out と同じでよい。T = 1 なら全部を1組の起動で計算する
     fn control(&self, cur: P, shared: bool, out: P, msg: P, cs: &[GCtrl], t: usize) {
-        let b = &self.b;
+        let b = self.bufs(t);
         let slab = |j: usize| f4(j * t * D);
         if t == 1 {
             let w = |j: usize, f: fn(&GCtrl) -> P| cs.get(j).map_or(0, f);
@@ -507,8 +533,9 @@ impl Gpu {
                 e
             })
             .collect();
-        self.htod(self.b.x, &e);
-        self.htod(self.b.pos, &[self.pos as i32]);
+        let b = self.bufs(tokens.len());
+        self.htod(b.x, &e);
+        self.htod(b.pos, &[self.pos as i32]);
     }
 
     /// 位置 self.pos から T トークンを処理する。T <= SPEC_T なら、最初の1回でカーネル列を CUDA Graph に記録し、
@@ -540,6 +567,9 @@ impl Gpu {
             return;
         }
         self.stamps.borrow_mut().clear();
+        if t > SPEC_T {
+            self.take_big();
+        }
         self.capturing.set(small);
         self.begin();
         self.record(t, verify);
@@ -556,7 +586,7 @@ impl Gpu {
         self.inputs(&[token]);
         self.run(1, false);
         self.pos += 1;
-        self.dtoh(self.b.logits, VOCAB)
+        self.dtoh(self.small.logits, VOCAB)
     }
 
     /// 1トークンを処理して、logits の最大の位置 (貪欲法の次のトークン) を返す。logits は GPU で調べ、位置だけを読む
@@ -579,7 +609,7 @@ impl Gpu {
             eprintln!("stamp {}", agg.iter().map(|a| format!("{}:{:.0}us/{}", a.0, a.1, a.2)).collect::<Vec<_>>().join(" "));
         }
         self.pos += 1;
-        0xffff_ffff - self.dtoh::<u64>(self.b.best, 1)[0] as u32
+        0xffff_ffff - self.dtoh::<u64>(self.small.best, 1)[0] as u32
     }
 
     /// プロンプトを TMAX トークンずつまとめて処理し、最後のトークンの logits を返す。
@@ -591,7 +621,7 @@ impl Gpu {
             after(self, chunk.len());
             self.pos += chunk.len();
         }
-        self.dtoh(self.b.logits, VOCAB)
+        self.dtoh(self.bufs(tokens.len().saturating_sub(1) % TMAX + 1).logits, VOCAB)
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
@@ -605,7 +635,7 @@ impl Gpu {
         self.inputs(tokens);
         self.run(tokens.len(), true);
         self.pos += tokens.len();
-        self.dtoh::<i32>(self.b.amax, tokens.len()).into_iter().map(|t| t as u32).collect()
+        self.dtoh::<i32>(self.small.amax, tokens.len()).into_iter().map(|t| t as u32).collect()
     }
 
     /// 直前の verify の t トークンのうち、先頭 keep 個だけを残す。畳み込みの状態を戻し、位置を下げる。
@@ -615,6 +645,17 @@ impl Gpu {
             k!(self, "conv_rewind", (D.div_ceil(256), self.slots.len() * 4), 256, 0; self.rewind_tab, keep as i32);
             self.pos -= t - keep;
         }
+    }
+
+    /// T トークンを処理するときの作業領域
+    fn bufs(&self, t: usize) -> &Bufs {
+        if t <= SPEC_T { &self.small } else { &self.big }
+    }
+
+    /// (下書きモデル) 直前に処理した n トークンの、下書きモデルが読む層出力の場所と、種類ごとのずれ (行数)
+    pub(crate) fn taps(&self, n: usize) -> (P, usize) {
+        let b = self.bufs(n);
+        (b.taps, b.cap)
     }
 
     /// 次に処理するトークンの位置 (= ここまでに処理したトークン数)
@@ -659,7 +700,7 @@ impl Gpu {
 
     /// (生成と検証) 20〜23層の MoE を CPU で計算する。b.h を読み b.y に書く
     fn cpu_moe(&self, il: usize, t: usize) {
-        let h: Vec<f32> = self.dtoh(self.b.h, t * D);
+        let h: Vec<f32> = self.dtoh(self.small.h, t * D);
         let l = &self.cpu.layers[il];
         if t == 1 {
             return self.split_moe(il, l, &h);
@@ -668,13 +709,13 @@ impl Gpu {
         let ids: Vec<i32> = routes.iter().flat_map(|r| r.0.map(|e| e as i32)).collect();
         let wts: Vec<f32> = routes.iter().flat_map(|r| r.1).collect();
         let y = self.cpu.moe_batch(l, &h, &ids, &wts, |_| true);
-        self.htod(self.b.y, &y);
+        self.htod(self.small.y, &y);
     }
 
     /// (生成) 20〜23層の MoE。選ばれた expert のうち枠にあるものを GPU で、残りを同時に CPU で計算する。h は b.h の写しで、b.y に書く。
     /// そのあと、CPU で計算した expert のうち選ばれた回数の多いものを、空いた枠か回数の最も少ない枠へ PCIe で送っておく
     fn split_moe(&self, il: usize, l: &Layer, h: &[f32]) {
-        let (li, b) = (il - MXFP8_FROM, &self.b);
+        let (li, b) = (il - MXFP8_FROM, &self.small);
         let (sel, wts) = self.cpu.route(l, h);
         let mut xc = self.xc.borrow_mut();
         if li == 0 {
@@ -743,11 +784,11 @@ impl Gpu {
         }
     }
 
-    /// prefill で置き場 (expert の先頭の 2 * GROUP 枠) を使う前に呼ぶ。枠への転送が終わるのを待ち、その枠を空にする
-    fn take_staging(&self) {
+    /// prefill で大きい作業領域と置き場 (expert の先頭の reserved 枠) を使う前に呼ぶ。枠への転送が終わるのを待ち、その枠を空にする
+    fn take_big(&self) {
         self.stream.wait(&self.fill_done).unwrap();
         let mut xc = self.xc.borrow_mut();
-        for s in 0..2 * GROUP {
+        for s in 0..xc.reserved {
             if let Some((l2, e2)) = xc.owner[s].take() {
                 xc.slot[l2][e2] = None;
             }
@@ -758,8 +799,7 @@ impl Gpu {
     /// (prefill) 20〜23層の MoE を、expert 8個ずつの組に分け、一部の組は PCIe で送って GPU で、残りは CPU で同時に計算する。
     /// b.h を読み b.y に書く
     fn hybrid_moe(&self, il: usize, t: usize) {
-        self.take_staging();
-        let (b, l, cl) = (&self.b, &self.layers[il], &self.cpu.layers[il]);
+        let (b, l, cl) = (&self.big, &self.layers[il], &self.cpu.layers[il]);
         let n = t * TOP_K;
         self.gemm(l.router, b.h, b.rl, 128, D, t);
         k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
@@ -820,7 +860,7 @@ impl Gpu {
 
     /// T トークン分のカーネル列を投げる。logits は、verify なら全行の最大の位置だけ、そうでなければ最後の行を求める
     fn record(&self, t: usize, verify: bool) {
-        let b = &self.b;
+        let b = self.bufs(t);
         let slab = |i: usize| f4(i * t * D); // [種類][T][D] の i 番目
         let mut nb = 0;
         for il in 0..CORE.0 {
@@ -850,7 +890,7 @@ impl Gpu {
         }
         self.mix(b.blocks, nb, b.x, self.output_query, 1, b.h, t, None);
         // 正規化した最後の隠れ状態は、下書きモデルの4つ目の入力でもある
-        let normed = b.taps + f4(3 * TMAX * D);
+        let normed = b.taps + f4(3 * b.cap * D);
         k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, 0i32, t as i32);
         if verify {
             // softcap は単調なので、最大の位置は変わらない
@@ -867,10 +907,9 @@ impl Gpu {
     /// (prefill、主記憶の KV) 位置 0..pos+t の KV を KB 位置ずつ置き場に送り、塊ごとに注意を足し込む。
     /// GPU が主記憶を直接読むと、クエリのタイルごとに同じ KV を読み直すことになり遅い
     fn attn_host(&self, host: [usize; 2], l: &GLayer, t: usize) {
-        self.take_staging();
         // 置き場 1 つ (65.7 MB) に K と V が入る位置数 (1 位置 2 KB ずつ)。16 の倍数に切り下げる
         const KB: usize = GROUP * (W13 + S13 + W2 + S2) / 4096 / 16 * 16;
-        let (b, st, end) = (&self.b, self.staging[0], self.pos + t);
+        let (b, st, end) = (&self.big, self.staging[0], self.pos + t);
         for (i, b0) in (0..end).step_by(KB).enumerate() {
             let nb = KB.min(end - b0);
             for (j, &h) in host.iter().enumerate() {
@@ -888,7 +927,7 @@ impl Gpu {
 
     #[allow(clippy::too_many_arguments)]
     fn layer(&self, il: usize, ip: usize, slot: usize, nb: &mut usize, msgs: bool, t: usize) {
-        let (l, s, b) = (&self.layers[il], &self.slots[slot], &self.b);
+        let (l, s, b) = (&self.layers[il], &self.slots[slot], self.bufs(t));
         let slab = |i: usize| f4(i * t * D);
         let ti = t as i32;
         // attention の入力: SWA は1本、global は Q, K, V に1本ずつ
@@ -988,7 +1027,7 @@ impl Gpu {
         }
         self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t, seq(3), b.x);
         if let Some(j) = TAP_SLOTS.iter().position(|&s| s == slot) {
-            self.copy(b.taps + f4(j * TMAX * D), b.x, t * D);
+            self.copy(b.taps + f4(j * b.cap * D), b.x, t * D);
         }
         if model::tracing() && t == 1 {
             model::trace(slot, &self.dtoh(b.x, D));

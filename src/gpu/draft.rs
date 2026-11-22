@@ -210,20 +210,21 @@ impl Drafter {
         self.ctx_end = 0;
     }
 
-    /// 本体が今処理した n トークン (g.b.taps の行 0..n) を、位置 ctx_end から文脈に加える
+    /// 本体が今処理した n トークン (g.taps の行 0..n) を、位置 ctx_end から文脈に加える
     pub fn add_ctx(&mut self, g: &Gpu, n: usize) {
+        let (taps, cap) = g.taps(n);
         for c0 in (0..n).step_by(B) {
             let m = (n - c0).min(B);
             for (li, l) in self.layers.iter().enumerate() {
                 let a = self.alpha[li];
-                k!(g, "tapmix", (m * D).div_ceil(256), 256, 0; g.b.taps + f4(c0 * D), (TMAX * D) as i32, a[0], a[1], a[2], a[3], m as i32, self.mix);
+                k!(g, "tapmix", (m * D).div_ceil(256), 256, 0; taps + f4(c0 * D), (cap * D) as i32, a[0], a[1], a[2], a[3], m as i32, self.mix);
                 Self::rms(g, self.mix, l.dflare, self.mix, m);
                 self.mv(g, &l.kvc, self.mix, self.kv, m);
                 k!(g, "dr_ctx_store", (8, m), 128, 0; self.kv, l.knc, (self.ctx_end + c0) as i32, l.ring as i32, l.kc, l.vc);
             }
         }
         for j in 0..4 {
-            g.copy(self.anchor + f4(j * D), g.b.taps + f4(j * TMAX * D + (n - 1) * D), D);
+            g.copy(self.anchor + f4(j * D), taps + f4(j * cap * D + (n - 1) * D), D);
         }
         self.ctx_end += n;
     }
