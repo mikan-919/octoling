@@ -1235,16 +1235,22 @@ impl Uploader {
         Self { stream: stream.clone(), pin, total: 0 }
     }
 
-    fn zeros(&mut self, n: usize) -> P {
-        // SAFETY: 確保して 0 で埋める。解放はしない
+    fn alloc(&mut self, n: usize) -> P {
+        // SAFETY: 確保するだけ。解放はしない
         let p = unsafe { result::malloc_sync(n.max(4)) }.unwrap_or_else(|e| panic!("VRAM を {n} バイト確保できない: {e}"));
-        unsafe { result::memset_d8_async(p, 0, n.max(4), self.stream.cu_stream()) }.unwrap();
         self.total += n;
         p
     }
 
+    fn zeros(&mut self, n: usize) -> P {
+        let p = self.alloc(n);
+        // SAFETY: p は n.max(4) バイト確保してある
+        unsafe { result::memset_d8_async(p, 0, n.max(4), self.stream.cu_stream()) }.unwrap();
+        p
+    }
+
     fn bytes(&mut self, src: &[u8]) -> P {
-        let p = self.zeros(src.len());
+        let p = self.alloc(src.len());
         self.to(p, src);
         p
     }
@@ -1254,7 +1260,7 @@ impl Uploader {
         for (i, c) in src.chunks(PIN).enumerate() {
             // SAFETY: pin は PIN バイトある。前の転送が終わってから上書きする
             unsafe {
-                std::ptr::copy_nonoverlapping(c.as_ptr(), self.pin, c.len());
+                par_copy(c, self.pin);
                 let staged = std::slice::from_raw_parts(self.pin, c.len());
                 result::memcpy_htod_async(dst + (i * PIN) as u64, staged, self.stream.cu_stream()).unwrap();
             }
@@ -1268,9 +1274,29 @@ fn pin(src: &[u8]) -> &'static [u8] {
     // SAFETY: 確保した領域に src を写し、その領域を指すスライスを返す
     unsafe {
         let p = result::malloc_host(src.len(), 0).expect("ページ固定メモリを確保できない") as *mut u8;
-        std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+        par_copy(src, p);
         std::slice::from_raw_parts(p, src.len())
     }
+}
+
+/// 重みを全コアで写す。mmap のページフォルトも各スレッドに分かれる
+///
+/// # Safety
+/// dst は src.len() バイト書き込めて、src と重ならない
+unsafe fn par_copy(src: &[u8], dst: *mut u8) {
+    if src.len() < 1 << 20 {
+        // SAFETY: 呼び出し側の約束どおり
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let (size, dst) = (src.len().div_ceil(n), dst as usize);
+    std::thread::scope(|s| {
+        for (i, c) in src.chunks(size).enumerate() {
+            // SAFETY: 各スレッドは dst の重ならない範囲に書く
+            s.spawn(move || unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (dst + i * size) as *mut u8, c.len()) });
+        }
+    });
 }
 
 mod draft;
