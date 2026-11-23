@@ -952,6 +952,172 @@ extern "C" __global__ void gemm_mxfp8_grouped(const u8* __restrict__ w, const u8
     }
 }
 
+// SQ 形式 (Strata の S2_K, S3_K, SF4) の expert。行列1つのレコード (gate/up は1行、down は2行の組) は 2304 要素で、16 要素のブロック 144 個に分ける。
+// S_K の平面: lo [レコード][144] (u32。2ビット x 16)、hi [レコード][144] (u16。S3 の3ビット目 x 16)、sc は u [レコード][36] (u8) のあとに D [レコード][9] (f16)。
+// 重みは (q - half) * D * u / 255 で、u は 64 要素ごと、D は 256 要素ごと。SF4 の平面: lo [レコード][144] (u64)、sc [レコード][144] (E4M3)
+struct SkMat {
+    unsigned long long lo, sc;
+    unsigned code;
+    float g; // SF4 の大域スケール。S_K は 1
+};
+
+__device__ __forceinline__ float sk_scale(const u8* sc, int nrec, int rec, int g) {
+    const half_t* d = (const half_t*)(sc + (size_t)nrec * 36) + (size_t)rec * 9 + g / 4;
+    return h2f(__ldg(d)) * ((float)__ldg(sc + (size_t)rec * 36 + g) / 255.f);
+}
+
+__device__ __forceinline__ unsigned sk_q(unsigned lo, unsigned hi, int n) { return ((lo >> (2 * n)) & 3u) | (((hi >> n) & 1u) << 2); }
+
+// レコード rec のブロック blk と x[0..16] (xv) の内積
+__device__ __forceinline__ float sk_dot(const SkMat& m, int nrec, int rec, int blk, const float4* xv) {
+    if (m.code == 15) {
+        uint2 pk = __ldg((const uint2*)m.lo + (size_t)rec * 144 + blk);
+        return fp4_block(pk, xv) * e4m3(__ldg((const u8*)m.sc + (size_t)rec * 144 + blk));
+    }
+    bool s3 = m.code == 3;
+    unsigned lo = __ldg((const unsigned*)m.lo + (size_t)rec * 144 + blk);
+    unsigned hi = s3 ? __ldg((const unsigned short*)(m.lo + (size_t)nrec * 576) + (size_t)rec * 144 + blk) : 0u;
+    float half = s3 ? 3.5f : 1.5f, b = 0.f;
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+        float4 x = xv[q];
+        b += ((float)sk_q(lo, hi, 4 * q) - half) * x.x + ((float)sk_q(lo, hi, 4 * q + 1) - half) * x.y +
+             ((float)sk_q(lo, hi, 4 * q + 2) - half) * x.z + ((float)sk_q(lo, hi, 4 * q + 3) - half) * x.w;
+    }
+    return b * sk_scale((const u8*)m.sc, nrec, rec, blk / 4);
+}
+
+// (T <= 8 用) moe_up_nvfp4 の SQ 版。down の入力になるよう、活性を列ごとの逆スケール ixd で割っておく
+extern "C" __global__ void moe_up_sk(const SkMat* tab, const float* ixd, const int* ids, const float* x, float* act, int T) {
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= T * TOPK * FF / 4) return;
+    PDL();
+    int a = gw / (FF / 4), i0 = gw % (FF / 4) * 4, ex = ids[a];
+    const SkMat m = tab[ex * 2];
+    const float* xt = x + (size_t)(a / TOPK) * D;
+    float acc[8] = {};
+    #pragma unroll 1
+    for (int j = 0; j < (D / 16 + 31) / 32; j++) {
+        int blk = lane + 32 * j;
+        if (blk >= D / 16) break;
+        const float4* xx = (const float4*)(xt + blk * 16);
+        float4 xv[4] = {xx[0], xx[1], xx[2], xx[3]};
+        #pragma unroll
+        for (int r = 0; r < 8; r++) acc[r] += sk_dot(m, 2 * FF, 2 * i0 + r, blk, xv);
+    }
+    #pragma unroll
+    for (int r = 0; r < 8; r += 2) {
+        float g = warp_sum(acc[r]), u = warp_sum(acc[r + 1]);
+        if (lane == 0) act[(size_t)a * FF + i0 + r / 2] = situ(g * m.g, u * m.g) * ixd[(size_t)ex * FF + i0 + r / 2];
+    }
+}
+
+// (T <= 8 用) moe_down_nvfp4 の SQ 版。1ワープがトークン t の出力の2行 (レコード1つ) を受け持つ
+extern "C" __global__ void moe_down_sk(const SkMat* tab, const int* ids, const float* wts, const float* act, float* y, int T) {
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (gw >= T * D / 2) return;
+    int t = gw / (D / 2), rec = gw % (D / 2);
+    PDL();
+    float acc[2] = {};
+    #pragma unroll 2
+    for (int k = 0; k < TOPK; k++) {
+        int a = t * TOPK + k, ex = ids[a];
+        const SkMat m = tab[ex * 2 + 1];
+        const float* xk = act + (size_t)a * FF;
+        float d[2] = {};
+        #pragma unroll
+        for (int j = 0; j < (FF / 16 + 31) / 32; j++) {
+            int blk = lane + 32 * j;
+            if (blk >= FF / 16) break;
+            const float4* xx = (const float4*)(xk + blk * 16);
+            float4 xv[4] = {xx[0], xx[1], xx[2], xx[3]};
+            #pragma unroll
+            for (int r = 0; r < 2; r++) d[r] += sk_dot(m, D / 2, rec, r * (FF / 16) + blk, xv);
+        }
+        #pragma unroll
+        for (int r = 0; r < 2; r++) acc[r] += d[r] * wts[a] * m.g;
+    }
+    #pragma unroll
+    for (int r = 0; r < 2; r++) {
+        float v = warp_sum(acc[r]);
+        if (lane == 0) y[(size_t)t * D + 2 * rec + r] = v;
+    }
+}
+
+// (prefill 用) gemm_nvfp4_grouped の SQ 版。which = 0 は gate/up (行 = レコード)、1 は down (2行で1レコード)。
+// q - half は BF16 で誤差なく表せるので、テンソルコアでは q - half を掛け、u と D は 64 列ごとに行ごとの積へ掛ける
+extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows, int cols, const float* __restrict__ x, int xdiv, const int* order, const int* off, float* y) {
+    PDL();
+    __shared__ __align__(16) unsigned short Ws[64 * TS], Xs[2 * 32 * TS];
+    __shared__ int as[32];
+    int e = blockIdx.y, beg = off[e], end = off[e + 1];
+    if (beg == end) return;
+    int tid = threadIdx.x, r0 = blockIdx.x * 64, nrec = which ? D / 2 : 2 * FF;
+    const SkMat m = tab[e * 2 + which];
+    bool fp4 = m.code == 15, s3 = m.code == 3;
+    float half = s3 ? 3.5f : 1.5f;
+    for (int c0 = beg; c0 < end; c0 += 32) {
+        if (tid < 32) as[tid] = c0 + tid < end ? order[c0 + tid] : -1;
+        float acc[4][4] = {}, seg[4][4] = {};
+        for (int k0 = 0; k0 < cols; k0 += 32) {
+            __syncthreads();
+            {
+                int r = tid / 2, c = (tid % 2) * 16, rr = r0 + r, rec = rr >> which;
+                int blk = (rr & which) * (cols / 16) + (k0 + c) / 16;
+                unsigned v[8];
+                if (fp4) {
+                    uint2 pk = ((const uint2*)m.lo)[(size_t)rec * 144 + blk];
+                    float sc = e4m3(((const u8*)m.sc)[(size_t)rec * 144 + blk]);
+                    for (int i = 0; i < 4; i++) {
+                        v[i] = pack2(e2m1(pk.x >> (8 * i)) * sc, e2m1(pk.x >> (8 * i + 4)) * sc);
+                        v[i + 4] = pack2(e2m1(pk.y >> (8 * i)) * sc, e2m1(pk.y >> (8 * i + 4)) * sc);
+                    }
+                } else {
+                    unsigned lo = ((const unsigned*)m.lo)[(size_t)rec * 144 + blk];
+                    unsigned hi = s3 ? ((const unsigned short*)(m.lo + (size_t)nrec * 576))[(size_t)rec * 144 + blk] : 0u;
+                    for (int i = 0; i < 8; i++) v[i] = pack2((float)sk_q(lo, hi, 2 * i) - half, (float)sk_q(lo, hi, 2 * i + 1) - half);
+                }
+                *(uint4*)&Ws[r * TS + c] = make_uint4(v[0], v[1], v[2], v[3]);
+                *(uint4*)&Ws[r * TS + c + 8] = make_uint4(v[4], v[5], v[6], v[7]);
+            }
+            load_x(Xs, x, cols, k0, [&](int j) { return as[j] >= 0 ? as[j] / xdiv : -1; });
+            __syncthreads();
+            mma_tile(Ws, Xs, seg);
+            if (k0 & 32) {
+                // seg[j] は行 16w+g と 16w+g+8 の分 (store_y と同じ並び)
+                int rr = r0 + (threadIdx.x >> 5) * 16 + ((threadIdx.x & 31) >> 2);
+                float sc[2] = {1.f, 1.f};
+                if (!fp4) {
+                    #pragma unroll
+                    for (int h = 0; h < 2; h++) {
+                        int row = rr + h * 8;
+                        sc[h] = sk_scale((const u8*)m.sc, nrec, row >> which, (row & which) * (cols / 64) + k0 / 64);
+                    }
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    acc[j][0] += seg[j][0] * sc[0], acc[j][1] += seg[j][1] * sc[0];
+                    acc[j][2] += seg[j][2] * sc[1], acc[j][3] += seg[j][3] * sc[1];
+                    seg[j][0] = seg[j][1] = seg[j][2] = seg[j][3] = 0.f;
+                }
+            }
+        }
+        store_y(acc, r0, [&](int r, int c, float v) {
+            if (as[c] >= 0) y[(size_t)as[c] * rows + r] = v * m.g;
+        });
+        __syncthreads();
+    }
+}
+
+// (prefill 用) situ_rows の SQ 版。活性を expert の列ごとの逆スケールで割る
+extern "C" __global__ void situ_sk(const float* gu, float* act, const int* ids, const float* ixd, int n) {
+    PDL();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * FF) return;
+    int a = i / FF, j = i % FF;
+    act[i] = situ(gu[(size_t)a * 2 * FF + 2 * j], gu[(size_t)a * 2 * FF + 2 * j + 1]) * ixd[(size_t)ids[a] * FF + j];
+}
+
 // (prefill 用) order[base..base+n] の割り当てだけ SITU をかける
 extern "C" __global__ void situ_sel(const float* gu, float* act, const int* order, int base, int n) {
     PDL();

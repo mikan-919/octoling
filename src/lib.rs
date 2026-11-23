@@ -5,3 +5,4 @@ pub mod kernels;
 pub mod gpu;
 pub mod model;
 pub mod st;
+pub mod strata;

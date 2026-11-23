@@ -2,7 +2,7 @@ use octoling::gpu::Gpu;
 fn argmax(l: &[f32]) -> u32 { let mut b = 0; for i in 0..l.len() { if l[i] > l[b] { b = i; } } b as u32 }
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let m = octoling::model::Model::load(octoling::st::SafeTensors::open(format!("{}/model-00001-of-00001.safetensors", a[1])).unwrap());
+    let m = octoling::model::Model::open(std::path::Path::new(&a[1]));
     let prompt: Vec<u32> = std::fs::read_to_string(&a[2]).unwrap().trim().split(',').map(|t| t.parse().unwrap()).collect();
     let mut g = Gpu::new(m, octoling::gpu::VRAM_CTX);
     // 基準: prefill して 24 トークンを1つずつ貪欲に

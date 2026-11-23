@@ -102,7 +102,14 @@ struct GLayer {
     router: P,
     router_bias: P,
     ctrl: Vec<GCtrl>,
-    experts: Option<[P; 6]>, // w13, s13, a13, w2, s2, a2。MXFP8 の層は None で CPU が計算する
+    experts: GExperts,
+}
+
+#[derive(Clone, Copy)]
+enum GExperts {
+    Fp4([P; 6]),            // w13, s13, a13, w2, s2, a2
+    Sk { tab: P, ixd: P },  // SQ 形式。tab は行列ごとの SkMat、ixd は活性の逆スケール [128][FF]
+    Host,                   // MXFP8。CPU と分担する
 }
 
 struct GSlot {
@@ -307,10 +314,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 54] = [
+const KERNELS: [&str; 58] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "moe_up_sk", "moe_down_sk", "gemm_sk_grouped", "situ_sk",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -374,7 +381,16 @@ impl Gpu {
                     router: up.bytes(as_bytes(l.router)),
                     router_bias: f32s(l.router_bias, &mut up),
                     ctrl: l.ctrl.iter().flatten().map(|c| GCtrl { down: up.bytes(as_bytes(c.down)), gf: bfs(&[c.gain, c.forget], &mut up) }).collect(),
-                    experts: (!e.mx).then(|| [e.w13, e.s13, as_bytes(e.a13), e.w2, e.s2, as_bytes(e.a2)].map(|b| up.bytes(b))),
+                    experts: if let Some(sk) = &e.sk {
+                        let im = sk.image();
+                        let base = up.bytes(&im.bytes);
+                        let tab: Vec<[u64; 3]> = im.tab.iter().map(|m| [base + m[0], base + m[1], m[2]]).collect();
+                        GExperts::Sk { tab: up.bytes(as_bytes(&tab)), ixd: f32s(&im.ixd, &mut up) }
+                    } else if e.mx {
+                        GExperts::Host
+                    } else {
+                        GExperts::Fp4([e.w13, e.s13, as_bytes(e.a13), e.w2, e.s2, as_bytes(e.a2)].map(|b| up.bytes(b)))
+                    },
                 }
             })
             .collect();
@@ -412,9 +428,14 @@ impl Gpu {
         });
         let reserved = (2 * GROUP * XSLOT + big_bytes).div_ceil(XSLOT);
         let (free, _) = result::mem_get_info().unwrap();
-        let n_slots = std::env::var("OCTO_EXPERT_SLOTS")
-            .map_or(free.saturating_sub(VRAM_MARGIN) / XSLOT, |s| s.parse().expect("OCTO_EXPERT_SLOTS は数"))
-            .clamp(reserved, 255);
+        // MXFP8 の層がなければ (SQ 形式) 枠は要らず、prefill の作業領域の分だけとる
+        let n_slots = if cpu.layers.iter().any(|l| l.experts.mx) {
+            std::env::var("OCTO_EXPERT_SLOTS")
+                .map_or(free.saturating_sub(VRAM_MARGIN) / XSLOT, |s| s.parse().expect("OCTO_EXPERT_SLOTS は数"))
+                .clamp(reserved, 255)
+        } else {
+            reserved
+        };
         let xbase = up.zeros(n_slots * XSLOT);
         let staging = [xbase, xbase + (GROUP * XSLOT) as u64];
         let mut at = xbase + (2 * GROUP * XSLOT) as u64;
@@ -642,7 +663,7 @@ impl Gpu {
                     self.stream.synchronize().unwrap();
                     ms.push(t0.elapsed().as_secs_f64() * 1e3);
                 }
-                if i < N_LAYER - MXFP8_FROM {
+                if i + 1 < gs.len() {
                     let t0 = Instant::now();
                     self.cpu_moe(MXFP8_FROM + i, t);
                     ms.push(t0.elapsed().as_secs_f64() * 1e3);
@@ -1278,14 +1299,29 @@ impl Gpu {
         if !mlp_fused {
             k!(self, "rmsnorm", t, 256, 0; b.h, l.mlp_norm, b.h, 0i32, ti);
         }
+        if !matches!(l.experts, GExperts::Host) {
+            if t == 1 {
+                k!(self, "router_topk", 64, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24));
+            } else {
+                self.gemm(l.router, b.h, b.rl, 128, D, t);
+                k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
+            }
+        }
         match l.experts {
-            Some([w13, s13, a13, w2, s2, a2]) => {
-                if t == 1 {
-                    k!(self, "router_topk", 64, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24));
+            GExperts::Sk { tab, ixd } => {
+                if t <= SPEC_T {
+                    k!(self, "moe_up_sk", (t * TOP_K * FF / 4 * 32).div_ceil(256), 256, 0; tab, ixd, b.ids, b.h, b.act, ti);
+                    k!(self, "moe_down_sk", (t * D / 2 * 32).div_ceil(256), 256, 0; tab, b.ids, b.wts, b.act, b.y, ti);
                 } else {
-                    self.gemm(l.router, b.h, b.rl, 128, D, t);
-                    k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
+                    let n = (t * TOP_K) as i32;
+                    k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
+                    k!(self, "gemm_sk_grouped", (2 * FF / 64, 128), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, b.gu);
+                    k!(self, "situ_sk", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, b.ids, ixd, n);
+                    k!(self, "gemm_sk_grouped", (D / 64, 128), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
+                    k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
+            }
+            GExperts::Fp4([w13, s13, a13, w2, s2, a2]) => {
                 if t <= SPEC_T {
                     k!(self, "moe_up_nvfp4", (t * TOP_K * FF / 4 * 32).div_ceil(256), 256, 0; w13, s13, a13, b.ids, b.h, b.act, ti);
                     k!(self, "moe_down_nvfp4", (t * D / 2 * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y, ti);
@@ -1299,7 +1335,7 @@ impl Gpu {
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }
-            None if t == 1 && self.capturing.get() => {
+            GExperts::Host if t == 1 && self.capturing.get() => {
                 // CPU との受け渡しをグラフの中で待つ (serve_host)。枠にある expert は GPU で計算し、CPU の分と足す
                 let at = |off: usize| self.hx.0 + ((il - MXFP8_FROM) * HX + off) as u64;
                 let base = self.xc.borrow().base;
@@ -1311,12 +1347,12 @@ impl Gpu {
                 k!(self, "wait_host", 1, 32, 0; at(HX_FY), 0u64, 0u64, 0i32);
                 k!(self, "add_host", D.div_ceil(256), 256, 0; b.yd, at(HX_Y), b.y);
             }
-            None if t <= SPEC_T => {
+            GExperts::Host if t <= SPEC_T => {
                 self.end();
                 self.cpu_moe(il, t);
                 self.begin();
             }
-            None => self.hybrid_moe(il, t),
+            GExperts::Host => self.hybrid_moe(il, t),
         }
         self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t, seq(3), b.x);
         if let Some(j) = TAP_SLOTS.iter().position(|&s| s == slot) {

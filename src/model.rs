@@ -40,6 +40,7 @@ pub(crate) struct Experts {
     pub(crate) w2: &'static [u8],
     pub(crate) s2: &'static [u8],
     pub(crate) a2: &'static [f32],
+    pub(crate) sk: Option<crate::strata::SkLayer>, // SQ 形式なら上の欄は空で、こちらを使う
 }
 
 pub(crate) struct Ctrl {
@@ -127,6 +128,59 @@ impl Model {
             assert_eq!((t.dtype.as_str(), t.shape.as_slice()), (dtype, shape), "{name}");
             t.data
         };
+        // moe() は分母を 2688 と決め打ちしている
+        for i in 0..MXFP8_FROM {
+            for w in ["w13", "w2"] {
+                let d: &[f32] = cast(get(&format!("model.llm.layers.{i}.mlp.experts.{w}_weight_outer_scale_denominator"), "F32", &[1]));
+                assert_eq!(d[0], 2688.0);
+            }
+        }
+        let experts = |i: usize| {
+            let e = |w: &str| format!("model.llm.layers.{i}.mlp.experts.{w}");
+            let f32s = |name: &str, shape: &[usize]| -> &'static [f32] { cast(get(name, "F32", shape)) };
+            if i >= MXFP8_FROM {
+                Experts {
+                    mx: true,
+                    w13: get(&e("w13_weight"), "F8_E4M3", &[N_EXP, 2 * FF, D]),
+                    s13: get(&e("w13_weight_scale"), "U8", &[N_EXP, 2 * FF, D / 32]),
+                    a13: &[],
+                    w2: get(&e("w2_weight"), "F8_E4M3", &[N_EXP, D, FF]),
+                    s2: get(&e("w2_weight_scale"), "U8", &[N_EXP, D, FF / 32]),
+                    a2: &[],
+                    sk: None,
+                }
+            } else {
+                Experts {
+                    mx: false,
+                    w13: get(&e("w13_weight"), "U8", &[N_EXP, 2 * FF, D / 2]),
+                    s13: get(&e("w13_weight_scale"), "F8_E4M3", &[N_EXP, 2 * FF, D / 16]),
+                    a13: f32s(&e("w13_weight_amax"), &[N_EXP]),
+                    w2: get(&e("w2_weight"), "U8", &[N_EXP, D, FF / 2]),
+                    s2: get(&e("w2_weight_scale"), "F8_E4M3", &[N_EXP, D, FF / 16]),
+                    a2: f32s(&e("w2_weight_amax"), &[N_EXP]),
+                    sk: None,
+                }
+            }
+        };
+        Self::build(&get, &experts)
+    }
+
+    /// dir の公式の重み (safetensors) か、なければ .strata を読む
+    pub fn open(dir: &std::path::Path) -> Self {
+        let st = dir.join("model-00001-of-00001.safetensors");
+        if st.exists() {
+            return Self::load(SafeTensors::open(st).expect("重みを開けない"));
+        }
+        let pack = std::fs::read_dir(dir)
+            .expect("重みのディレクトリを読めない")
+            .filter_map(|e| Some(e.ok()?.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "strata"))
+            .unwrap_or_else(|| panic!("{} に safetensors も .strata もない", dir.display()));
+        let pack = crate::strata::Pack::open(&pack).unwrap_or_else(|e| panic!("{e}"));
+        Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i))
+    }
+
+    fn build(get: &dyn Fn(&str, &str, &[usize]) -> &'static [u8], experts: &dyn Fn(usize) -> Experts) -> Self {
         let bf = |name: &str, shape: &[usize]| -> W { cast(get(name, "BF16", shape)) };
         let f32s = |name: &str, shape: &[usize]| -> &'static [f32] { cast(get(name, "F32", shape)) };
         let bf_f32 = |name: &str, shape: &[usize]| -> Vec<f32> { bf(name, shape).iter().map(|&x| bf16(x)).collect() };
@@ -168,7 +222,6 @@ impl Model {
                 } else {
                     (conv(&n("attn.k_sconv.weight"), N_KV * HD), conv(&n("attn.v_sconv.weight"), N_KV * HD), None, None)
                 };
-                let e = |w: &str| format!("{p}mlp.experts.{w}");
                 Layer {
                     global,
                     attn_query: (i > 0).then(|| {
@@ -196,27 +249,7 @@ impl Model {
                     mlp_norm: bf(&n("mlp_norm.weight"), &[D]),
                     router: bf(&n("mlp.gate.weight"), &[N_EXP, D]),
                     router_bias: f32s(&n("mlp.gate.bias"), &[N_EXP]),
-                    experts: if i >= MXFP8_FROM {
-                        Experts {
-                            mx: true,
-                            w13: get(&e("w13_weight"), "F8_E4M3", &[N_EXP, 2 * FF, D]),
-                            s13: get(&e("w13_weight_scale"), "U8", &[N_EXP, 2 * FF, D / 32]),
-                            a13: &[],
-                            w2: get(&e("w2_weight"), "F8_E4M3", &[N_EXP, D, FF]),
-                            s2: get(&e("w2_weight_scale"), "U8", &[N_EXP, D, FF / 32]),
-                            a2: &[],
-                        }
-                    } else {
-                        Experts {
-                            mx: false,
-                            w13: get(&e("w13_weight"), "U8", &[N_EXP, 2 * FF, D / 2]),
-                            s13: get(&e("w13_weight_scale"), "F8_E4M3", &[N_EXP, 2 * FF, D / 16]),
-                            a13: f32s(&e("w13_weight_amax"), &[N_EXP]),
-                            w2: get(&e("w2_weight"), "U8", &[N_EXP, D, FF / 2]),
-                            s2: get(&e("w2_weight_scale"), "F8_E4M3", &[N_EXP, D, FF / 16]),
-                            a2: f32s(&e("w2_weight_amax"), &[N_EXP]),
-                        }
-                    },
+                    experts: experts(i),
                     ctrl: in_core.then(|| [ctrl("attn"), ctrl("k"), ctrl("v"), ctrl("mlp")]),
                     msg_query: in_core.then(|| {
                         let j = i - CORE.0;
@@ -228,13 +261,6 @@ impl Model {
                 }
             })
             .collect();
-        // moe() は分母を 2688 と決め打ちしている
-        for i in 0..MXFP8_FROM {
-            for w in ["w13", "w2"] {
-                let d = f32s(&format!("model.llm.layers.{i}.mlp.experts.{w}_weight_outer_scale_denominator"), &[1]);
-                assert_eq!(d[0], 2688.0);
-            }
-        }
         Self {
             embed: bf("model.llm.embed.weight", &[201024, D]),
             embed_norm: bf("model.llm.embed_norm.weight", &[D]),
@@ -411,17 +437,16 @@ impl Model {
             for (i, o) in o.iter_mut().enumerate() {
                 let r = c * 64 + i;
                 let ex = sel[r / (2 * FF)];
-                *o = e.dot(e.w13, e.s13, ex * 2 * FF + r % (2 * FF), x) * e.g13(ex);
+                *o = e.up(ex, r % (2 * FF), x);
             }
         });
         let mut act = vec![0.0; n * FF];
         crate::pool::chunks_mut(&mut act, 256, |c, o| o.copy_from_slice(&situ_pairs(&gu[c * 512..][..2 * o.len()])));
-        let g2: Vec<f32> = (0..n).map(|k| wts[k] * e.g2(sel[k])).collect();
         let mut y = vec![0.0; D];
         crate::pool::chunks_mut(&mut y, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
                 let row = c * 64 + i;
-                *o = (0..n).map(|k| e.dot(e.w2, e.s2, sel[k] * D + row, &act[k * FF..][..FF]) * g2[k]).sum();
+                *o = (0..n).map(|k| e.down(sel[k], row, &act[k * FF..][..FF]) * wts[k]).sum();
             }
         });
         y
@@ -577,6 +602,22 @@ impl Experts {
 
     fn g2(&self, ex: usize) -> f32 {
         if self.mx { 1.0 } else { self.a2[ex] / 2688.0 }
+    }
+
+    /// expert ex の gate/up の行 r と x の内積
+    fn up(&self, ex: usize, r: usize, x: &[f32]) -> f32 {
+        match &self.sk {
+            Some(s) => s.up(ex, r, x),
+            None => self.dot(self.w13, self.s13, ex * 2 * FF + r, x) * self.g13(ex),
+        }
+    }
+
+    /// expert ex の down の行 r と活性の内積
+    fn down(&self, ex: usize, r: usize, act: &[f32]) -> f32 {
+        match &self.sk {
+            Some(s) => s.down(ex, r, act),
+            None => self.dot(self.w2, self.s2, ex * D + r, act) * self.g2(ex),
+        }
     }
 
     /// 行 row を f32 に展開する。NVFP4 は amax の大域スケールを掛ける前の値

@@ -1,7 +1,6 @@
 use octoling::gpu::Gpu;
 use octoling::model::{Model, State};
 use octoling::serve::{Engine, Msg, Params, Piece, effort, serve};
-use octoling::st::SafeTensors;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -13,7 +12,7 @@ const USAGE: &str = "使い方:
       1回だけ質問し、答えを流して表示する。思考は灰色で出す
   octoling bench <重みのディレクトリ> <トークンID,トークンID,...> [生成するトークン数]
       prefill と貪欲法の生成の速さを測る。@ファイル名 でファイルから読む。; で区切ると複数のプロンプトを続けて測る (読み込みは1回、OCTO_REPEAT 回繰り返す)。OCTO_STEP=1 で1トークンずつ、OCTO_CPU=1 で CPU だけで処理する
-重みのディレクトリには model-00001-of-00001.safetensors と tokenizer.json を置く
+重みのディレクトリには tokenizer.json と、公式の model-00001-of-00001.safetensors か Strata の SQ-10 (.strata) を置く
 文脈長の上限は OCTO_CTX (既定 8192)。それより長くすると global 層の KV を主記憶に置く (1 トークン 32 KB)";
 
 fn main() {
@@ -23,7 +22,7 @@ fn main() {
         std::process::exit(2);
     }
     let dir = Path::new(&args[2]);
-    let model = Model::load(SafeTensors::open(dir.join("model-00001-of-00001.safetensors")).expect("重みを開けない"));
+    let model = Model::open(dir);
     match args[1].as_str() {
         "serve" => {
             let mut engine = Engine::new(Gpu::new(model, n_ctx()), dir);
