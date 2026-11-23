@@ -239,7 +239,17 @@ pub struct Gpu {
     hx: (P, usize),
     // 生成の入力 (x, 位置) と結果 (旗, 最大の位置, logits) を受け渡す主記憶。HIO_* の並び。転送エンジンを使わないので、枠への大きい転送の後ろで待たされない
     hio: (P, usize),
+    // 生成で、主記憶の KV への注意を CPU と受け渡す主記憶 (GPU 側, 主記憶側のアドレス)。スロットごとに HA バイト。文脈が VRAM_CTX 以下なら使わない
+    ha: (P, usize),
+    host_seq: RefCell<Vec<HostEv>>, // 1トークンのグラフが CPU を待つ順番
     token_done: CudaEvent, // 生成の1トークン分の CUDA Graph の終わり
+}
+
+/// 生成のグラフが CPU に頼む処理
+#[derive(Clone, Copy)]
+enum HostEv {
+    Attn(usize), // スロット番号
+    Moe(usize),  // 20 層からの番号
 }
 
 /// prefill で1回に PCIe で送る MXFP8 expert の数。置き場は2つあり、片方を送るあいだにもう片方で計算する
@@ -266,6 +276,12 @@ const HX_ROUTE: usize = 8 * D;
 const HX_FH: usize = 8 * D + 128; // h を書いた (GPU が立てる)
 const HX_FR: usize = 8 * D + 192; // route を書いた (CPU が立てる)
 const HX_FY: usize = 8 * D + 256; // y を書いた (CPU が立てる)
+// 主記憶の KV への注意の受け渡し。[q 3072, r 384, sink 24] の f32、結果 [3072] の f32、旗
+const HA: usize = 32768;
+const HA_Q: usize = 0;
+const HA_O: usize = 16384;
+const HA_FQ: usize = 28672; // q, r, sink を書いた (GPU が立てる)
+const HA_FO: usize = 28736; // 結果を書いた (CPU が立てる)
 // 生成の入出力の受け渡しの場所の並び (バイト)
 const HIO_X: usize = 0;
 const HIO_POS: usize = 4 * D;
@@ -291,10 +307,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 50] = [
+const KERNELS: [&str; 52] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -422,6 +438,8 @@ impl Gpu {
             fill_done: ev(),
             hx: mapped(4 * HX),
             hio: mapped(HIO_LOGITS + VOCAB * 4),
+            ha: if n_ctx > VRAM_CTX { mapped(N_SLOT * HA) } else { (0, 0) },
+            host_seq: RefCell::new(vec![]),
             token_done: ev(),
             _ctx: ctx.clone(),
             stream,
@@ -640,6 +658,9 @@ impl Gpu {
             self.take_big();
         }
         self.capturing.set(small);
+        if small && t == 1 {
+            self.host_seq.borrow_mut().clear();
+        }
         self.begin();
         self.record(t, verify);
         self.end();
@@ -804,7 +825,15 @@ impl Gpu {
         self.token_done.record(&self.stream).unwrap();
         let prof = std::env::var_os("OCTO_PROF").is_some();
         let mut ms = vec![];
-        for li in 0..N_LAYER - MXFP8_FROM {
+        let seq = self.host_seq.borrow().clone();
+        for ev in seq {
+            let li = match ev {
+                HostEv::Attn(slot) => {
+                    self.host_attn(slot);
+                    continue;
+                }
+                HostEv::Moe(li) => li,
+            };
             let t0 = Instant::now();
             let h = self.host_h(li);
             let t1 = Instant::now();
@@ -818,6 +847,29 @@ impl Gpu {
             self.stream.synchronize().unwrap();
             ms.push(t0.elapsed().as_secs_f64() * 1e3);
             eprintln!("prof {ms:.2?}");
+        }
+    }
+
+    /// (生成、主記憶に KV がある global 層) GPU が書いた q, r, sink を待ち、KV 全体への注意を CPU で計算して返す
+    fn host_attn(&self, slot: usize) {
+        let at = self.ha.1 + slot * HA;
+        let flag = (at + HA_FQ) as *mut u32;
+        let [kh, vh] = self.slots[slot].host.unwrap();
+        let rel = model::bf_vec(self.cpu.layers[phys(slot)].rel_proj);
+        let t0 = Instant::now();
+        // SAFETY: ha は主記憶の受け渡しの場所。GPU は旗が立つまで結果を読まない。KV は pos + 1 行まで書かれている
+        unsafe {
+            while std::ptr::read_volatile(flag) == 0 {
+                std::hint::spin_loop();
+                assert!(t0.elapsed().as_secs() < 30, "GPU が注意の入力を書かない");
+            }
+            std::ptr::write_volatile(flag, 0);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let qr = std::slice::from_raw_parts((at + HA_Q) as *const f32, 3480);
+            let out = std::slice::from_raw_parts_mut((at + HA_O) as *mut f32, 3072);
+            host_attn::attend(&qr[..3072], &qr[3072..3456], &qr[3456..], kh as *const u16, vh as *const u16, self.pos + 1, &rel, out);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            std::ptr::write_volatile((at + HA_FO) as *mut u32, 1);
         }
     }
 
@@ -1128,14 +1180,21 @@ impl Gpu {
         let ring = if l.global { 0 } else { RING as i32 };
         if t == 1 {
             k!(self, "qkv_conv_post", 64, 128, 0; b.qx, b.kx, b.vx, l.k_conv, l.v_conv, dyn_.map_or(-1, |d| d as i32),
-                s.hist[0], s.hist[1], s.seq[0], s.seq[1], l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
+                s.hist[0], s.hist[1], s.seq[0], s.seq[1], l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc, s.host.is_some() as i32);
         } else {
             self.conv(b.kx, nk, l.k_conv, dyn_, s.hist[0], b.kp, 1024, 1024, 128, t, seq(0), 0);
             self.conv(b.vx, nk, l.v_conv, dyn_, s.hist[1], b.vp, 1024, 1024, 128, t, seq(1), 0);
             k!(self, "qkv_post", (64, t), 128, 0; b.qx, b.kp, b.vp, l.q_clip, l.rel_clip, b.pos, ring, s.kc, s.vc);
         }
-        if t <= SPEC_T {
-            // 主記憶の KV も GPU から直接読む
+        if t == 1 && s.host.is_some() && self.capturing.get() {
+            // 主記憶の KV は CPU が読んで注意を計算する (serve_host)
+            let at = |off: usize| self.ha.0 + (slot * HA + off) as u64;
+            self.host_seq.borrow_mut().push(HostEv::Attn(slot));
+            k!(self, "attn_to_host", 1, 256, 0; b.qx, at(HA_Q), at(HA_FQ));
+            k!(self, "wait_host", 1, 32, 0; at(HA_FO), 0u64, 0u64, 0i32);
+            k!(self, "attn_from_host", 12, 256, 0; b.qx, at(HA_O), b.o);
+        } else if t <= SPEC_T {
+            // 検証のバッチは、主記憶の KV も GPU から直接読む
             k!(self, "attn_part", (8, 32 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
@@ -1185,6 +1244,7 @@ impl Gpu {
                 // CPU との受け渡しをグラフの中で待つ (serve_host)。枠にある expert は GPU で計算し、CPU の分と足す
                 let at = |off: usize| self.hx.0 + ((il - MXFP8_FROM) * HX + off) as u64;
                 let base = self.xc.borrow().base;
+                self.host_seq.borrow_mut().push(HostEv::Moe(il - MXFP8_FROM));
                 k!(self, "to_host", 1, 256, 0; b.h, at(HX_H), at(HX_FH));
                 k!(self, "wait_host", 1, 32, 0; at(HX_FR), at(HX_ROUTE), b.route, 12i32);
                 k!(self, "moe_up_mx", (TOP_K * FF * 32).div_ceil(256), 256, 0; base, b.route, b.h, b.act);
@@ -1300,6 +1360,7 @@ unsafe fn par_copy(src: &[u8], dst: *mut u8) {
 }
 
 mod draft;
+mod host_attn;
 pub use draft::{DRAFT_CTX, Drafter};
 
 /// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない

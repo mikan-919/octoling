@@ -1360,6 +1360,23 @@ extern "C" __global__ void add_host(const float* a, const float* b, float* out) 
     if (i < D) out[i] = a[i] + __ldcv(b + i);
 }
 
+// (生成、主記憶に KV がある global 層) 注意は CPU で計算する。[q 3072, r 384, sink 24] を主記憶の out に写し、旗を立てる。1 ブロック
+extern "C" __global__ void attn_to_host(const float* qx, float* out, unsigned* flag) {
+    PDL();
+    for (int i = threadIdx.x; i < R_OFF + 384; i += blockDim.x) out[i] = qx[i];
+    if (threadIdx.x < 24) out[R_OFF + 384 + threadIdx.x] = qx[SINK_OFF + threadIdx.x];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*)flag = 1;
+}
+
+// CPU が主記憶に書いた注意の結果 ho [3072] に出力ゲートをかけて out に書く。12 ブロック
+extern "C" __global__ void attn_from_host(const float* qx, const float* ho, float* out) {
+    PDL();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = __ldcv(ho + i) * sigmoidf(qx[GATE_OFF + i]);
+}
+
 // ---- control (T = 1 用) ----
 // norm2、down の行列×ベクトル、gf の行列×ベクトル、control の4カーネルを2つにまとめ、さらに n (<= 3) 本の control を1回の起動で計算する。
 // control j の入力は cur + j * cs (cs = 0 なら共通)、メッセージは msg + j * D、出力は out + j * D。足す順はまとめる前と同じ
@@ -1448,7 +1465,7 @@ extern "C" __global__ void mv3_bf16(const bf16* w0, const float* x0, float* y0, 
 // 畳み込みの式と足す順は conv と同じ (dyn は 1024、cph は 128)。hk, hv は K, V の hist、sk, sv は seq
 extern "C" __global__ void qkv_conv_post(float* qx, const float* kx, const float* vx, const float* kw, const float* vw, int dyn,
                                          float* hk, float* hv, float* sk, float* sv, const float* qclip, const float* rclip, const int* posp,
-                                         int ring, half_t* kc, half_t* vc) {
+                                         int ring, half_t* kc, half_t* vc, int host) {
     PDL();
     int b = blockIdx.x, t = threadIdx.x, pos = *posp;
     float* q = qx;
@@ -1494,6 +1511,8 @@ extern "C" __global__ void qkv_conv_post(float* qx, const float* kx, const float
     // qkv_post
     if (isk) kc[row + c] = f2h(y * clip_scale(y, 22.627416997969522f));
     else vc[row + c] = f2h(y * rsqrtf(block_sum(y * y) / HD + 1e-6f));
+    // KV が主記憶にあれば、CPU が読む前に書き終える
+    if (host) __threadfence_system();
 }
 
 // (T = 1 用) ルーターの行列×ベクトル (128 行) と topk を1回の起動で。64 ブロック x 256 スレッド。
