@@ -503,35 +503,22 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
     for (int h = 0; h < 3; h++) attn_combine(qx, part, ob, kvh * 3 + h, tt);
 }
 
-// (prefill、長い文脈の global 層) VRAM に送った KV の塊 (位置 b0 から nb 個、kb [nb][1024]、vb 同じ) の分だけ注意を計算し、
-// acc [T][24][HD + 2] の (最大値, 指数和, 重み付き和) に足す。first なら sink から始める。
-// グリッドは (KV ヘッド 8, T/AQ)、128スレッド。スレッドはトークン tid/AP の、KV を共有する 3 ヘッドの次元 (tid%AP)*AD から AD 個を受け持つ。
+// (prefill) 注意の共通部分。グリッドは (KV ヘッド 8, T/AQ)、128スレッド。スレッドはトークン tid/AP の、KV を共有する 3 ヘッドの次元 (tid%AP)*AD から AD 個を受け持つ。
 // q と o をレジスタに置き、共有メモリから読んだ K, V の AD 次元を 3 ヘッドに使い回す (共有メモリの帯域が律速になるため)
 #define AP 4
 #define AD (HD / AP)
 #define AQ (128 / AP)
 #define AK 16
-extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const half_t* vb, int b0, int nb, const float* rel_proj, float* acc,
-                                    const int* posp, int T, int first) {
-    PDL();
-    __shared__ __align__(16) float Ks[AK][HD];
-    __shared__ __align__(16) float Vs[AK][HD];
-    __shared__ float Ps[AQ][3][AK];
-    __shared__ float Rs[AQ][3][NREL];
-    int kvh = blockIdx.x, tid = threadIdx.x, qi = tid / AP, part = tid % AP;
-    int t0 = blockIdx.y * AQ, nq = min(AQ, T - t0), p0 = *posp + t0, pq = p0 + qi;
+
+// q と (最大値 m, 指数和 z, 重み付き和 o) を用意する。first なら sink から始め、そうでなければ acc [T][24][HD + 2] の続きから
+__device__ __forceinline__ void attn_init(const float* qx, const float* acc, int first, int t0, int nq, int kvh, float qr[3][AD], float o[3][AD], float* m, float* z) {
+    int qi = threadIdx.x / AP, part = threadIdx.x % AP;
     bool valid = qi < nq;
-    for (int i = tid; i < AQ * 3 * NREL; i += blockDim.x) {
-        int q = i / (3 * NREL), h = i / NREL % 3;
-        Rs[q][h][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + (kvh * 3 + h) * NREL + i % NREL] : 0.f;
-    }
-    __align__(16) float qr[3][AD], o[3][AD];
-    float m[3], z[3];
+    const float* qh = qx + (size_t)(t0 + qi) * QX;
     #pragma unroll
     for (int h = 0; h < 3; h++) {
         int head = kvh * 3 + h;
-        const float* qh = qx + (size_t)(t0 + qi) * QX;
-        const float* a = acc + ((size_t)(t0 + qi) * 24 + head) * PART;
+        const float* a = first ? nullptr : acc + ((size_t)(t0 + qi) * 24 + head) * PART;
         m[h] = !valid ? 0.f : first ? qh[SINK_OFF + head] : a[0];
         z[h] = !valid || first ? 1.f : a[1];
         #pragma unroll
@@ -540,14 +527,28 @@ extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const hal
             o[h][d] = !valid || first ? 0.f : a[2 + part * AD + d];
         }
     }
-    int jmax = min(b0 + nb - 1, p0 + nq - 1);
-    for (int j0 = b0; j0 <= jmax; j0 += AK) {
+}
+
+// 位置 jlo..=jmax のキーの分を (m, z, o) に足す。行 j の KV は kb, vb の kv_row(j - b0, ring) にある
+__device__ __forceinline__ void attn_keys(const float* qx, const half_t* kb, const half_t* vb, int b0, int ring, int jlo, int jmax, const float* rel_proj, int t0, int nq,
+                                          int p0, int kvh, const float qr[3][AD], float o[3][AD], float* m, float* z) {
+    __shared__ __align__(16) float Ks[AK][HD];
+    __shared__ __align__(16) float Vs[AK][HD];
+    __shared__ float Ps[AQ][3][AK];
+    __shared__ float Rs[AQ][3][NREL];
+    int tid = threadIdx.x, qi = tid / AP, part = tid % AP, pq = p0 + qi;
+    bool valid = qi < nq;
+    for (int i = tid; i < AQ * 3 * NREL; i += blockDim.x) {
+        int q = i / (3 * NREL), h = i / NREL % 3;
+        Rs[q][h][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + (kvh * 3 + h) * NREL + i % NREL] : 0.f;
+    }
+    for (int j0 = jlo; j0 <= jmax; j0 += AK) {
         __syncthreads();
         for (int i = tid; i < AK * HD; i += blockDim.x) {
             int k = i / HD, j = j0 + k;
             bool in = j <= jmax;
-            Ks[k][i % HD] = in ? h2f(kb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
-            Vs[k][i % HD] = in ? h2f(vb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
+            Ks[k][i % HD] = in ? h2f(kb[kv_row(j - b0, ring) + kvh * HD + i % HD]) : 0.f;
+            Vs[k][i % HD] = in ? h2f(vb[kv_row(j - b0, ring) + kvh * HD + i % HD]) : 0.f;
         }
         __syncthreads();
         float tmax[3] = {-INFINITY, -INFINITY, -INFINITY};
@@ -560,7 +561,7 @@ extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const hal
                 for (int h = 0; h < 3; h++) ac[h] += qr[h][e] * y.x + qr[h][e + 1] * y.y + qr[h][e + 2] * y.z + qr[h][e + 3] * y.w;
             }
             int j = j0 + k, d = pq - j;
-            bool ok = valid && j <= jmax && j <= pq;
+            bool ok = valid && j <= jmax && j <= pq && (!ring || d < EXTENT);
             #pragma unroll
             for (int h = 0; h < 3; h++) {
                 float x = ac[h] + __shfl_xor_sync(0xffffffffu, ac[h], 1);
@@ -597,7 +598,20 @@ extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const hal
             }
         }
     }
-    if (valid) {
+}
+
+// (prefill、長い文脈の global 層) VRAM に送った KV の塊 (位置 b0 から nb 個、kb [nb][1024]、vb 同じ) の分だけ注意を計算し、
+// acc [T][24][HD + 2] の (最大値, 指数和, 重み付き和) に足す。first なら sink から始める
+extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const half_t* vb, int b0, int nb, const float* rel_proj, float* acc,
+                                    const int* posp, int T, int first) {
+    PDL();
+    int kvh = blockIdx.x, qi = threadIdx.x / AP, part = threadIdx.x % AP;
+    int t0 = blockIdx.y * AQ, nq = min(AQ, T - t0), p0 = *posp + t0;
+    __align__(16) float qr[3][AD], o[3][AD];
+    float m[3], z[3];
+    attn_init(qx, acc, first, t0, nq, kvh, qr, o, m, z);
+    attn_keys(qx, kb, vb, b0, 0, b0, min(b0 + nb - 1, p0 + nq - 1), rel_proj, t0, nq, p0, kvh, qr, o, m, z);
+    if (qi < nq) {
         #pragma unroll
         for (int h = 0; h < 3; h++) {
             float* a = acc + ((size_t)(t0 + qi) * 24 + kvh * 3 + h) * PART;
@@ -635,87 +649,24 @@ __device__ void attn_combine(const float* qx, const float* part, float* out, int
     out[h * HD + t] = o / z * sigmoidf(qx[GATE_OFF + h * HD + t]);
 }
 
-// (prefill 用) 32 クエリ x 16 キーのタイルで、K と V を共有メモリに載せて 32 クエリで使い回す (オンライン softmax)。
-// グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
-#define QT 32
-#define KT 16
+// (prefill、VRAM の KV) 注意を計算し、出力ゲートをかけて out [T][3072] に書く。ring > 0 なら SWA 層で、直近 EXTENT 個の位置を見る
 extern "C" __global__ void attn_tile(const float* qx, const half_t* kc, const half_t* vc, const float* rel_proj, float* out, const int* posp, int ring, int T) {
     PDL();
-    __shared__ __align__(16) float Qs[QT][HD];
-    __shared__ __align__(16) float Ks[KT][HD + 4];
-    __shared__ __align__(16) float Vs[KT][HD];
-    __shared__ float Ps[QT][KT];
-    __shared__ float Rs[QT][NREL];
-    int h = blockIdx.x, kvh = h / 3, tid = threadIdx.x, qi = tid / 4, part = tid % 4;
-    int t0 = blockIdx.y * QT, nq = min(QT, T - t0), p0 = *posp + t0;
-    for (int i = tid; i < QT * HD; i += blockDim.x) {
-        int q = i / HD;
-        Qs[q][i % HD] = q < nq ? qx[(size_t)(t0 + q) * QX + h * HD + i % HD] : 0.f;
-    }
-    for (int i = tid; i < QT * NREL; i += blockDim.x) {
-        int q = i / NREL;
-        Rs[q][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + h * NREL + i % NREL] : 0.f;
-    }
-    int pq = p0 + qi; // このスレッドのクエリの位置
-    bool valid = qi < nq;
-    float m = valid ? qx[(size_t)(t0 + qi) * QX + SINK_OFF + h] : 0.f, z = 1.f; // sink から始める
-    float o[32];
-    for (int d = 0; d < 32; d++) o[d] = 0.f;
-    int pmax = p0 + nq - 1, jlo = ring ? max(0, p0 + 1 - EXTENT) : 0;
-    for (int j0 = jlo; j0 <= pmax; j0 += KT) {
-        __syncthreads();
-        for (int i = tid; i < KT * HD; i += blockDim.x) {
-            int k = i / HD, j = j0 + k;
-            float kv = 0.f, vv = 0.f;
-            if (j <= pmax) {
-                kv = h2f(kc[kv_row(j, ring) + kvh * HD + i % HD]);
-                vv = h2f(vc[kv_row(j, ring) + kvh * HD + i % HD]);
-            }
-            Ks[k][i % HD] = kv;
-            Vs[k][i % HD] = vv;
+    int kvh = blockIdx.x, qi = threadIdx.x / AP, part = threadIdx.x % AP;
+    int t0 = blockIdx.y * AQ, nq = min(AQ, T - t0), p0 = *posp + t0;
+    __align__(16) float qr[3][AD], o[3][AD];
+    float m[3], z[3];
+    attn_init(qx, nullptr, 1, t0, nq, kvh, qr, o, m, z);
+    attn_keys(qx, kc, vc, 0, ring, ring ? max(0, p0 + 1 - EXTENT) : 0, p0 + nq - 1, rel_proj, t0, nq, p0, kvh, qr, o, m, z);
+    if (qi < nq) {
+        #pragma unroll
+        for (int h = 0; h < 3; h++) {
+            int head = kvh * 3 + h;
+            const float* gate = qx + (size_t)(t0 + qi) * QX + GATE_OFF + head * HD + part * AD;
+            float* dst = out + (size_t)(t0 + qi) * 3072 + head * HD + part * AD;
+            #pragma unroll
+            for (int d = 0; d < AD; d++) dst[d] = o[h][d] / z[h] * sigmoidf(gate[d]);
         }
-        __syncthreads();
-        // このスレッドはキー part*4 .. part*4+3 のスコアを計算する
-        float s[4], tmax = -INFINITY;
-        for (int kk = 0; kk < 4; kk++) {
-            int k = part * 4 + kk, j = j0 + k, d = pq - j;
-            bool ok = valid && j <= pq && (!ring || d < EXTENT);
-            float acc = 0.f;
-            if (ok) {
-                for (int e = 0; e < HD; e += 4) {
-                    float4 a = *(const float4*)&Qs[qi][e], b = *(const float4*)&Ks[k][e];
-                    acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
-                }
-                acc = acc * rsqrtf((float)HD) + rel_bias(Rs[qi], rel_proj, d);
-            }
-            s[kk] = ok ? acc : -INFINITY;
-            tmax = fmaxf(tmax, s[kk]);
-        }
-        // 同じクエリの4スレッドは隣り合うレーン
-        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
-        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
-        float mn = fmaxf(m, tmax), f = expf(m - mn), ps = 0.f;
-        for (int kk = 0; kk < 4; kk++) {
-            float p = expf(s[kk] - mn);
-            Ps[qi][part * 4 + kk] = p;
-            ps += p;
-        }
-        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
-        ps += __shfl_xor_sync(0xffffffffu, ps, 2);
-        z = z * f + ps;
-        m = mn;
-        __syncwarp();
-        for (int d = 0; d < 32; d++) o[d] *= f;
-        for (int k = 0; k < KT; k++) {
-            float p = Ps[qi][k];
-            const float* vr = &Vs[k][part * 32];
-            for (int d = 0; d < 32; d++) o[d] += p * vr[d];
-        }
-    }
-    if (valid) {
-        const float* gate = qx + (size_t)(t0 + qi) * QX + GATE_OFF + h * HD + part * 32;
-        float* dst = out + (size_t)(t0 + qi) * 3072 + h * HD + part * 32;
-        for (int d = 0; d < 32; d++) dst[d] = o[d] / z * sigmoidf(gate[d]);
     }
 }
 

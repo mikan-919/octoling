@@ -1258,7 +1258,7 @@ impl Gpu {
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
         } else {
-            k!(self, "attn_tile", (24, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
+            k!(self, "attn_tile", (8, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
         }
         self.gemm(l.wo, b.o, b.a, D, 3072, t);
         let start = ip.is_multiple_of(BLOCK);
