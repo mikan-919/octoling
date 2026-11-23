@@ -503,88 +503,108 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
     for (int h = 0; h < 3; h++) attn_combine(qx, part, ob, kvh * 3 + h, tt);
 }
 
-#define QT 32
-#define KT 16
 // (prefill、長い文脈の global 層) VRAM に送った KV の塊 (位置 b0 から nb 個、kb [nb][1024]、vb 同じ) の分だけ注意を計算し、
 // acc [T][24][HD + 2] の (最大値, 指数和, 重み付き和) に足す。first なら sink から始める。
-// グリッドは (ヘッド, T/32)、128スレッド。スレッドはクエリ tid/4 の、次元 (tid%4)*32 から 32 個を受け持つ
+// グリッドは (KV ヘッド 8, T/AQ)、128スレッド。スレッドはトークン tid/AP の、KV を共有する 3 ヘッドの次元 (tid%AP)*AD から AD 個を受け持つ。
+// q と o をレジスタに置き、共有メモリから読んだ K, V の AD 次元を 3 ヘッドに使い回す (共有メモリの帯域が律速になるため)
+#define AP 4
+#define AD (HD / AP)
+#define AQ (128 / AP)
+#define AK 16
 extern "C" __global__ void attn_blk(const float* qx, const half_t* kb, const half_t* vb, int b0, int nb, const float* rel_proj, float* acc,
                                     const int* posp, int T, int first) {
     PDL();
-    __shared__ __align__(16) float Qs[QT][HD];
-    __shared__ __align__(16) float Ks[KT][HD + 4];
-    __shared__ __align__(16) float Vs[KT][HD];
-    __shared__ float Ps[QT][KT];
-    __shared__ float Rs[QT][NREL];
-    int h = blockIdx.x, kvh = h / 3, tid = threadIdx.x, qi = tid / 4, part = tid % 4;
-    int t0 = blockIdx.y * QT, nq = min(QT, T - t0), p0 = *posp + t0;
-    for (int i = tid; i < QT * HD; i += blockDim.x) {
-        int q = i / HD;
-        Qs[q][i % HD] = q < nq ? qx[(size_t)(t0 + q) * QX + h * HD + i % HD] : 0.f;
-    }
-    for (int i = tid; i < QT * NREL; i += blockDim.x) {
-        int q = i / NREL;
-        Rs[q][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + h * NREL + i % NREL] : 0.f;
-    }
-    int pq = p0 + qi;
+    __shared__ __align__(16) float Ks[AK][HD];
+    __shared__ __align__(16) float Vs[AK][HD];
+    __shared__ float Ps[AQ][3][AK];
+    __shared__ float Rs[AQ][3][NREL];
+    int kvh = blockIdx.x, tid = threadIdx.x, qi = tid / AP, part = tid % AP;
+    int t0 = blockIdx.y * AQ, nq = min(AQ, T - t0), p0 = *posp + t0, pq = p0 + qi;
     bool valid = qi < nq;
-    float* a = acc + ((size_t)(t0 + qi) * 24 + h) * PART;
-    float m, z, o[32];
-    if (first) {
-        m = valid ? qx[(size_t)(t0 + qi) * QX + SINK_OFF + h] : 0.f, z = 1.f;
-        for (int d = 0; d < 32; d++) o[d] = 0.f;
-    } else {
-        m = valid ? a[0] : 0.f, z = valid ? a[1] : 1.f;
-        for (int d = 0; d < 32; d++) o[d] = valid ? a[2 + part * 32 + d] : 0.f;
+    for (int i = tid; i < AQ * 3 * NREL; i += blockDim.x) {
+        int q = i / (3 * NREL), h = i / NREL % 3;
+        Rs[q][h][i % NREL] = q < nq ? qx[(size_t)(t0 + q) * QX + R_OFF + (kvh * 3 + h) * NREL + i % NREL] : 0.f;
+    }
+    __align__(16) float qr[3][AD], o[3][AD];
+    float m[3], z[3];
+    #pragma unroll
+    for (int h = 0; h < 3; h++) {
+        int head = kvh * 3 + h;
+        const float* qh = qx + (size_t)(t0 + qi) * QX;
+        const float* a = acc + ((size_t)(t0 + qi) * 24 + head) * PART;
+        m[h] = !valid ? 0.f : first ? qh[SINK_OFF + head] : a[0];
+        z[h] = !valid || first ? 1.f : a[1];
+        #pragma unroll
+        for (int d = 0; d < AD; d++) {
+            qr[h][d] = valid ? qh[head * HD + part * AD + d] : 0.f;
+            o[h][d] = !valid || first ? 0.f : a[2 + part * AD + d];
+        }
     }
     int jmax = min(b0 + nb - 1, p0 + nq - 1);
-    for (int j0 = b0; j0 <= jmax; j0 += KT) {
+    for (int j0 = b0; j0 <= jmax; j0 += AK) {
         __syncthreads();
-        for (int i = tid; i < KT * HD; i += blockDim.x) {
+        for (int i = tid; i < AK * HD; i += blockDim.x) {
             int k = i / HD, j = j0 + k;
             bool in = j <= jmax;
             Ks[k][i % HD] = in ? h2f(kb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
             Vs[k][i % HD] = in ? h2f(vb[(size_t)(j - b0) * 1024 + kvh * HD + i % HD]) : 0.f;
         }
         __syncthreads();
-        float s[4], tmax = -INFINITY;
-        for (int kk = 0; kk < 4; kk++) {
-            int k = part * 4 + kk, j = j0 + k, d = pq - j;
-            bool ok = valid && j <= jmax && j <= pq;
-            float ac = 0.f;
-            if (ok) {
-                for (int e = 0; e < HD; e += 4) {
-                    float4 x = *(const float4*)&Qs[qi][e], y = *(const float4*)&Ks[k][e];
-                    ac += x.x * y.x + x.y * y.y + x.z * y.z + x.w * y.w;
-                }
-                ac = ac * rsqrtf((float)HD) + rel_bias(Rs[qi], rel_proj, d);
+        float tmax[3] = {-INFINITY, -INFINITY, -INFINITY};
+        for (int k = 0; k < AK; k++) {
+            float ac[3] = {};
+            #pragma unroll
+            for (int e = 0; e < AD; e += 4) {
+                float4 y = *(const float4*)&Ks[k][part * AD + e];
+                #pragma unroll
+                for (int h = 0; h < 3; h++) ac[h] += qr[h][e] * y.x + qr[h][e + 1] * y.y + qr[h][e + 2] * y.z + qr[h][e + 3] * y.w;
             }
-            s[kk] = ok ? ac : -INFINITY;
-            tmax = fmaxf(tmax, s[kk]);
+            int j = j0 + k, d = pq - j;
+            bool ok = valid && j <= jmax && j <= pq;
+            #pragma unroll
+            for (int h = 0; h < 3; h++) {
+                float x = ac[h] + __shfl_xor_sync(0xffffffffu, ac[h], 1);
+                x += __shfl_xor_sync(0xffffffffu, x, 2);
+                float s = ok ? x * rsqrtf((float)HD) + rel_bias(Rs[qi][h], rel_proj, d) : -INFINITY;
+                tmax[h] = fmaxf(tmax[h], s);
+                if (k % AP == part) Ps[qi][h][k] = s;
+            }
         }
-        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 1));
-        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, 2));
-        float mn = fmaxf(m, tmax), f = expf(m - mn), ps = 0.f;
-        for (int kk = 0; kk < 4; kk++) {
-            float p = expf(s[kk] - mn);
-            Ps[qi][part * 4 + kk] = p;
-            ps += p;
+        #pragma unroll
+        for (int h = 0; h < 3; h++) {
+            float mn = fmaxf(m[h], tmax[h]), f = expf(m[h] - mn), zs = 0.f;
+            for (int k = part; k < AK; k += AP) {
+                float p = expf(Ps[qi][h][k] - mn);
+                Ps[qi][h][k] = p;
+                zs += p;
+            }
+            zs += __shfl_xor_sync(0xffffffffu, zs, 1);
+            zs += __shfl_xor_sync(0xffffffffu, zs, 2);
+            z[h] = z[h] * f + zs;
+            m[h] = mn;
+            #pragma unroll
+            for (int d = 0; d < AD; d++) o[h][d] *= f;
         }
-        ps += __shfl_xor_sync(0xffffffffu, ps, 1);
-        ps += __shfl_xor_sync(0xffffffffu, ps, 2);
-        z = z * f + ps;
-        m = mn;
         __syncwarp();
-        for (int d = 0; d < 32; d++) o[d] *= f;
-        for (int k = 0; k < KT; k++) {
-            float p = Ps[qi][k];
-            const float* vr = &Vs[k][part * 32];
-            for (int d = 0; d < 32; d++) o[d] += p * vr[d];
+        for (int k = 0; k < AK; k++) {
+            float p0_ = Ps[qi][0][k], p1 = Ps[qi][1][k], p2 = Ps[qi][2][k];
+            #pragma unroll
+            for (int e = 0; e < AD; e += 4) {
+                float4 v = *(const float4*)&Vs[k][part * AD + e];
+                o[0][e] += p0_ * v.x, o[0][e + 1] += p0_ * v.y, o[0][e + 2] += p0_ * v.z, o[0][e + 3] += p0_ * v.w;
+                o[1][e] += p1 * v.x, o[1][e + 1] += p1 * v.y, o[1][e + 2] += p1 * v.z, o[1][e + 3] += p1 * v.w;
+                o[2][e] += p2 * v.x, o[2][e + 1] += p2 * v.y, o[2][e + 2] += p2 * v.z, o[2][e + 3] += p2 * v.w;
+            }
         }
     }
     if (valid) {
-        if (part == 0) a[0] = m, a[1] = z;
-        for (int d = 0; d < 32; d++) a[2 + part * 32 + d] = o[d];
+        #pragma unroll
+        for (int h = 0; h < 3; h++) {
+            float* a = acc + ((size_t)(t0 + qi) * 24 + kvh * 3 + h) * PART;
+            if (part == 0) a[0] = m[h], a[1] = z[h];
+            #pragma unroll
+            for (int d = 0; d < AD; d++) a[2 + part * AD + d] = o[h][d];
+        }
     }
 }
 

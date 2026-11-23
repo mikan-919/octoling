@@ -1079,7 +1079,7 @@ impl Gpu {
                     result::memcpy_htod_async(st + (j * KB * 2048) as u64, src, self.stream.cu_stream()).unwrap();
                 }
             }
-            k!(self, "attn_blk", (24, t.div_ceil(32)), 128, 0;
+            k!(self, "attn_blk", (8, t.div_ceil(32)), 128, 0;
                 b.qx, st, st + (KB * 2048) as u64, b0 as i32, nb as i32, l.rel_proj, b.acc, b.pos, t as i32, (i == 0) as i32);
         }
         k!(self, "attn_fin", (24, t), 128, 0; b.qx, b.acc, b.o);
