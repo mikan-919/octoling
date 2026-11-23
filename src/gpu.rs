@@ -266,7 +266,7 @@ const XDECAY: f32 = 0.95;
 /// 1層の計算のあとに入れ替える枠の数の上限 (1つ 8.2 MB を PCIe で送る)
 const XFILLS: usize = 2;
 /// 枠を確保したあとに残す VRAM。Windows (WDDM) は VRAM が足りなくなると主記憶へ退避させ、何倍も遅くなる
-const VRAM_MARGIN: usize = 400 << 20;
+const VRAM_MARGIN: usize = 150 << 20;
 
 // CPU との受け渡しの場所の並び (層ごと、バイト)。h と y は f32 x D、route は [n u32, 枠の番号 u64 (+8), 重み f32 x 8 (+16)]、旗は u32
 const HX: usize = 20480;
