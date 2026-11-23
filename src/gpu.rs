@@ -307,10 +307,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 52] = [
+const KERNELS: [&str; 54] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -811,11 +811,106 @@ impl Gpu {
             // (トレース中だけ) グラフを使わないので、全部 CPU で計算する
             return self.htod(self.small.y, &self.cpu.moe(l, &h));
         }
+        // ここで投げるカーネルは CUDA Graph に入らない
+        let capturing = self.capturing.replace(false);
         let routes: Vec<_> = h.chunks(D).map(|x| self.cpu.route(l, x)).collect();
         let ids: Vec<i32> = routes.iter().flat_map(|r| r.0.map(|e| e as i32)).collect();
         let wts: Vec<f32> = routes.iter().flat_map(|r| r.1).collect();
-        let y = self.cpu.moe_batch(l, &h, &ids, &wts, |_| true);
-        self.htod(self.small.y, &y);
+        let (b, li) = (&self.small, il - MXFP8_FROM);
+        let mut xc = self.xc.borrow_mut();
+        self.xc_tick(&mut xc, li);
+        for &e in &ids {
+            xc.cnt[li][e as usize] += 1.0;
+        }
+        // 枠にある expert は GPU、残りは CPU。expert ごとに割り当てをまとめ、重みの読み出しを共有する
+        let (mut on_gpu, mut on_cpu) = ([false; N_EXP], vec![]);
+        let (mut order, mut off, mut u) = (vec![], vec![-1i32; 129], 0);
+        for ex in 0..N_EXP {
+            let asg: Vec<i32> = (0..ids.len()).filter(|&a| ids[a] as usize == ex).map(|a| a as i32).collect();
+            if asg.is_empty() {
+                continue;
+            }
+            match xc.slot[li][ex] {
+                Some(s) if xc.ready[s] => {
+                    on_gpu[ex] = true;
+                    off[u] = order.len() as i32;
+                    off[65 + u] = s as i32;
+                    order.extend(asg);
+                    u += 1;
+                }
+                _ => on_cpu.push(ex),
+            }
+        }
+        off[u] = order.len() as i32;
+        if u > 0 {
+            self.htod(b.order, &order);
+            self.htod(b.off, &off);
+            self.htod(b.wts, &wts);
+            // SAFETY: yd は T*8*D 要素ある。CPU が受け持つ割り当ての行は 0 のまま moe_sum に渡る
+            unsafe { result::memset_d8_async(b.yd, 0, t * TOP_K * D * 4, self.stream.cu_stream()) }.unwrap();
+            k!(self, "moe_up_mx_g", (u * FF * 32).div_ceil(256), 256, 0; xc.base, b.order, b.off, b.h, b.act);
+            k!(self, "moe_down_mx_g", (u * D * 32).div_ceil(256), 256, 0; xc.base, b.order, b.off, b.act, b.yd);
+            k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, t as i32);
+        }
+        // GPU が計算しているあいだに、残りを CPU で計算する
+        let y = self.cpu.moe_batch(l, &h, &ids, &wts, |ex| !on_gpu[ex]);
+        if u > 0 {
+            self.htod(b.a, &y);
+            k!(self, "add", (t * D).div_ceil(256), 256, 0; b.y, b.a, b.y, (t * D) as i32);
+        } else {
+            self.htod(b.y, &y);
+        }
+        if li == N_LAYER - MXFP8_FROM - 1 {
+            self.token_done.record(&self.stream).unwrap();
+        }
+        self.plan_fills(&mut xc, li, on_cpu);
+        self.capturing.set(capturing);
+    }
+
+    /// 1トークン (1回の検証) の最初の層で、選ばれた回数を減らし、届いた枠を使えるようにする
+    fn xc_tick(&self, xc: &mut XCache, li: usize) {
+        if li == 0 {
+            xc.cnt.iter_mut().flatten().for_each(|c| *c *= XDECAY);
+            if !xc.issued.is_empty() && self.fill_done.is_complete() {
+                for s in std::mem::take(&mut xc.issued) {
+                    xc.ready[s] = true;
+                }
+            }
+        }
+    }
+
+    /// CPU で計算した expert のうち選ばれた回数の多いものを、空いた枠か回数の最も少ない枠へ送ると決める。
+    /// 転送は、GPU がまだ枠を読んでいるかもしれないので、token_done のあとにまとめて出す
+    fn plan_fills(&self, xc: &mut XCache, li: usize, mut on_cpu: Vec<usize>) {
+        on_cpu.sort_by(|&a, &c| xc.cnt[li][c].total_cmp(&xc.cnt[li][a]));
+        for &ex in on_cpu.iter().take(XFILLS) {
+            let score = |xc: &XCache, s: usize| xc.owner[s].map_or(-1.0, |(l2, e2)| xc.cnt[l2][e2]);
+            let victim = (0..xc.owner.len()).min_by(|&a, &c| score(xc, a).total_cmp(&score(xc, c))).unwrap();
+            if score(xc, victim) >= xc.cnt[li][ex] {
+                break;
+            }
+            if let Some((l2, e2)) = xc.owner[victim] {
+                xc.slot[l2][e2] = None;
+            }
+            xc.owner[victim] = Some((li, ex));
+            xc.slot[li][ex] = Some(victim);
+            xc.ready[victim] = false;
+            xc.pending.push((li, ex, victim));
+        }
+        if li == N_LAYER - MXFP8_FROM - 1 && !xc.pending.is_empty() {
+            self.copy.wait(&self.token_done).unwrap();
+            for (li, ex, victim) in std::mem::take(&mut xc.pending) {
+                let e = &self.cpu.layers[MXFP8_FROM + li].experts;
+                let mut at = xc.base + (victim * XSLOT) as u64;
+                for (src, size) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)] {
+                    // SAFETY: src はページ固定メモリ。枠は XSLOT バイトある
+                    unsafe { result::memcpy_htod_async(at, &src[ex * size..(ex + 1) * size], self.copy.cu_stream()) }.unwrap();
+                    at += size as u64;
+                }
+                xc.issued.push(victim);
+            }
+            self.fill_done.record(&self.copy).unwrap();
+        }
     }
 
     /// (生成) 1トークン分の CUDA Graph を起動したあとに呼ぶ。グラフは 20〜23層の MoE の入力 h を主記憶に書いて待っているので、
@@ -901,14 +996,7 @@ impl Gpu {
         let l = &self.cpu.layers[MXFP8_FROM + li];
         let (sel, wts) = self.cpu.route(l, h);
         let mut xc = self.xc.borrow_mut();
-        if li == 0 {
-            xc.cnt.iter_mut().flatten().for_each(|c| *c *= XDECAY);
-            if !xc.issued.is_empty() && self.fill_done.is_complete() {
-                for s in std::mem::take(&mut xc.issued) {
-                    xc.ready[s] = true;
-                }
-            }
-        }
+        self.xc_tick(&mut xc, li);
         for &e in &sel {
             xc.cnt[li][e] += 1.0;
         }
@@ -942,36 +1030,7 @@ impl Gpu {
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             std::ptr::write_volatile(self.hx_at::<u32>(li, HX_FY), 1);
         }
-
-        on_cpu.sort_by(|&a, &c| xc.cnt[li][c].total_cmp(&xc.cnt[li][a]));
-        for &ex in on_cpu.iter().take(XFILLS) {
-            let score = |xc: &XCache, s: usize| xc.owner[s].map_or(-1.0, |(l2, e2)| xc.cnt[l2][e2]);
-            let victim = (0..xc.owner.len()).min_by(|&a, &c| score(&xc, a).total_cmp(&score(&xc, c))).unwrap();
-            if score(&xc, victim) >= xc.cnt[li][ex] {
-                break;
-            }
-            if let Some((l2, e2)) = xc.owner[victim] {
-                xc.slot[l2][e2] = None;
-            }
-            xc.owner[victim] = Some((li, ex));
-            xc.slot[li][ex] = Some(victim);
-            xc.ready[victim] = false;
-            xc.pending.push((li, ex, victim));
-        }
-        if li == N_LAYER - MXFP8_FROM - 1 && !xc.pending.is_empty() {
-            self.copy.wait(&self.token_done).unwrap();
-            for (li, ex, victim) in std::mem::take(&mut xc.pending) {
-                let e = &self.cpu.layers[MXFP8_FROM + li].experts;
-                let mut at = xc.base + (victim * XSLOT) as u64;
-                for (src, size) in [(e.w13, W13), (e.s13, S13), (e.w2, W2), (e.s2, S2)] {
-                    // SAFETY: src はページ固定メモリ。枠は XSLOT バイトある
-                    unsafe { result::memcpy_htod_async(at, &src[ex * size..(ex + 1) * size], self.copy.cu_stream()) }.unwrap();
-                    at += size as u64;
-                }
-                xc.issued.push(victim);
-            }
-            self.fill_done.record(&self.copy).unwrap();
-        }
+        self.plan_fills(&mut xc, li, on_cpu);
     }
 
     /// prefill で大きい作業領域と置き場 (expert の先頭の reserved 枠) を使う前に呼ぶ。枠への転送が終わるのを待ち、その枠を空にする

@@ -1327,6 +1327,87 @@ extern "C" __global__ void moe_down_mx(const u8* cache, const u8* route, const f
     if (lane == 0) y[row] = acc;
 }
 
+// (2 <= T <= 8、検証) MXFP8 の1行と cnt 本の入力 xp[t] の内積の部分和を acc[t] に足す。レーンは 16 要素ずつ分担し、重みは1回だけ読む
+__device__ __forceinline__ void mx_row_t(const u8* w, const u8* s, const float* const* xp, int cnt, int n, int lane, float* acc) {
+    for (int c = lane; c < n / 16; c += 32) {
+        uint4 pk = __ldg((const uint4*)(w + c * 16));
+        float sc = __uint_as_float((unsigned)s[c / 2] << 23);
+        unsigned u[4] = {pk.x, pk.y, pk.z, pk.w};
+        float wf[16];
+        #pragma unroll
+        for (int q = 0; q < 4; q++) wf[q * 4] = e4m3(u[q]), wf[q * 4 + 1] = e4m3(u[q] >> 8), wf[q * 4 + 2] = e4m3(u[q] >> 16), wf[q * 4 + 3] = e4m3(u[q] >> 24);
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= cnt) break;
+            const float4* xx = (const float4*)(xp[t] + c * 16);
+            float b = 0.f;
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                float4 v = xx[q];
+                b += wf[q * 4] * v.x + wf[q * 4 + 1] * v.y + wf[q * 4 + 2] * v.z + wf[q * 4 + 3] * v.w;
+            }
+            acc[t] += b * sc;
+        }
+    }
+}
+
+// (検証) 枠にある expert の gate と up に SITU をかける。off[u]..off[u+1] が u 番目の expert の割り当て (order)、off[65 + u] がその枠。
+// 1ワープが1つの expert の行 2i (gate) と 2i+1 (up) を、その expert を選んだ全トークンについて計算する
+extern "C" __global__ void moe_up_mx_g(const u8* cache, const int* order, const int* off, const float* x, float* act) {
+    PDL();
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int u = gw / FF, i = gw % FF;
+    if (u >= 64) return;
+    int slot = off[65 + u];
+    if (slot < 0) return;
+    int beg = off[u], cnt = off[u + 1] - beg, as[8];
+    const float* xp[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        as[c] = c < cnt ? order[beg + c] : 0;
+        xp[c] = x + (size_t)(as[c] / TOPK) * D;
+    }
+    const u8* w13 = cache + (size_t)slot * XSLOT;
+    const u8* s13 = w13 + XW13;
+    size_t row = 2 * (size_t)i;
+    float g[8] = {}, up[8] = {};
+    mx_row_t(w13 + row * D, s13 + row * (D / 32), xp, cnt, D, lane, g);
+    mx_row_t(w13 + (row + 1) * D, s13 + (row + 1) * (D / 32), xp, cnt, D, lane, up);
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        if (c >= cnt) break;
+        float gv = warp_sum(g[c]), uv = warp_sum(up[c]);
+        if (lane == 0) act[(size_t)as[c] * FF + i] = situ(gv, uv);
+    }
+}
+
+// (検証) 枠にある expert の down 射影を yd [T * 8][D] に書く (重みは moe_sum が掛ける)。1ワープが1つの expert の1行を受け持つ
+extern "C" __global__ void moe_down_mx_g(const u8* cache, const int* order, const int* off, const float* act, float* yd) {
+    PDL();
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int u = gw / D, row = gw % D;
+    if (u >= 64) return;
+    int slot = off[65 + u];
+    if (slot < 0) return;
+    int beg = off[u], cnt = off[u + 1] - beg, as[8];
+    const float* xp[8];
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        as[c] = c < cnt ? order[beg + c] : 0;
+        xp[c] = act + (size_t)as[c] * FF;
+    }
+    const u8* w2 = cache + (size_t)slot * XSLOT + XW13 + XS13;
+    const u8* s2 = w2 + XW2;
+    float acc[8] = {};
+    mx_row_t(w2 + (size_t)row * FF, s2 + (size_t)row * (FF / 32), xp, cnt, FF, lane, acc);
+    #pragma unroll
+    for (int c = 0; c < 8; c++) {
+        if (c >= cnt) break;
+        float v = warp_sum(acc[c]);
+        if (lane == 0) yd[(size_t)as[c] * D + row] = v;
+    }
+}
+
 // ---- 生成時の CPU との受け渡し ----
 // 20〜23層の MoE は、1トークン分の CUDA Graph の中で CPU と受け渡す。場所は GPU から直接読み書きできる主記憶で、
 // 旗 (u32) で待ち合わせる。旗は書いた側が 1 にし、待っていた側が 0 に戻す。主記憶の値はキャッシュを通さずに読む
