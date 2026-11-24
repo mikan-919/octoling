@@ -465,6 +465,75 @@ extern "C" __global__ void mv_s6(const u8* __restrict__ w, const float* __restri
             if (lane == 0) y[(size_t)t * rows + row0 + r] = s;
         }
 }
+// ---- (prefill 用) int8 のテンソルコアで計算する Q8 の行列積 ----
+// 活性を 64 要素ごとに int8 に量子化する (Strata と同じ精度)。グリッドは (n, cols / 64 / 8)、256 スレッド (ワープが 64 要素の組 1つ)
+extern "C" __global__ void quant_q8(const float* x, int cols, signed char* q, float* s) {
+    PDL();
+    int r = blockIdx.x, gi = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, G = cols / 64;
+    if (gi >= G) return;
+    float2 v = ((const float2*)(x + (size_t)r * cols + gi * 64))[lane];
+    float mx = fmaxf(fabsf(v.x), fabsf(v.y));
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    float sc = mx > 0.f ? mx / 127.f : 1.f;
+    char2 c = make_char2((signed char)__float2int_rn(v.x / sc), (signed char)__float2int_rn(v.y / sc));
+    ((char2*)(q + (size_t)r * cols + gi * 64))[lane] = c;
+    if (lane == 0) s[(size_t)r * G + gi] = sc;
+}
+
+__device__ __forceinline__ void mma_s8(int c[4], const unsigned a[4], unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Y[t][r] = sc_w[r] * sum_g sc_x[t][g] * sum_{k in g} q_w[r][k] q_x[t][k]。W は Q8、x は quant_q8 で量子化したもの。cols は 64 の倍数。
+// グリッドは (rows/64, T/32)、128スレッド。ブロックは 64行 x 32列 (トークン)、K は 64 (活性の量子化の単位) ずつ共有メモリに載せ、m16n8k32 の int8 mma 2 回で積和する
+#define Q8ST 20 // 共有メモリの行の長さ (u32)。64 バイト + 16 の詰め物
+extern "C" __global__ void gemm_q8i(const float* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ y, int rows, int cols, int T) {
+    PDL();
+    __shared__ __align__(16) unsigned Ws[64 * Q8ST], Xs[32 * Q8ST];
+    __shared__ float sxs[32];
+    int r0 = blockIdx.x * 64, t0 = blockIdx.y * 32, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3, G = cols / 64;
+    // 重みはスレッドあたり 行 tid/2 の 32 バイト、活性は トークン tid/4 の 16 バイト
+    int wr = tid / 2, wc = (tid % 2) * 32, xj = tid / 4, xc = (tid % 4) * 16;
+    bool wok = r0 + wr < rows, xok = t0 + xj < T;
+    const u8* wq = (const u8*)(w + rows);
+    uint4 wv[2], xv;
+    auto fetch = [&](int k0) {
+        #pragma unroll
+        for (int q = 0; q < 2; q++) wv[q] = wok ? __ldg((const uint4*)(wq + (size_t)(r0 + wr) * cols + k0 + wc) + q) : make_uint4(0, 0, 0, 0);
+        xv = xok ? *(const uint4*)(xq + (size_t)(t0 + xj) * cols + k0 + xc) : make_uint4(0, 0, 0, 0);
+    };
+    float acc[4][4] = {};
+    fetch(0);
+    for (int k0 = 0; k0 < cols; k0 += 64) {
+        __syncthreads();
+        *(uint4*)(Ws + wr * Q8ST + wc / 4) = wv[0];
+        *(uint4*)(Ws + wr * Q8ST + wc / 4 + 4) = wv[1];
+        *(uint4*)(Xs + xj * Q8ST + xc / 4) = xv;
+        if (tid < 32) sxs[tid] = t0 + tid < T ? xs[(size_t)(t0 + tid) * G + k0 / 64] : 0.f;
+        __syncthreads();
+        if (k0 + 64 < cols) fetch(k0 + 64);
+        int seg[4][4] = {};
+        #pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            int r = warp * 16 + g, k = kk * 8 + t;
+            unsigned a[4] = {Ws[r * Q8ST + k], Ws[(r + 8) * Q8ST + k], Ws[r * Q8ST + k + 4], Ws[(r + 8) * Q8ST + k + 4]};
+            #pragma unroll
+            for (int j = 0; j < 4; j++) mma_s8(seg[j], a, Xs[(j * 8 + g) * Q8ST + k], Xs[(j * 8 + g) * Q8ST + k + 4]);
+        }
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float x0 = sxs[j * 8 + 2 * t], x1 = sxs[j * 8 + 2 * t + 1];
+            acc[j][0] += (float)seg[j][0] * x0, acc[j][1] += (float)seg[j][1] * x1;
+            acc[j][2] += (float)seg[j][2] * x0, acc[j][3] += (float)seg[j][3] * x1;
+        }
+    }
+    store_y(acc, r0, [&](int r, int c, float v) {
+        if (r < rows && t0 + c < T) y[(size_t)(t0 + c) * rows + r] = v * w[r];
+    });
+}
+
 // 長さ D のベクトル gridDim.x 本をそれぞれ RMS 正規化する。並びは [種類][T][D] で、重みは種類ごとに wstride ずつずれる (0 なら共通)
 extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int wstride, int T) {
     PDL();
@@ -1514,7 +1583,11 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
 // テンソルコアは f16 入力、f32 累積。16要素のブロックの中の並びを、重みと活性の両方で (0, 8, 1, 9, ...) に入れ替えてある (積和は変わらない)。
 // 次の K の分は、今の分の積和の前にレジスタへ読んでおく
 #define SKP 8
-extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows, int cols, const uint4* __restrict__ x, int xdiv, const int* order, const int* off, float* y) {
+// 16要素のブロックの中の並び (0, 8, 1, 9, ...) で、要素 j の位置
+__device__ __forceinline__ int perm16(int j) { int n = j & 15; return (j & ~15) + (n < 8 ? 2 * n : 2 * n - 15); }
+
+// which = 0 (gate/up) では、出力にそのまま SITU と ixd をかけ、down の入力 act [割り当て][FF] (f16_perm の並びの f16) に書く (situ_sk と同じ値)
+extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows, int cols, const uint4* __restrict__ x, int xdiv, const int* order, const int* off, float* y, half_t* act, const float* ixd) {
     PDL();
     __shared__ __align__(16) unsigned Ws[64 * WST / 2], Xs[32 * WST / 2];
     __shared__ int as[32];
@@ -1599,14 +1672,30 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
                 acc[j][2] += seg[j][2] * sc[1], acc[j][3] += seg[j][3] * sc[1];
             }
         }
-        store_y(acc, r0, [&](int r, int c, float v) {
-            if (as[c] >= 0) y[(size_t)as[c] * rows + r] = v * m.g;
-        });
+        if (which == 0) {
+            // 行 2i (gate) と 2i+1 (up) は、g が隣り合うレーン (lane ^ 4) にある
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    float a[2] = {acc[j][2 * h] * m.g, acc[j][2 * h + 1] * m.g}, b[2];
+                    #pragma unroll
+                    for (int q = 0; q < 2; q++) b[q] = __shfl_xor_sync(0xffffffffu, a[q], 4);
+                    if (g & 1) continue;
+                    int jj = (r0 + warp * 16 + g + 8 * h) / 2;
+                    #pragma unroll
+                    for (int q = 0; q < 2; q++) {
+                        int c = j * 8 + 2 * t + q;
+                        if (as[c] >= 0) act[(size_t)as[c] * FF + perm16(jj)] = f2h(situ(a[q], b[q]) * ixd[(size_t)e * FF + jj]);
+                    }
+                }
+        } else {
+            store_y(acc, r0, [&](int r, int c, float v) {
+                if (as[c] >= 0) y[(size_t)as[c] * rows + r] = v * m.g;
+            });
+        }
     }
 }
-
-// 16要素のブロックの中の並び (0, 8, 1, 9, ...) で、要素 j の位置
-__device__ __forceinline__ int perm16(int j) { int n = j & 15; return (j & ~15) + (n < 8 ? 2 * n : 2 * n - 15); }
 
 // (prefill 用) x [n] を f16 にして、16要素のブロックの中を perm16 の並びにする (gemm_sk_grouped の入力)
 extern "C" __global__ void f16_perm(const float* x, half_t* out, int n) {
