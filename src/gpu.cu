@@ -1415,29 +1415,44 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
     const unsigned* xr = ag < 0 ? nullptr : x + (size_t)(which ? ag : g) * (cols / 2);
     int r0 = blockIdx.y * 128 + warp * 32, row = r0 + lane, rec = row >> which, b0r = (row & which) * (cols / 16);
     // k4 (4 の倍数) からの 4 ブロックの位置は sk_blk(nrec, rec, b0r + k4) から連続する
-    uint4 L[2];
-    uint2 H;
-    unsigned SC;
-    float us = 1024.f; // SF4 の値は 2^-10 倍で展開する
-    auto fetch = [&](int k4) {
-        if (fp4) {
-            size_t at = sk_blk(nrec, rec, b0r + k4);
-            L[0] = *(const uint4*)((const uint2*)m.lo + at);
-            L[1] = *(const uint4*)((const uint2*)m.lo + at + 2);
-            SC = *(const unsigned*)((const u8*)m.sc + at);
-        } else {
-            size_t at = sk_blk(nrec, rec, b0r + k4);
-            L[0] = *(const uint4*)((const unsigned*)m.lo + at);
-            if (s3) H = *(const uint2*)((const unsigned short*)(m.lo + (size_t)nrec * 576) + at);
-            us = 16777216.f * sk_scale((const u8*)m.sc, nrec, rec, (b0r + k4) / 4);
-        }
+    // 4 ブロック分の重み、スケールの元の値 (u と D)、活性 (B フラグメント)。2 つ先の分まで読んでおき (c1, c2)、スケールは使うときに計算する
+    struct Chunk {
+        uint4 L[2];
+        uint2 H;
+        unsigned SC, X[8];
+        unsigned short U, SD;
     };
-    fetch(0);
+    auto fetch = [&](int k4) {
+        Chunk c{};
+        if (k4 >= cols / 16) return c;
+        size_t at = sk_blk(nrec, rec, b0r + k4);
+        if (fp4) {
+            c.L[0] = __ldg((const uint4*)((const uint2*)m.lo + at));
+            c.L[1] = __ldg((const uint4*)((const uint2*)m.lo + at + 2));
+            c.SC = __ldg((const unsigned*)((const u8*)m.sc + at));
+        } else {
+            c.L[0] = __ldg((const uint4*)((const unsigned*)m.lo + at));
+            if (s3) c.H = __ldg((const uint2*)((const unsigned short*)(m.lo + (size_t)nrec * 576) + at));
+            int gi = (b0r + k4) / 4;
+            c.U = __ldg((const u8*)m.sc + (size_t)gi * nrec + rec);
+            c.SD = __ldg((const unsigned short*)((const u8*)m.sc + (size_t)nrec * 36) + (size_t)(gi / 4) * nrec + rec);
+        }
+        #pragma unroll
+        for (int i = 0; i < 4; i++) c.X[2 * i] = xr ? __ldg(xr + (k4 + i) * 8 + t) : 0u, c.X[2 * i + 1] = xr ? __ldg(xr + (k4 + i) * 8 + t + 4) : 0u;
+        return c;
+    };
+    Chunk c1 = fetch(0), c2 = fetch(4);
     float acc[2][4] = {};
     half_t* W = Wsm[warp];
     // seg は q * 2^-24 との積なので、スケールに 2^24 を掛けておき、half は 2^-24 倍で引く
     float hq = fp4 ? 0.f : (s3 ? 3.5f : 1.5f) / 16777216.f;
     for (int k4 = 0; k4 < cols / 16; k4 += 4) {
+        Chunk c0 = c1;
+        c1 = c2;
+        c2 = fetch(k4 + 8);
+        const uint4* L = c0.L;
+        uint2 H = c0.H;
+        unsigned SC = c0.SC;
         __syncwarp();
         #pragma unroll
         for (int c = 0; c < 4; c++) {
@@ -1461,16 +1476,14 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
             dst[0] = make_uint4(v[0], v[1], v[2], v[3]);
             dst[1] = make_uint4(v[4], v[5], v[6], v[7]);
         }
-        Ssm[warp][lane] = us;
+        Ssm[warp][lane] = fp4 ? 1024.f : 16777216.f * h2f(c0.SD) * ((float)c0.U / 255.f); // SF4 の値は 2^-10 倍で展開する
         __syncwarp();
-        if (k4 + 4 < cols / 16) fetch(k4 + 4);
         // xs は列ごとの活性の和 (全部 1 の行列との積)。S_K では q * 2^-24 との積から half * (活性の和) を引く
         float seg[2][4] = {}, xs[4] = {};
         const unsigned ones[4] = {0x3c003c00u, 0x3c003c00u, 0x3c003c00u, 0x3c003c00u};
         #pragma unroll
         for (int i = 0; i < 4; i++) {
-            int kb = k4 + i;
-            unsigned b0 = xr ? xr[kb * 8 + t] : 0u, b1 = xr ? xr[kb * 8 + t + 4] : 0u;
+            unsigned b0 = c0.X[2 * i], b1 = c0.X[2 * i + 1];
             if (!fp4) mma_f16(xs, ones, b0, b1);
             #pragma unroll
             for (int h = 0; h < 2; h++) {
@@ -2199,20 +2212,33 @@ extern "C" __global__ void attn_from_host(const float* qx, const float* ho, floa
 // g[j][t][r] = down_j[r] . [rmsnorm(cur_j[t]), rmsnorm(msg_j[t])] (r < 64)。グリッドは (8, n)、256 スレッド
 extern "C" __global__ void ctrl_down_t(const float* cur, int cs, const float* msg, const bf16* w0, const bf16* w1, const bf16* w2, float* g, int T) {
     PDL();
-    __shared__ float kc[8], km[8];
+    __shared__ float kc[8], km[8], part[8][16];
     int jc = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     cur += (size_t)jc * cs;
     msg += (size_t)jc * T * D;
     const bf16* w = jc == 0 ? w0 : jc == 1 ? w1 : w2;
-    for (int t = 0; t < T; t++)
+    // 正規化の係数: 全トークンの入力とメッセージの二乗和を1回の走査で求める
+    float ss[16] = {};
+    for (int i = threadIdx.x; i < D; i += blockDim.x)
         #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            const float* x = (h ? msg : cur) + (size_t)t * D;
-            float ss = 0.f;
-            for (int i = threadIdx.x; i < D; i += blockDim.x) ss += x[i] * x[i];
-            float k = rsqrtf(block_sum(ss) / D + 1e-6f);
-            if (threadIdx.x == 0) (h ? km : kc)[t] = k;
-        }
+        for (int t = 0; t < 8; t++)
+            if (t < T) {
+                float a = cur[(size_t)t * D + i], b = msg[(size_t)t * D + i];
+                ss[2 * t] += a * a, ss[2 * t + 1] += b * b;
+            }
+    #pragma unroll
+    for (int q = 0; q < 16; q++) {
+        float v = warp_sum(ss[q]);
+        if (lane == 0) part[warp][q] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 * T) {
+        float v = 0.f;
+        for (int w = 0; w < 8; w++) v += part[w][threadIdx.x];
+        float k = rsqrtf(v / D + 1e-6f);
+        if (threadIdx.x & 1) km[threadIdx.x / 2] = k;
+        else kc[threadIdx.x / 2] = k;
+    }
     __syncthreads();
     int row = blockIdx.x * 8 + warp;
     const uint4* wr = (const uint4*)(w + (size_t)row * 2 * D);
