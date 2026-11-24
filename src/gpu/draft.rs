@@ -63,7 +63,7 @@ pub struct Drafter {
     w1: P,  // [201024][256] BF16: 前のトークンの幅 256 の埋め込み
     state: P, // [256]: Markov ヘッドの状態
     raw: P,   // [768]: Markov ヘッドの1手の rnn_proj の出力
-    fpart: P, // fold_part の結果 [語彙 / 1024][3]
+    fpart: P, // fold_mv の結果 [語彙 / 64][3]
     fold: Fp8,          // [201024][256] = 本体の出力層 x hidden_out
     fold_b: P,
     pub(super) ctx_end: usize,
@@ -82,7 +82,6 @@ pub struct Drafter {
     mix: P,
     kv: P,
     lat: P,
-    lg: P,
     res: P,
     part: P, // dr_attn の部分結果 [分割][8][24][HD + 2]
     anchor: P, // [4][D]: 文脈の最後の位置の taps
@@ -181,7 +180,7 @@ impl Drafter {
             w1: up.bytes(as_bytes(get("markov_head.markov_w1.weight", &[201024, R]))),
             state: fz(R, &mut up),
             raw: fz(768, &mut up),
-            fpart: fz(VOCAB.div_ceil(1024) * 3, &mut up),
+            fpart: fz(VOCAB.div_ceil(64) * 3, &mut up),
             fold,
             fold_b,
             ctx_end: 0,
@@ -200,7 +199,6 @@ impl Drafter {
             mix: fz(B * D, &mut up),
             kv: fz(B * 2048, &mut up),
             lat: fz(R, &mut up),
-            lg: fz(201024, &mut up),
             res: fz(2 * B, &mut up),
             part: fz((DRAFT_CTX + B).div_ceil(256) * 8 * 24 * (HD + 2), &mut up),
             anchor: fz(4 * D, &mut up),
@@ -278,7 +276,8 @@ impl Drafter {
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
         }
         Self::rms(g, self.x, self.norm, self.hidden, B);
-        g.logits(self.hidden, self.base, B);
+        // 行 0 の logits は使わない
+        g.logits(self.hidden + f4(D), self.base + f4(201024), B - 1);
         let a = self.alpha[3];
         k!(g, "tapmix", D.div_ceil(256), 256, 0; self.anchor, D as i32, a[0], a[1], a[2], a[3], 1i32, self.frnn);
         Self::rms(g, self.frnn, self.markov_norm, self.frnn, 1);
@@ -294,9 +293,8 @@ impl Drafter {
             let at = |j: usize| self.res + (8 * j) as u64;
             k!(g, "markov_raw", 96, 256, 0; self.ctxm + f4(i * 768), self.j01, self.w1, self.state, at(i - 1), self.raw);
             k!(g, "markov_step", 1, 256, 0; self.raw, self.state, self.lat);
-            self.mv(g, &self.fold, self.lat, self.lg, 1);
-            let nb = VOCAB.div_ceil(1024);
-            k!(g, "fold_part", nb, 1024, 0; self.lg, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.fpart);
+            let nb = VOCAB.div_ceil(64);
+            k!(g, "fold_mv", nb, 256, 0; self.fold.w, self.fold.s, self.lat, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.fpart);
             k!(g, "fold_fin", 1, 256, 0; self.fpart, nb as i32, at(i), at(i) + 4);
         }
         let r: Vec<u32> = g.dtoh(self.res, 2 * B);

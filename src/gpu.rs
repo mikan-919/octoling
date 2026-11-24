@@ -372,10 +372,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 73] = [
+const KERNELS: [&str; 72] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_part", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "gemm_q8", "quant_q8", "gemm_q8i", "mv_s6",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "quant_q8", "gemm_q8i", "mv_s6",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
