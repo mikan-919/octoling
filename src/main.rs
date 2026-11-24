@@ -31,8 +31,8 @@ fn main() {
         "chat" if args.len() >= 4 => {
             let mut engine = Engine::new(Gpu::new(model, n_ctx()), dir);
             let e = effort(&serde_json::json!(args.get(4).map_or("high", String::as_str))).unwrap_or_else(|e| panic!("{e}"));
-            let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], reasoning: None }];
-            let prompt = engine.prompt(&msgs, e).unwrap();
+            let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], ..Default::default() }];
+            let prompt = engine.prompt(&msgs, &[], e).unwrap();
             let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
             let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed };
             let t0 = Instant::now();
@@ -41,6 +41,7 @@ fn main() {
                     match piece {
                         Piece::Thinking(t) => print!("\x1b[90m{t}\x1b[0m"),
                         Piece::Text(t) => print!("{t}"),
+                        Piece::Tool(_) => {}
                     }
                     std::io::stdout().flush().is_ok()
                 })

@@ -20,7 +20,7 @@ fn main() {
             s.trim().split(',').map(|t| t.trim().parse().unwrap()).collect()
         })
         .collect();
-    let m = octoling::model::Model::load(octoling::st::SafeTensors::open(dir.join("model-00001-of-00001.safetensors")).unwrap());
+    let m = octoling::model::Model::open(dir);
     let mut g = Gpu::new(m, VRAM_CTX);
     let mut d = Drafter::load(&g, &dir.join("mtp.safetensors"));
     let repeat = std::env::var("OCTO_REPEAT").map_or(1, |s| s.parse().unwrap());

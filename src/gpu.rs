@@ -23,6 +23,8 @@ pub const TMAX: usize = 512;
 
 /// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
 const RING: usize = EXTENT + TMAX;
+/// gemm_sk_grouped で、expert 1つの割り当てを分けるブロックの数 (gpu.cu の SKP と同じ)
+const SKP: usize = 8;
 
 /// 投機的デコードで一度に検証するトークン数の上限
 pub const SPEC_T: usize = 8;
@@ -105,6 +107,21 @@ struct GLayer {
     experts: GExperts,
 }
 
+/// 主記憶に写した文脈。tokens の続きから生成を再開できる
+#[derive(Clone, Default)]
+pub struct KvSnap {
+    pub tokens: Vec<u32>,
+    pub head: bool,     // tools と system までの記録。会話が変わっても使うので、続きの記録に置き換えない
+    fixed: Vec<u8>,     // SWA 層のリング、畳み込みの状態、下書きモデルの文脈
+    rows: Vec<Vec<u8>>, // global 層の K, V (1 位置 2 KB)
+}
+
+impl KvSnap {
+    pub fn bytes(&self) -> usize {
+        self.fixed.len() + self.rows.iter().map(Vec::len).sum::<usize>()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum GExperts {
     Fp4([P; 6]),            // w13, s13, a13, w2, s2, a2
@@ -161,6 +178,7 @@ struct Bufs {
     best: P,       // u64。最後の行の最大の logits の (値, 位置) を並べたもの (softcap が書く)
     route: P,      // 生成の 20〜23層で、GPU で計算する枠 (CPU との受け渡しの route を写したもの、u32 x 12)
     rms: P,        // (T = 1) RMS の逆数: [0..3] 注意の入力、[3] FFN の入力、[4..52] ループ 12 層のメッセージ
+    relb: P,       // (prefill) [T][24][EXTENT]。相対位置のバイアス
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -208,6 +226,7 @@ impl Bufs {
             best: fz(2),
             route: fz(16),
             rms: fz(64),
+            relb: if t > SPEC_T { fz(t * 24 * EXTENT) } else { 0 },
         }
     }
 }
@@ -227,6 +246,7 @@ pub struct Gpu {
     small: Bufs,
     big: Bufs, // expert の枠と同じ場所
     pos: usize,
+    kv_pin: usize, // KV を主記憶へ写すときに経由するページ固定メモリ (PIN バイト)
     ctx: usize,
     // T トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph。(T, 検証か) ごと
     graphs: RefCell<HashMap<(usize, bool), Vec<CudaGraph>>>,
@@ -314,10 +334,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 58] = [
-    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_tile", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
+const KERNELS: [&str; 60] = [
+    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "moe_up_sk", "moe_down_sk", "gemm_sk_grouped", "situ_sk",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "moe_up_sk", "moe_down_sk", "gemm_sk_grouped", "situ_sk", "f16_perm",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -394,10 +414,13 @@ impl Gpu {
                 }
             })
             .collect();
+        // SQ 形式は VRAM に余裕があるので、長い文脈の KV も VRAM に置く
+        let host_kv = n_ctx > VRAM_CTX && cpu.layers.iter().any(|l| l.experts.mx);
         let slots: Vec<GSlot> = (0..N_SLOT)
             .map(|s| {
-                let rows = if GLOBAL_LAYERS.contains(&phys(s)) { n_ctx } else { RING };
-                let ([kc, vc], host) = if rows > VRAM_CTX {
+                let global = GLOBAL_LAYERS.contains(&phys(s));
+                let rows = if global { n_ctx } else { RING };
+                let ([kc, vc], host) = if global && host_kv {
                     let [(kd, kh), (vd, vh)] = [0; 2].map(|_| mapped(rows * 1024 * 2));
                     ([kd, vd], Some([kh, vh]))
                 } else {
@@ -422,7 +445,7 @@ impl Gpu {
         // 先頭の枠は prefill の置き場 (staging、2 * GROUP 枠) と prefill 用の作業領域を兼ねる
         let align = |n: usize| n.div_ceil(256) * 256;
         let mut big_bytes = 0;
-        Bufs::new(TMAX, n_ctx > VRAM_CTX, |n| {
+        Bufs::new(TMAX, host_kv, |n| {
             big_bytes += align(n);
             0
         });
@@ -439,7 +462,7 @@ impl Gpu {
         let xbase = up.zeros(n_slots * XSLOT);
         let staging = [xbase, xbase + (GROUP * XSLOT) as u64];
         let mut at = xbase + (2 * GROUP * XSLOT) as u64;
-        let big = Bufs::new(TMAX, n_ctx > VRAM_CTX, |n| {
+        let big = Bufs::new(TMAX, host_kv, |n| {
             let p = at;
             at += align(n) as u64;
             p
@@ -459,7 +482,7 @@ impl Gpu {
             fill_done: ev(),
             hx: mapped(4 * HX),
             hio: mapped(HIO_LOGITS + VOCAB * 4),
-            ha: if n_ctx > VRAM_CTX { mapped(N_SLOT * HA) } else { (0, 0) },
+            ha: if host_kv { mapped(N_SLOT * HA) } else { (0, 0) },
             host_seq: RefCell::new(vec![]),
             token_done: ev(),
             _ctx: ctx.clone(),
@@ -475,6 +498,8 @@ impl Gpu {
             small,
             big,
             pos: 0,
+            // SAFETY: 確保に失敗したら止まる。解放はしない
+            kv_pin: unsafe { result::malloc_host(PIN, 0) }.expect("ページ固定メモリを確保できない") as usize,
             ctx: n_ctx,
             graphs: RefCell::new(HashMap::new()),
             recording: RefCell::new(vec![]),
@@ -547,6 +572,7 @@ impl Gpu {
         } else if t <= SPEC_T {
             k!(self, "mv_bf16_t", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
         } else {
+            debug_assert!(cols % 64 == 0);
             k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
         }
     }
@@ -594,7 +620,8 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize, seq: P, res: P) {
         let d = dyn_.map_or(-1, |d| d as i32);
-        k!(self, "conv", ch.div_ceil(256), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
+        assert!(t <= 16 || cur != out, "conv: T > CONV_T なら out と cur は別の場所");
+        k!(self, "conv", (ch.div_ceil(256), t.div_ceil(16)), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
     }
 
     /// トークンの埋め込みと先頭の位置を GPU に送る
@@ -764,6 +791,13 @@ impl Gpu {
         self.dtoh::<i32>(self.small.amax, tokens.len()).into_iter().map(|t| t as u32).collect()
     }
 
+    /// 直前の verify の row 行目の logits。温度付きのサンプリングで使う
+    pub fn verify_logits(&self, row: usize) -> Vec<f32> {
+        let x = self.small.logits_all + f4(row * 201024);
+        k!(self, "softcap", VOCAB.div_ceil(256), 256, 0; x, VOCAB as i32, self.small.best, 0u64);
+        self.dtoh(x, VOCAB)
+    }
+
     /// 直前の verify の t トークンのうち、先頭 keep 個だけを残す。畳み込みの状態を戻し、位置を下げる。
     /// KV キャッシュは位置で読むので、捨てた位置は次に書くときに上書きされる
     pub fn rewind(&mut self, keep: usize, t: usize) {
@@ -805,6 +839,87 @@ impl Gpu {
         }
         self.stream.synchronize().unwrap();
         self.pos = 0;
+    }
+
+    /// global 層の KV が主記憶にあるか
+    pub fn host_kv(&self) -> bool {
+        self.slots.iter().any(|s| s.host.is_some())
+    }
+
+    /// 文脈を作る VRAM の場所。(位置で読む global の KV, 丸ごと写す (場所, バイト数))
+    fn kv_regions(&self, d: Option<&Drafter>) -> (Vec<P>, Vec<(P, usize)>) {
+        let (mut rows, mut fixed) = (vec![], vec![]);
+        for (i, s) in self.slots.iter().enumerate() {
+            if GLOBAL_LAYERS.contains(&phys(i)) {
+                rows.extend([s.kc, s.vc]);
+            } else {
+                fixed.extend([(s.kc, RING * 2048), (s.vc, RING * 2048)]);
+            }
+            fixed.extend(s.hist.iter().zip([1024, 1024, D, D]).map(|(&h, ch)| (h, ch * 3 * 4)));
+        }
+        fixed.extend(d.into_iter().flat_map(Drafter::kv_regions));
+        (rows, fixed)
+    }
+
+    fn kv_read(&self, src: P, out: &mut [u8]) {
+        for (i, c) in out.chunks_mut(PIN).enumerate() {
+            // SAFETY: kv_pin は PIN バイトある。転送が終わってから写す
+            unsafe {
+                let pin = std::slice::from_raw_parts_mut(self.kv_pin as *mut u8, c.len());
+                result::memcpy_dtoh_async(pin, src + (i * PIN) as u64, self.stream.cu_stream()).unwrap();
+                self.stream.synchronize().unwrap();
+                par_copy(pin, c.as_mut_ptr());
+            }
+        }
+    }
+
+    fn kv_write(&self, dst: P, src: &[u8]) {
+        for (i, c) in src.chunks(PIN).enumerate() {
+            // SAFETY: kv_pin は PIN バイトある。前の転送が終わってから上書きする
+            unsafe {
+                par_copy(c, self.kv_pin as *mut u8);
+                let pin = std::slice::from_raw_parts(self.kv_pin as *const u8, c.len());
+                result::memcpy_htod_async(dst + (i * PIN) as u64, pin, self.stream.cu_stream()).unwrap();
+            }
+            self.stream.synchronize().unwrap();
+        }
+    }
+
+    /// 今の文脈を s に写す。s.tokens が tokens の先頭なら、global の KV はその続きだけを読む
+    pub fn save_kv(&self, d: Option<&Drafter>, s: &mut KvSnap, tokens: &[u32]) {
+        assert_eq!(tokens.len(), self.pos);
+        let (rows, fixed) = self.kv_regions(d);
+        let from = s.tokens.len() * 2048;
+        s.rows.resize_with(rows.len(), Vec::new);
+        for (v, &p) in s.rows.iter_mut().zip(&rows) {
+            v.resize(self.pos * 2048, 0);
+            self.kv_read(p + from as u64, &mut v[from..]);
+        }
+        s.fixed.resize(fixed.iter().map(|f| f.1).sum(), 0);
+        let mut at = 0;
+        for &(p, n) in &fixed {
+            self.kv_read(p, &mut s.fixed[at..at + n]);
+            at += n;
+        }
+        s.tokens.clear();
+        s.tokens.extend_from_slice(tokens);
+    }
+
+    /// s の文脈に戻す。global の KV のうち、VRAM に同じものがある先頭 keep 位置は送らない
+    pub fn load_kv(&mut self, mut d: Option<&mut Drafter>, s: &KvSnap, keep: usize) {
+        let (rows, fixed) = self.kv_regions(d.as_deref());
+        for (v, &p) in s.rows.iter().zip(&rows) {
+            self.kv_write(p + (keep * 2048) as u64, &v[keep * 2048..]);
+        }
+        let mut at = 0;
+        for &(p, n) in &fixed {
+            self.kv_write(p, &s.fixed[at..at + n]);
+            at += n;
+        }
+        self.pos = s.tokens.len();
+        if let Some(d) = d.as_deref_mut() {
+            d.ctx_end = self.pos;
+        }
     }
 
     fn begin(&self) {
@@ -1078,7 +1193,7 @@ impl Gpu {
         let n = t * TOP_K;
         self.gemm(l.router, b.h, b.rl, 128, D, t);
         k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
-        k!(self, "moe_sort", 1, 32, 0; b.ids, n as i32, b.order, b.off);
+        k!(self, "moe_sort", 1, 1024, 0; b.ids, n as i32, b.order, b.off);
         // SAFETY: yd は T*8*D 要素ある。CPU が受け持つ割り当ての行は 0 のまま moe_sum に渡る
         unsafe { result::memset_d8_async(b.yd, 0, n * D * 4, self.stream.cu_stream()) }.unwrap();
         let ids: Vec<i32> = self.dtoh(b.ids, n);
@@ -1279,16 +1394,18 @@ impl Gpu {
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
         } else {
-            k!(self, "attn_tile", (8, t.div_ceil(32)), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.o, b.pos, ring, ti);
+            k!(self, "rel_table", (t, 24), 256, 0; b.qx, l.rel_proj, b.relb, ti);
+            k!(self, "attn_fa", (8, t.div_ceil(32)), 192, 0; b.qx, s.kc, s.vc, b.relb, b.o, b.pos, ring, ti);
         }
         self.gemm(l.wo, b.o, b.a, D, 3072, t);
         let start = ip.is_multiple_of(BLOCK);
-        self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.a, D, D, D, t, seq(2), if start { 0 } else { b.x });
+        // 出力は、wo が読み終えた b.o に置く
+        self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.o, D, D, D, t, seq(2), if start { 0 } else { b.x });
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む
         if start {
             self.copy(b.blocks + slab(*nb), b.x, t * D);
             *nb += 1;
-            self.copy(b.x, b.a, t * D);
+            self.copy(b.x, b.o, t * D);
         }
 
         let mlp_fused = !msgs;
@@ -1313,11 +1430,14 @@ impl Gpu {
                     k!(self, "moe_up_sk", (t * TOP_K * FF / 4 * 32).div_ceil(256), 256, 0; tab, ixd, b.ids, b.h, b.act, ti);
                     k!(self, "moe_down_sk", (t * D / 2 * 32).div_ceil(256), 256, 0; tab, b.ids, b.wts, b.act, b.y, ti);
                 } else {
+                    // 活性は f16 にして並べ替えておく (置き場は、この後の down が書く yd)
+                    let hh = b.yd;
+                    k!(self, "f16_perm", (t * D).div_ceil(256), 256, 0; b.h, hh, (t * D) as i32);
                     let n = (t * TOP_K) as i32;
-                    k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
-                    k!(self, "gemm_sk_grouped", (2 * FF / 64, 128), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, b.gu);
+                    k!(self, "moe_sort", 1, 1024, 0; b.ids, n, b.order, b.off);
+                    k!(self, "gemm_sk_grouped", (2 * FF / 64, 128 * SKP), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, TOP_K as i32, b.order, b.off, b.gu);
                     k!(self, "situ_sk", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, b.ids, ixd, n);
-                    k!(self, "gemm_sk_grouped", (D / 64, 128), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
+                    k!(self, "gemm_sk_grouped", (D / 64, 128 * SKP), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd);
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }
@@ -1327,7 +1447,7 @@ impl Gpu {
                     k!(self, "moe_down_nvfp4", (t * D / 2 * 32).div_ceil(256), 256, 0; w2, s2, a2, b.ids, b.wts, b.act, b.y, ti);
                 } else {
                     let n = (t * TOP_K) as i32;
-                    k!(self, "moe_sort", 1, 32, 0; b.ids, n, b.order, b.off);
+                    k!(self, "moe_sort", 1, 1024, 0; b.ids, n, b.order, b.off);
                     k!(self, "gemm_nvfp4_grouped", (2 * FF / 64, 128), 128, 0;
                         w13, s13, a13, (2 * FF) as i32, D as i32, b.h, TOP_K as i32, b.order, b.off, b.gu);
                     k!(self, "situ_rows", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, n);
@@ -1354,7 +1474,7 @@ impl Gpu {
             }
             GExperts::Host => self.hybrid_moe(il, t),
         }
-        self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.y, D, D, D, t, seq(3), b.x);
+        self.conv(b.y, D, l.mlp_conv, None, s.hist[3], b.a, D, D, D, t, seq(3), b.x);
         if let Some(j) = TAP_SLOTS.iter().position(|&s| s == slot) {
             self.copy(b.taps + f4(j * b.cap * D), b.x, t * D);
         }
@@ -1456,7 +1576,7 @@ unsafe fn par_copy(src: &[u8], dst: *mut u8) {
 
 mod draft;
 mod host_attn;
-pub use draft::{DRAFT_CTX, Drafter};
+pub use draft::Drafter;
 
 /// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
 fn mapped(bytes: usize) -> (P, usize) {

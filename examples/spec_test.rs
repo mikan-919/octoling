@@ -32,4 +32,16 @@ fn main() {
     got.truncate(24);
     println!("got  {:?}", got);
     println!("{}", if got == want { "MATCH" } else { "MISMATCH" });
+    // KV の退避: 別の文を処理して上書きしてから戻しても、同じトークンが続く
+    g.reset();
+    let mut next = argmax(&g.prefill(&prompt));
+    let mut snap = octoling::gpu::KvSnap::default();
+    g.save_kv(None, &mut snap, &prompt);
+    g.reset();
+    let other: Vec<u32> = prompt.iter().rev().copied().collect();
+    g.prefill(&other);
+    g.load_kv(None, &snap, 0);
+    let mut kv: Vec<u32> = vec![];
+    for _ in 0..24 { kv.push(next); next = argmax(&g.forward(next)); }
+    println!("kv   {}", if kv == want { "MATCH" } else { "MISMATCH" });
 }

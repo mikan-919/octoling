@@ -10,8 +10,9 @@ use crate::st::SafeTensors;
 use std::path::Path;
 
 const B: usize = 8; // ブロックの行数
-/// 下書きモデルが扱う文脈の長さ。global 層の KV を VRAM に置く (gpu.cu の DRAFT_CTX と同じ)
-pub const DRAFT_CTX: usize = 8192;
+/// 下書きモデルの global 層が見る、直近の文脈の位置数 (gpu.cu の DRAFT_CTX と同じ)。これより長い文脈では古い位置を読まない。
+/// 下書きは本体が必ず確かめるので、出力は変わらない
+const DRAFT_CTX: usize = 8192;
 const DRING: usize = 2048; // 局所層の文脈 K/V のリングバッファの行数
 const LOCAL_WIN: usize = 1025; // 局所層が見る文脈の位置数
 /// 下書きの top-1 確率の積がこれを下回ったら下書きを止める。OCTO_TAU で変えられる (既定 0.35 は Xolotl と同じ)
@@ -44,7 +45,8 @@ struct DLayer {
     down: Fp8,
     kc: P,
     vc: P,
-    ring: usize, // 0 なら global 層
+    ring: usize, // 文脈の K/V のリングバッファの行数
+    win: usize,  // 注意が読む直近の位置数
 }
 
 pub struct Drafter {
@@ -59,7 +61,7 @@ pub struct Drafter {
     w1: &'static [u16], // [201024][256]: 前のトークンの幅 256 の埋め込み
     fold: Fp8,          // [201024][256] = 本体の出力層 x hidden_out
     fold_b: P,
-    ctx_end: usize,
+    pub(super) ctx_end: usize,
     x: P,
     h: P,
     qkv: P,
@@ -113,8 +115,7 @@ impl Drafter {
             .map(|l| {
                 let p = |s: &str| format!("layers.{l}.{s}");
                 let v = |s: &str, n: usize, up: &mut Uploader| up.bytes(as_bytes(&bfv(&p(s), &[n])));
-                let ring = if l == 1 { 0 } else { DRING };
-                let rows = if ring == 0 { DRAFT_CTX } else { DRING };
+                let (ring, win) = if l == 1 { (DRAFT_CTX, DRAFT_CTX) } else { (DRING, LOCAL_WIN) };
                 DLayer {
                     attn_norm: v("input_layernorm.weight", D, &mut up),
                     ffn_norm: v("post_attention_layernorm.weight", D, &mut up),
@@ -127,9 +128,10 @@ impl Drafter {
                     wo: fp8(g, &mut up, &[get(&p("self_attn.o_proj.weight"), &[D, 3072])], 3072),
                     gu: fp8(g, &mut up, &[get(&p("mlp.gate_proj.weight"), &[9216, D]), get(&p("mlp.up_proj.weight"), &[9216, D])], D),
                     down: fp8(g, &mut up, &[get(&p("mlp.down_proj.weight"), &[D, 9216])], 9216),
-                    kc: up.zeros(rows * 1024 * 2),
-                    vc: up.zeros(rows * 1024 * 2),
+                    kc: up.zeros(ring * 1024 * 2),
+                    vc: up.zeros(ring * 1024 * 2),
                     ring,
+                    win,
                 }
             })
             .collect();
@@ -210,6 +212,13 @@ impl Drafter {
         self.ctx_end = 0;
     }
 
+    /// 退避と復元で丸ごと写す場所 (場所, バイト数)
+    pub(super) fn kv_regions(&self) -> Vec<(P, usize)> {
+        let mut v: Vec<_> = self.layers.iter().flat_map(|l| [(l.kc, l.ring * 2048), (l.vc, l.ring * 2048)]).collect();
+        v.push((self.anchor, 4 * D * 4));
+        v
+    }
+
     /// 本体が今処理した n トークン (g.taps の行 0..n) を、位置 ctx_end から文脈に加える
     pub fn add_ctx(&mut self, g: &Gpu, n: usize) {
         let (taps, cap) = g.taps(n);
@@ -246,7 +255,7 @@ impl Drafter {
             Self::rms(g, self.x, l.attn_norm, self.h, B);
             self.mv(g, &l.qkv, self.h, self.qkv, B);
             k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32);
-            let lo = if l.ring > 0 { p.saturating_sub(LOCAL_WIN) } else { 0 };
+            let lo = p.saturating_sub(l.win);
             k!(g, "dr_attn", (24, B), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.att);
             self.mv(g, &l.wo, self.att, self.o, B);
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
