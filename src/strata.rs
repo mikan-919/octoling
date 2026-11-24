@@ -138,6 +138,43 @@ impl Pack {
         Ok(Self { sec1: sec(1)?, sec4, trunk, dir })
     }
 
+    /// 名前のテンソル (列は D) が S6_K なら、GPU 向けに並べ直したもの [下位4ビット rows * D/2][上位2ビット rows * D/4][64 要素ごとのスケール D * u / 255 (f32) rows * D/64] を返す
+    pub(crate) fn s6(&self, name: &str) -> Option<&'static [u8]> {
+        let t = self.trunk.get(name)?;
+        if t.fmt != "S6_K" {
+            return None;
+        }
+        let raw = &self.sec1[t.off..t.off + t.bytes];
+        let rows = t.shape[0];
+        let mut out = vec![0u8; rows * (D / 2 + D / 4 + D / 64 * 4)];
+        let (lo, rest) = out.split_at_mut(rows * D / 2);
+        let (hi, sc) = rest.split_at_mut(rows * D / 4);
+        let (lo, hi, sc) = (lo.as_mut_ptr() as usize, hi.as_mut_ptr() as usize, sc.as_mut_ptr() as usize);
+        crate::pool::run(rows.div_ceil(256), &|c| {
+            for r in c * 256..(c * 256 + 256).min(rows) {
+                for s in 0..SB_REC {
+                    let b = &raw[(r * SB_REC + s) * sb_bytes(6)..][..sb_bytes(6)];
+                    let d = f16(u16::from_le_bytes([b[0], b[1]]));
+                    // SAFETY: 行ごとに重ならない範囲に書く
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(b[6..].as_ptr(), (lo + r * D / 2 + s * 128) as *mut u8, 128);
+                        std::ptr::copy_nonoverlapping(b[134..].as_ptr(), (hi + r * D / 4 + s * 64) as *mut u8, 64);
+                        for g in 0..4 {
+                            *((sc + (r * D / 64 + s * 4 + g) * 4) as *mut f32) = d * b[2 + g] as f32 / 255.0;
+                        }
+                    }
+                }
+            }
+        });
+        Some(leak_bytes(out))
+    }
+
+    /// 名前のテンソルが Q8_ROW なら、その生のバイト列 ([行] の f32 スケール; int8 [行][列]) を返す
+    pub(crate) fn q8(&self, name: &str) -> Option<&'static [u8]> {
+        let t = self.trunk.get(name)?;
+        (t.fmt == "Q8_ROW").then(|| &self.sec1[t.off..t.off + t.bytes])
+    }
+
     /// 名前のテンソルを want (BF16 か F32) のバイト列で返す。形式が違えば展開する
     pub(crate) fn tensor(&self, name: &str, want: &str, shape: &[usize]) -> &'static [u8] {
         let t = self.trunk.get(name).unwrap_or_else(|| panic!("{name} がない"));
@@ -282,7 +319,7 @@ impl SkLayer {
             for (m, (code, recs)) in [(b.gu, GU_RECS), (b.dn, DN_RECS)].into_iter().enumerate() {
                 let [lo, hi, sc] = planes(code, recs);
                 tab[e * 2 + m] = [at as u64, (at + lo + hi) as u64, code as u64 | (g[m].to_bits() as u64) << 32];
-                at += (lo + hi + sc).next_multiple_of(8);
+                at += (lo + hi + sc).next_multiple_of(16); // moe_skb が 16 バイトずつ読む
             }
             places.push((start, at - start));
         }
@@ -292,7 +329,7 @@ impl SkLayer {
             let (b, (start, n)) = (&self.bodies[e], places[e]);
             // SAFETY: expert ごとの範囲は重ならず、bytes は run が返るまで生きている
             let out = unsafe { std::slice::from_raw_parts_mut((base + start) as *mut u8, n) };
-            let g = planes(b.gu, GU_RECS).iter().sum::<usize>().next_multiple_of(8);
+            let g = planes(b.gu, GU_RECS).iter().sum::<usize>().next_multiple_of(16);
             let (gu, dn) = out.split_at_mut(g);
             if b.gu == SF4 {
                 let n = GU_RECS * 1152 + GU_RECS * 144;

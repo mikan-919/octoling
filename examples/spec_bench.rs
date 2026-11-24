@@ -21,7 +21,8 @@ fn main() {
         })
         .collect();
     let m = octoling::model::Model::open(dir);
-    let mut g = Gpu::new(m, VRAM_CTX);
+    let ctx = std::env::var("OCTO_CTX").map_or(VRAM_CTX, |s| s.parse().unwrap());
+    let mut g = Gpu::new(m, ctx);
     let mut d = Drafter::load(&g, &dir.join("mtp.safetensors"));
     let repeat = std::env::var("OCTO_REPEAT").map_or(1, |s| s.parse().unwrap());
     for _ in 0..repeat {
@@ -39,7 +40,6 @@ fn main() {
             g.reset();
             d.reset();
             let mut next = argmax(&g.prefill_with(p, |g, c| d.add_ctx(g, c)));
-            let mut anchor = *p.last().unwrap();
             let mut got: Vec<u32> = vec![];
             let (mut steps, mut sent, mut hist) = (0usize, 0usize, [0usize; SPEC_T + 1]);
             let mut ms = [0f64; 3];
@@ -48,7 +48,7 @@ fn main() {
                 let room = (n - got.len()).min(SPEC_T);
                 let mut chunk = vec![next];
                 let t = Instant::now();
-                chunk.extend(d.draft(&g, anchor, next, room - 1));
+                chunk.extend(d.draft(&g, next, room - 1));
                 ms[0] += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let pred = g.verify(&chunk);
@@ -62,7 +62,6 @@ fn main() {
                 d.add_ctx(&g, k);
                 ms[2] += t.elapsed().as_secs_f64();
                 got.extend(&chunk[..k]);
-                anchor = chunk[k - 1];
                 next = pred[k - 1];
                 steps += 1;
                 sent += chunk.len();

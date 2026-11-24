@@ -89,10 +89,10 @@ struct GLayer {
     attn_query: P,
     mlp_query: P,
     msg_query: P,
-    wq: P, // [wq; wr; gate_attn; sink]
-    wk: P, // [wk; k_dyn]
-    wv: P, // [wv; v_dyn]
-    wo: P,
+    wq: M, // [wq; wr; gate_attn; sink]
+    wk: M, // [wk; k_dyn]
+    wv: M, // [wv; v_dyn]
+    wo: M,
     q_clip: P,
     rel_clip: P,
     rel_proj: P,
@@ -120,6 +120,41 @@ impl KvSnap {
     pub fn bytes(&self) -> usize {
         self.fixed.len() + self.rows.iter().map(Vec::len).sum::<usize>()
     }
+}
+
+/// 本体の行列。q8 なら [行ごとの f32 スケール; int8 [rows][cols]] (SQ 形式の Q8_ROW)、そうでなければ BF16
+#[derive(Clone, Copy)]
+struct M {
+    p: P,
+    q8: bool,
+}
+
+/// Q8 の行列のバイト列を作る。Q8_ROW でない部分 (sink や k_dyn など) は行ごとに量子化する。
+/// 64 行より大きい部分が Q8_ROW でなければ (精度のために BF16 で置かれた行列) None を返し、BF16 のままにする
+fn q8_mat(parts: &[(Option<&'static [u8]>, W)], cols: usize) -> Option<Vec<u8>> {
+    if parts.iter().any(|&(q, w)| q.is_none() && w.len() / cols > 64) {
+        return None;
+    }
+    let (mut sc, mut q) = (vec![], vec![]);
+    for &(raw, w) in parts {
+        let rows = w.len() / cols;
+        match raw {
+            Some(r) => {
+                sc.extend_from_slice(&r[..rows * 4]);
+                q.extend_from_slice(&r[rows * 4..rows * 4 + rows * cols]);
+            }
+            None => {
+                for row in w.chunks(cols) {
+                    let f = model::bf_vec(row);
+                    let s = f.iter().fold(0f32, |m, x| m.max(x.abs())) / 127.0;
+                    sc.extend_from_slice(&s.to_le_bytes());
+                    q.extend(f.iter().map(|&x| if s > 0.0 { (x / s).round() as i8 as u8 } else { 0 }));
+                }
+            }
+        }
+    }
+    sc.extend(q);
+    Some(sc)
 }
 
 #[derive(Clone, Copy)]
@@ -240,6 +275,7 @@ pub struct Gpu {
     layers: Vec<GLayer>,
     slots: Vec<GSlot>,
     unembed: P,
+    unembed_s6: P, // (SQ 形式) 出力層の S6_K を並べ直したもの。0 なら unembed (BF16) を使う
     norm: P,
     output_query: P,
     msg_queries: P, // ループの 12 層の msg_query を並べたもの [12][4][D]
@@ -334,10 +370,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 60] = [
+const KERNELS: [&str; 68] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "silu_mul", "concat_frnn", "add_bias_rows", "fold_finish", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "moe_up_sk", "moe_down_sk", "gemm_sk_grouped", "situ_sk", "f16_perm",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_part", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "gemm_q8", "mv_s6",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -372,13 +408,17 @@ impl Gpu {
         let f32s = |v: &[f32], up: &mut Uploader| up.bytes(as_bytes(v));
         let bfs = |parts: &[W], up: &mut Uploader| up.bytes(as_bytes(&parts.concat()));
         let flat = |c: &[[f32; 4]]| c.iter().flatten().copied().collect::<Vec<f32>>();
+        let mat = |parts: &[(Option<&'static [u8]>, W)], cols: usize, up: &mut Uploader| match q8_mat(parts, cols) {
+            Some(b) => M { p: up.bytes(&b), q8: true },
+            None => M { p: bfs(&parts.iter().map(|p| p.1).collect::<Vec<W>>(), up), q8: false },
+        };
         let layers = cpu
             .layers
             .iter()
             .map(|l: &Layer| {
                 let norms: Vec<f32> = if l.global { l.norms.iter().flat_map(|&w| model::bf_vec(w)).collect() } else { model::bf_vec(l.norms[0]) };
-                let wk: Vec<W> = [Some(l.wk), l.k_dyn].into_iter().flatten().collect();
-                let wv: Vec<W> = [Some(l.wv), l.v_dyn].into_iter().flatten().collect();
+                let wk: Vec<_> = [Some((l.q8[3], l.wk)), l.k_dyn.map(|w| (None, w))].into_iter().flatten().collect();
+                let wv: Vec<_> = [Some((l.q8[4], l.wv)), l.v_dyn.map(|w| (None, w))].into_iter().flatten().collect();
                 let e = &l.experts;
                 GLayer {
                     global: l.global,
@@ -386,10 +426,10 @@ impl Gpu {
                     attn_query: l.attn_query.map_or(0, |q| f32s(q, &mut up)),
                     mlp_query: f32s(l.mlp_query, &mut up),
                     msg_query: l.msg_query.as_ref().map_or(0, |q| f32s(q, &mut up)),
-                    wq: bfs(&[l.wq, l.wr, l.gate_attn, l.sink], &mut up),
-                    wk: bfs(&wk, &mut up),
-                    wv: bfs(&wv, &mut up),
-                    wo: up.bytes(as_bytes(l.wo)),
+                    wq: mat(&[(l.q8[0], l.wq), (l.q8[1], l.wr), (l.q8[2], l.gate_attn), (None, l.sink)], D, &mut up),
+                    wk: mat(&wk, D, &mut up),
+                    wv: mat(&wv, D, &mut up),
+                    wo: mat(&[(l.q8[5], l.wo)], 3072, &mut up),
                     q_clip: f32s(&model::bf_vec(l.q_clip), &mut up),
                     rel_clip: f32s(&model::bf_vec(l.rel_clip), &mut up),
                     rel_proj: f32s(&model::bf_vec(l.rel_proj), &mut up),
@@ -437,6 +477,7 @@ impl Gpu {
             .collect();
         let small = Bufs::new(SPEC_T, false, |n| up.zeros(n));
         let unembed = up.bytes(as_bytes(cpu.unembed));
+        let unembed_s6 = cpu.unembed_s6.map_or(0, |b| up.bytes(b));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
         let mq: Vec<f32> = cpu.layers[CORE.0..CORE.1].iter().flat_map(|l| l.msg_query.as_ref().unwrap().iter().copied()).collect();
@@ -492,6 +533,7 @@ impl Gpu {
             layers,
             slots,
             unembed,
+            unembed_s6,
             norm,
             output_query,
             msg_queries,
@@ -574,6 +616,29 @@ impl Gpu {
         } else {
             debug_assert!(cols % 64 == 0);
             k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
+        }
+    }
+
+    /// 出力層: y[t] = unembed x[t] (語彙 201024 行)。SQ 形式で t <= SPEC_T なら S6_K のまま計算する
+    pub(crate) fn logits(&self, x: P, y: P, t: usize) {
+        if self.unembed_s6 != 0 && t <= SPEC_T {
+            k!(self, "mv_s6", (201024 / 4 * 32usize).div_ceil(256), 256, 0; self.unembed_s6, x, y, 201024i32, t as i32);
+        } else {
+            self.gemm(self.unembed, x, y, 201024, D, t);
+        }
+    }
+
+    /// 本体の行列 m で Y[t] = W X[t]。Q8 なら T に応じて Q8 のカーネルを使う
+    fn gemm_m(&self, m: M, x: P, y: P, rows: usize, cols: usize, t: usize) {
+        if !m.q8 {
+            self.gemm(m.p, x, y, rows, cols, t);
+        } else if t == 1 {
+            k!(self, "mv_q8", (rows * 32).div_ceil(256), 256, 0; m.p, x, y, rows as i32, cols as i32);
+        } else if t <= SPEC_T {
+            debug_assert!(rows.is_multiple_of(4));
+            k!(self, "mv_q8_t", (rows / 4 * 32).div_ceil(256), 256, 0; m.p, x, y, rows as i32, cols as i32, t as i32);
+        } else {
+            k!(self, "gemm_q8", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, x, y, rows as i32, cols as i32, t as i32);
         }
     }
 
@@ -674,7 +739,7 @@ impl Gpu {
     fn run(&self, t: usize, verify: bool) {
         let key = (t, verify);
         let small = t <= SPEC_T && !model::tracing();
-        if small && let Some(gs) = self.graphs.borrow().get(&key) {
+        if small && !stamping() && let Some(gs) = self.graphs.borrow().get(&key) {
             if t == 1 {
                 gs[0].launch().unwrap();
                 self.serve_host();
@@ -740,19 +805,7 @@ impl Gpu {
         self.inputs(&[token]);
         self.run(1, false);
         if stamping() {
-            // (名前, 合計の µs, 回数)。区切りの先頭 (begin) は CPU の時間を含むので数えない
-            let names = self.stamps.borrow();
-            let t: Vec<u64> = self.dtoh(self.stamp_buf, names.len());
-            let mut agg: Vec<(&str, f64, usize)> = vec![];
-            for i in (1..names.len()).filter(|&i| names[i] != "begin") {
-                let us = (t[i] - t[i - 1]) as f64 / 1e3;
-                match agg.iter_mut().find(|a| a.0 == names[i]) {
-                    Some(a) => (a.1, a.2) = (a.1 + us, a.2 + 1),
-                    None => agg.push((names[i], us, 1)),
-                }
-            }
-            agg.sort_by(|a, b| b.1.total_cmp(&a.1));
-            eprintln!("stamp {}", agg.iter().map(|a| format!("{}:{:.0}us/{}", a.0, a.1, a.2)).collect::<Vec<_>>().join(" "));
+            self.report_stamps("stamp");
         }
         self.pos += 1;
         let best = if self.host_io(1) {
@@ -763,6 +816,23 @@ impl Gpu {
             self.dtoh::<u64>(self.small.best, 1)[0]
         };
         0xffff_ffff - best as u32
+    }
+
+    /// (OCTO_STAMP) 直前に再生したグラフの、カーネルの種類別の時間を出す
+    fn report_stamps(&self, label: &str) {
+        // (名前, 合計の µs, 回数)。区切りの先頭 (begin) は CPU の時間を含むので数えない
+        let names = self.stamps.borrow();
+        let t: Vec<u64> = self.dtoh(self.stamp_buf, names.len());
+        let mut agg: Vec<(&str, f64, usize)> = vec![];
+        for i in (1..names.len()).filter(|&i| names[i] != "begin") {
+            let us = (t[i] - t[i - 1]) as f64 / 1e3;
+            match agg.iter_mut().find(|a| a.0 == names[i]) {
+                Some(a) => (a.1, a.2) = (a.1 + us, a.2 + 1),
+                None => agg.push((names[i], us, 1)),
+            }
+        }
+        agg.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("{label} {}", agg.iter().map(|a| format!("{}:{:.0}us/{}", a.0, a.1, a.2)).collect::<Vec<_>>().join(" "));
     }
 
     /// プロンプトを TMAX トークンずつまとめて処理し、最後のトークンの logits を返す。
@@ -787,6 +857,10 @@ impl Gpu {
         assert!(tokens.len() <= SPEC_T);
         self.inputs(tokens);
         self.run(tokens.len(), true);
+        if stamping() {
+            self.stream.synchronize().unwrap();
+            self.report_stamps(&format!("verify{}", tokens.len()));
+        }
         self.pos += tokens.len();
         self.dtoh::<i32>(self.small.amax, tokens.len()).into_iter().map(|t| t as u32).collect()
     }
@@ -1297,10 +1371,10 @@ impl Gpu {
         k!(self, "rmsnorm", t, 256, 0; b.h, self.norm, normed, 0i32, t as i32);
         if verify {
             // softcap は単調なので、最大の位置は変わらない
-            self.gemm(self.unembed, normed, b.logits_all, 201024, D, t);
+            self.logits(normed, b.logits_all, t);
             k!(self, "argmax_rows", t, 1024, 0; b.logits_all, 201024i32, VOCAB as i32, b.amax);
         } else {
-            self.gemm(self.unembed, normed + f4((t - 1) * D), b.logits, 201024, D, 1);
+            self.logits(normed + f4((t - 1) * D), b.logits, 1);
             // SAFETY: best は 8 バイトある
             unsafe { result::memset_d8_async(b.best, 0, 8, self.stream.cu_stream()) }.unwrap();
             let host = if io { self.hio.0 + HIO_LOGITS as u64 } else { 0 };
@@ -1361,13 +1435,16 @@ impl Gpu {
         let (xq, xk, xv) = if separate { (b.inp, b.inp + slab(1), b.inp + slab(2)) } else { (b.inp, b.inp, b.inp) };
 
         let nk = if l.global { 1024 + 32 } else { 1024 };
-        if t == 1 {
+        if t == 1 && l.wq.q8 && l.wk.q8 && l.wv.q8 {
+            k!(self, "mv3_q8", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
+                l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32);
+        } else if t == 1 && !l.wq.q8 && !l.wk.q8 && !l.wv.q8 {
             k!(self, "mv3_bf16", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
-                l.wq, xq, b.qx, QX as i32, l.wk, xk, b.kx, nk as i32, l.wv, xv, b.vx, nk as i32);
+                l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32);
         } else {
-            self.gemm(l.wq, xq, b.qx, QX, D, t);
-            self.gemm(l.wk, xk, b.kx, nk, D, t);
-            self.gemm(l.wv, xv, b.vx, nk, D, t);
+            self.gemm_m(l.wq, xq, b.qx, QX, D, t);
+            self.gemm_m(l.wk, xk, b.kx, nk, D, t);
+            self.gemm_m(l.wv, xv, b.vx, nk, D, t);
         }
         let dyn_ = l.global.then_some(1024);
         // 小さいバッチ (生成と検証) では、外れた下書きを捨てられるよう畳み込みの入力を残す
@@ -1389,7 +1466,6 @@ impl Gpu {
             k!(self, "wait_host", 1, 32, 0; at(HA_FO), 0u64, 0u64, 0i32);
             k!(self, "attn_from_host", 12, 256, 0; b.qx, at(HA_O), b.o);
         } else if t <= SPEC_T {
-            // 検証のバッチは、主記憶の KV も GPU から直接読む
             k!(self, "attn_part", (8, 32 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
@@ -1397,7 +1473,7 @@ impl Gpu {
             k!(self, "rel_table", (t, 24), 256, 0; b.qx, l.rel_proj, b.relb, ti);
             k!(self, "attn_fa", (8, t.div_ceil(32)), 192, 0; b.qx, s.kc, s.vc, b.relb, b.o, b.pos, ring, ti);
         }
-        self.gemm(l.wo, b.o, b.a, D, 3072, t);
+        self.gemm_m(l.wo, b.o, b.a, D, 3072, t);
         let start = ip.is_multiple_of(BLOCK);
         // 出力は、wo が読み終えた b.o に置く
         self.conv(b.a, D, l.attn_conv, None, s.hist[2], b.o, D, D, D, t, seq(2), if start { 0 } else { b.x });
@@ -1426,14 +1502,16 @@ impl Gpu {
         }
         match l.experts {
             GExperts::Sk { tab, ixd } => {
+                // 活性は f16 にして並べ替えておく (置き場は、この後の down が書く yd)
+                let hh = b.yd;
+                let n = (t * TOP_K) as i32;
+                k!(self, "f16_perm", (t * D).div_ceil(256), 256, 0; b.h, hh, (t * D) as i32);
                 if t <= SPEC_T {
-                    k!(self, "moe_up_sk", (t * TOP_K * FF / 4 * 32).div_ceil(256), 256, 0; tab, ixd, b.ids, b.h, b.act, ti);
-                    k!(self, "moe_down_sk", (t * D / 2 * 32).div_ceil(256), 256, 0; tab, b.ids, b.wts, b.act, b.y, ti);
+                    k!(self, "moe_skb", (t * TOP_K, 2 * FF / 128), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, b.ids, ti, b.gu);
+                    k!(self, "situ_sk", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, b.ids, ixd, n);
+                    k!(self, "moe_skb", (t * TOP_K, D / 128), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, b.ids, ti, b.yd);
+                    k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 } else {
-                    // 活性は f16 にして並べ替えておく (置き場は、この後の down が書く yd)
-                    let hh = b.yd;
-                    k!(self, "f16_perm", (t * D).div_ceil(256), 256, 0; b.h, hh, (t * D) as i32);
-                    let n = (t * TOP_K) as i32;
                     k!(self, "moe_sort", 1, 1024, 0; b.ids, n, b.order, b.off);
                     k!(self, "gemm_sk_grouped", (2 * FF / 64, 128 * SKP), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, TOP_K as i32, b.order, b.off, b.gu);
                     k!(self, "situ_sk", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, b.ids, ixd, n);

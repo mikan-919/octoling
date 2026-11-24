@@ -220,10 +220,9 @@ impl Engine {
                     break "stop";
                 }
                 let room = (p.max_tokens - n).min(max_ctx - self.gpu.pos()).min(SPEC_T);
-                let anchor = *self.cached.last().unwrap();
                 let mut chunk = vec![next];
                 let tm = std::time::Instant::now();
-                chunk.extend(self.draft.as_mut().unwrap().draft(&self.gpu, anchor, next, room - 1));
+                chunk.extend(self.draft.as_mut().unwrap().draft(&self.gpu, next, room - 1));
                 t_draft += tm.elapsed().as_secs_f64();
                 let tm = std::time::Instant::now();
                 let amax = self.gpu.verify(&chunk);

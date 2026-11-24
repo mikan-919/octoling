@@ -76,6 +76,8 @@ pub(crate) struct Layer {
     pub(crate) experts: Experts,
     pub(crate) ctrl: Option<[Ctrl; 4]>, // q, k, v, mlp
     pub(crate) msg_query: Option<Vec<f32>>, // [4, D]
+    /// (SQ 形式) wq, wr, gate_attn, wk, wv, wo が Q8_ROW なら、その生のバイト列。GPU は BF16 に広げずに使う
+    pub(crate) q8: [Option<&'static [u8]>; 6],
 }
 
 pub struct Model {
@@ -83,6 +85,8 @@ pub struct Model {
     pub(crate) embed_norm: W,
     pub(crate) norm: W,
     pub(crate) unembed: W,
+    /// (SQ 形式) 出力層の S6_K を並べ直したもの (Pack::s6)。GPU の T <= 8 の logits はこれで計算する
+    pub(crate) unembed_s6: Option<&'static [u8]>,
     pub(crate) output_query: &'static [f32],
     pub(crate) layers: Vec<Layer>,
 }
@@ -162,7 +166,7 @@ impl Model {
                 }
             }
         };
-        Self::build(&get, &experts)
+        Self::build(&get, &experts, &|_| None, None)
     }
 
     /// dir の公式の重み (safetensors) か、なければ .strata を読む
@@ -177,10 +181,11 @@ impl Model {
             .find(|p| p.extension().is_some_and(|x| x == "strata"))
             .unwrap_or_else(|| panic!("{} に safetensors も .strata もない", dir.display()));
         let pack = crate::strata::Pack::open(&pack).unwrap_or_else(|e| panic!("{e}"));
-        Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i))
+        let pack: &'static crate::strata::Pack = Box::leak(Box::new(pack));
+        Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i), &|name| pack.q8(name), pack.s6("model.llm.unembed.weight"))
     }
 
-    fn build(get: &dyn Fn(&str, &str, &[usize]) -> &'static [u8], experts: &dyn Fn(usize) -> Experts) -> Self {
+    fn build(get: &dyn Fn(&str, &str, &[usize]) -> &'static [u8], experts: &dyn Fn(usize) -> Experts, q8: &dyn Fn(&str) -> Option<&'static [u8]>, unembed_s6: Option<&'static [u8]>) -> Self {
         let bf = |name: &str, shape: &[usize]| -> W { cast(get(name, "BF16", shape)) };
         let f32s = |name: &str, shape: &[usize]| -> &'static [f32] { cast(get(name, "F32", shape)) };
         let bf_f32 = |name: &str, shape: &[usize]| -> Vec<f32> { bf(name, shape).iter().map(|&x| bf16(x)).collect() };
@@ -237,6 +242,7 @@ impl Model {
                     wr: bf(&n("attn.wr_du.weight"), &[N_REL * N_HEAD, D]),
                     gate_attn: bf(&n("attn.gate_attn.weight"), &[N_HEAD * HD, D]),
                     sink: bf(&n("attn.attn_sink_proj.weight"), &[N_HEAD, D]),
+                    q8: ["attn.wq_du.weight", "attn.wr_du.weight", "attn.gate_attn.weight", "attn.wk_dv.weight", "attn.wv_dv.weight", "attn.wo_ud.weight"].map(|s| q8(&n(s))),
                     q_clip: bf(&n("attn.q_l2_clip.scale"), &[N_HEAD, HD]),
                     rel_clip: bf(&n("attn.rel_l2_clip.scale"), &[N_HEAD, N_REL]),
                     rel_proj: bf(&n("attn.rel_logits_proj.proj"), &[N_REL, EXTENT]),
@@ -266,6 +272,7 @@ impl Model {
             embed_norm: bf("model.llm.embed_norm.weight", &[D]),
             norm: bf("model.llm.norm.weight", &[D]),
             unembed: bf("model.llm.unembed.weight", &[201024, D]),
+            unembed_s6,
             output_query: f32s("model.llm.attn_res.output_query", &[D]),
             layers,
         }

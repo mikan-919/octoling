@@ -1,8 +1,10 @@
 //! 下書きモデル DSpark (公式の mtp.safetensors)。投機的デコードで、本体が次に選ぶトークンの先を推測する。
 //! 構造は Xolotl (MIT、Indras-Mirror/Xolotl の src/program/inkling_dspark.cpp) の説明と実装に合わせた:
 //!   文脈: 本体の4つの層出力 (taps) を層ごとの重み (softmax(fuse_weight)) で混ぜ、正規化して文脈の K/V にする
-//!   ブロック: 行 0 = 直前のトークンの埋め込み、行 1..7 = mask_embed。位置 P..P+7、3層の注意 (文脈 + ブロック、マスクなし) と MLP
-//!   出力: 正規化した隠れ状態を本体の出力層に通したものを土台に、幅 256 の Markov ヘッドで1トークンずつ選ぶ
+//!   ブロック: 行 0 = 本体が選んだがまだ処理していないトークン (位置 P)、行 1..7 = mask_embed。位置 P..P+7、文脈は位置 P より前。
+//!   3層の注意 (文脈 + ブロック、マスクなし) と MLP
+//!   出力: 行 i (1..7) が位置 P+i のトークン。正規化した隠れ状態を本体の出力層に通したものを土台に、幅 256 の Markov ヘッドで1トークンずつ選ぶ
+//!   (llama.cpp の src/models/dspark.cpp の Inkling2 と同じ並び)
 //! 重みは FP8 にして VRAM に置く。下書きは本体が必ず確かめるので、精度は受け入れ率にしか効かない。
 
 use super::*;
@@ -57,8 +59,11 @@ pub struct Drafter {
     alpha: [[f32; 4]; 4],
     jctx: P,
     jb: P,
-    j01: Vec<f32>,      // [768][512]: rnn_proj の、状態と前のトークンに掛かる列
-    w1: &'static [u16], // [201024][256]: 前のトークンの幅 256 の埋め込み
+    j01: P, // [768][512] f32: rnn_proj の、状態と前のトークンに掛かる列
+    w1: P,  // [201024][256] BF16: 前のトークンの幅 256 の埋め込み
+    state: P, // [256]: Markov ヘッドの状態
+    raw: P,   // [768]: Markov ヘッドの1手の rnn_proj の出力
+    fpart: P, // fold_part の結果 [語彙 / 1024][3]
     fold: Fp8,          // [201024][256] = 本体の出力層 x hidden_out
     fold_b: P,
     pub(super) ctx_end: usize,
@@ -79,6 +84,7 @@ pub struct Drafter {
     lat: P,
     lg: P,
     res: P,
+    part: P, // dr_attn の部分結果 [分割][8][24][HD + 2]
     anchor: P, // [4][D]: 文脈の最後の位置の taps
 }
 
@@ -152,7 +158,7 @@ impl Drafter {
         g.stream.synchronize().unwrap();
 
         let rnn = get("markov_head.rnn_proj.weight", &[768, 5120]);
-        let j01 = (0..768).flat_map(|o| model::bf_vec(&rnn[o * 5120..][..512])).collect();
+        let j01: Vec<f32> = (0..768).flat_map(|o| model::bf_vec(&rnn[o * 5120..][..512])).collect();
         let jctx: Vec<u16> = (0..768).flat_map(|o| rnn[o * 5120 + 512..][..4608].iter().copied()).collect();
         let fuse = bfv("fuse_weight", &[4, 4]);
         let alpha = std::array::from_fn(|r| {
@@ -171,8 +177,11 @@ impl Drafter {
             alpha,
             jctx: up.bytes(as_bytes(&jctx)),
             jb: up.bytes(as_bytes(&bfv("markov_head.rnn_proj.bias", &[768]))),
-            j01,
-            w1: get("markov_head.markov_w1.weight", &[201024, R]),
+            j01: up.bytes(as_bytes(&j01)),
+            w1: up.bytes(as_bytes(get("markov_head.markov_w1.weight", &[201024, R]))),
+            state: fz(R, &mut up),
+            raw: fz(768, &mut up),
+            fpart: fz(VOCAB.div_ceil(1024) * 3, &mut up),
             fold,
             fold_b,
             ctx_end: 0,
@@ -192,7 +201,8 @@ impl Drafter {
             kv: fz(B * 2048, &mut up),
             lat: fz(R, &mut up),
             lg: fz(201024, &mut up),
-            res: fz(2, &mut up),
+            res: fz(2 * B, &mut up),
+            part: fz((DRAFT_CTX + B).div_ceil(256) * 8 * 24 * (HD + 2), &mut up),
             anchor: fz(4 * D, &mut up),
         };
         let (free, _) = result::mem_get_info().unwrap();
@@ -201,7 +211,7 @@ impl Drafter {
     }
 
     fn mv(&self, g: &Gpu, m: &Fp8, x: P, y: P, t: usize) {
-        k!(g, "mv_fp8", (m.rows * 32).div_ceil(256), 256, 0; m.w, m.s, x, y, m.rows as i32, m.cols as i32, t as i32);
+        k!(g, "mv_fp8", (m.rows / 4 * 32).div_ceil(256), 256, 0; m.w, m.s, x, y, m.rows as i32, m.cols as i32, t as i32);
     }
 
     fn rms(g: &Gpu, x: P, w: P, y: P, t: usize) {
@@ -238,14 +248,14 @@ impl Drafter {
         self.ctx_end += n;
     }
 
-    /// 文脈の最後のトークン anchor と、本体が選んだ次のトークン next から、next の後に続くトークンを推測する。
+    /// 本体が選んだ次のトークン next (文脈の続き) から、next の後に続くトークンを推測する。
     /// 推測の top-1 確率の積が TAU を下回るか、max 個になったら止める
-    pub fn draft(&mut self, g: &Gpu, anchor: u32, next: u32, max: usize) -> Vec<u32> {
+    pub fn draft(&mut self, g: &Gpu, next: u32, max: usize) -> Vec<u32> {
         if max == 0 {
             return vec![];
         }
         let p = self.ctx_end;
-        let mut xb = model::bf_row(g.cpu.embed, anchor as usize, D);
+        let mut xb = model::bf_row(g.cpu.embed, next as usize, D);
         model::rmsnorm(&mut xb, Some(g.cpu.embed_norm));
         for _ in 1..B {
             xb.extend_from_slice(&self.mask);
@@ -256,7 +266,9 @@ impl Drafter {
             self.mv(g, &l.qkv, self.h, self.qkv, B);
             k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32);
             let lo = p.saturating_sub(l.win);
-            k!(g, "dr_attn", (24, B), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.att);
+            let ns = (p - lo + B).div_ceil(256);
+            k!(g, "dr_attn", (8, ns), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.part);
+            k!(g, "dr_fin", (24, B), 128, 0; self.part, ns as i32, self.att);
             self.mv(g, &l.wo, self.att, self.o, B);
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
             Self::rms(g, self.x, l.ffn_norm, self.h, B);
@@ -266,56 +278,36 @@ impl Drafter {
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
         }
         Self::rms(g, self.x, self.norm, self.hidden, B);
-        g.gemm(g.unembed, self.hidden, self.base, 201024, D, B);
+        g.logits(self.hidden, self.base, B);
         let a = self.alpha[3];
         k!(g, "tapmix", D.div_ceil(256), 256, 0; self.anchor, D as i32, a[0], a[1], a[2], a[3], 1i32, self.frnn);
         Self::rms(g, self.frnn, self.markov_norm, self.frnn, 1);
         k!(g, "concat_frnn", (B * 2 * D).div_ceil(256), 256, 0; self.hidden, self.frnn, self.x2);
         g.gemm(self.jctx, self.x2, self.ctxm, 768, 2 * D, B);
         k!(g, "add_bias_rows", (B * 768).div_ceil(256), 256, 0; self.ctxm, self.jb, 768i32, (B * 768) as i32);
-        let ctxm: Vec<f32> = g.dtoh(self.ctxm, B * 768);
-
-        // Markov ヘッド: 行 i は位置 P-1+i のトークンを選ぶ。行 1 は next なので、状態だけ進めて next を前のトークンにする
-        let (mut state, mut prev, mut cum) = ([0f32; R], anchor, 1f32);
+        // Markov ヘッド: 行 i は位置 P+i のトークンを選ぶ。前のトークンは、行 1 では next、以降は1つ前の行で選んだもの。
+        // 7 手を GPU で続けて計算し (res[i] = (位置, sum exp)、res[0] は next)、最後に1回読む。top-1 確率の積で打ち切るのは読んだあと
+        g.htod(self.res, &[next, 0]);
+        // SAFETY: state は R 個の f32
+        unsafe { result::memset_d8_async(self.state, 0, R * 4, g.stream.cu_stream()) }.unwrap();
+        for i in 1..B {
+            let at = |j: usize| self.res + (8 * j) as u64;
+            k!(g, "markov_raw", 96, 256, 0; self.ctxm + f4(i * 768), self.j01, self.w1, self.state, at(i - 1), self.raw);
+            k!(g, "markov_step", 1, 256, 0; self.raw, self.state, self.lat);
+            self.mv(g, &self.fold, self.lat, self.lg, 1);
+            let nb = VOCAB.div_ceil(1024);
+            k!(g, "fold_part", nb, 1024, 0; self.lg, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.fpart);
+            k!(g, "fold_fin", 1, 256, 0; self.fpart, nb as i32, at(i), at(i) + 4);
+        }
+        let r: Vec<u32> = g.dtoh(self.res, 2 * B);
+        let mut cum = 1f32;
         let mut out = vec![];
         for i in 1..B {
-            let w1 = &self.w1[prev as usize * R..][..R];
-            let mut raw = ctxm[i * 768..][..768].to_vec();
-            for (o, r) in raw.iter_mut().enumerate() {
-                let j = &self.j01[o * 512..][..512];
-                *r += (0..R).map(|e| j[e] * state[e] + j[R + e] * f32::from_bits((w1[e] as u32) << 16)).sum::<f32>();
-            }
-            let mut latent = [0f32; R];
-            for e in 0..R {
-                let gate = 1.0 / (1.0 + (-raw[e]).exp());
-                state[e] = gate * state[e] + (1.0 - gate) * raw[R + e].tanh();
-                latent[e] = raw[2 * R + e].tanh();
-            }
-            if i == 1 {
-                // OCTO_DRAFT_DEBUG: 行 1 の推測が next と合うかを数える (下書きモデルの実装の確かめ)
-                if std::env::var_os("OCTO_DRAFT_DEBUG").is_some() {
-                    g.htod(self.lat, &latent);
-                    self.mv(g, &self.fold, self.lat, self.lg, 1);
-                    k!(g, "fold_finish", 1, 1024, 0; self.lg, self.fold_b, self.base + f4(201024), VOCAB as i32, self.res, self.res + 4);
-                    let r: Vec<u32> = g.dtoh(self.res, 2);
-                    eprintln!("draft row1 {} next {next} {}", r[0], if r[0] == next { "ok" } else { "miss" });
-                }
-                prev = next;
-                continue;
-            }
-            g.htod(self.lat, &latent);
-            self.mv(g, &self.fold, self.lat, self.lg, 1);
-            k!(g, "fold_finish", 1, 1024, 0; self.lg, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.res, self.res + 4);
-            let r: Vec<u32> = g.dtoh(self.res, 2);
-            cum /= f32::from_bits(r[1]).max(1.0);
-            if cum < tau() {
+            cum /= f32::from_bits(r[2 * i + 1]).max(1.0);
+            if cum < tau() || out.len() == max {
                 break;
             }
-            out.push(r[0]);
-            prev = r[0];
-            if out.len() == max {
-                break;
-            }
+            out.push(r[2 * i]);
         }
         out
     }
