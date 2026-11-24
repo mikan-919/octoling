@@ -17,6 +17,7 @@ const B: usize = 8; // ブロックの行数
 const DRAFT_CTX: usize = 8192;
 const DRING: usize = 2048; // 局所層の文脈 K/V のリングバッファの行数
 const LOCAL_WIN: usize = 1025; // 局所層が見る文脈の位置数
+const DR_SPLIT: usize = 64; // dr_attn が1ブロックで受け持つキーの数 (gpu.cu と同じ)
 /// 下書きの top-1 確率の積がこれを下回ったら下書きを止める。OCTO_TAU で変えられる (既定 0.35 は Xolotl と同じ)
 fn tau() -> f32 {
     static T: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| std::env::var("OCTO_TAU").ok().and_then(|s| s.parse().ok()).unwrap_or(0.35));
@@ -67,6 +68,9 @@ pub struct Drafter {
     fold: Fp8,          // [201024][256] = 本体の出力層 x hidden_out
     fold_b: P,
     pub(super) ctx_end: usize,
+    // 確信度の補正: (送った下書きの top-1 確率の積の和, 実際に当たった数) の指数移動平均。比で tau を動かす
+    cal: (f32, f32),
+    sent: Option<(f32, usize)>, // 直前の draft で送った分 (確率の積の和, 個数)。add_ctx で当たった数と比べる
     x: P,
     h: P,
     qkv: P,
@@ -184,6 +188,8 @@ impl Drafter {
             fold,
             fold_b,
             ctx_end: 0,
+            cal: (1.0, 1.0),
+            sent: None,
             x: fz(B * D, &mut up),
             h: fz(B * D, &mut up),
             qkv: fz(B * 5120, &mut up),
@@ -200,7 +206,7 @@ impl Drafter {
             kv: fz(B * 2048, &mut up),
             lat: fz(R, &mut up),
             res: fz(2 * B, &mut up),
-            part: fz((DRAFT_CTX + B).div_ceil(256) * 8 * 24 * (HD + 2), &mut up),
+            part: fz((DRAFT_CTX + B).div_ceil(DR_SPLIT) * 8 * 24 * (HD + 2), &mut up),
             anchor: fz(4 * D, &mut up),
         };
         let (free, _) = result::mem_get_info().unwrap();
@@ -209,7 +215,7 @@ impl Drafter {
     }
 
     fn mv(&self, g: &Gpu, m: &Fp8, x: P, y: P, t: usize) {
-        k!(g, "mv_fp8", (m.rows / 4 * 32).div_ceil(256), 256, 0; m.w, m.s, x, y, m.rows as i32, m.cols as i32, t as i32);
+        k!(g, "mv_fp8", m.rows.div_ceil(32), 256, 0; m.w, m.s, x, y, m.rows as i32, m.cols as i32, t as i32);
     }
 
     fn rms(g: &Gpu, x: P, w: P, y: P, t: usize) {
@@ -218,6 +224,7 @@ impl Drafter {
 
     pub fn reset(&mut self) {
         self.ctx_end = 0;
+        (self.cal, self.sent) = ((1.0, 1.0), None);
     }
 
     /// 退避と復元で丸ごと写す場所 (場所, バイト数)
@@ -229,6 +236,10 @@ impl Drafter {
 
     /// 本体が今処理した n トークン (g.taps の行 0..n) を、位置 ctx_end から文脈に加える
     pub fn add_ctx(&mut self, g: &Gpu, n: usize) {
+        if let Some((p, k)) = self.sent.take() {
+            let a = n.saturating_sub(1).min(k) as f32;
+            self.cal = (0.9 * self.cal.0 + 0.1 * p, 0.9 * self.cal.1 + 0.1 * a);
+        }
         let (taps, cap) = g.taps(n);
         for c0 in (0..n).step_by(B) {
             let m = (n - c0).min(B);
@@ -252,6 +263,8 @@ impl Drafter {
         if max == 0 {
             return vec![];
         }
+        // 下書きが当たる率が確信度より低ければ、打ち切りの閾値を上げる
+        let tau = tau() * (self.cal.0 / self.cal.1.max(1e-3)).clamp(0.5, 2.0);
         let p = self.ctx_end;
         let mut xb = model::bf_row(g.cpu.embed, next as usize, D);
         model::rmsnorm(&mut xb, Some(g.cpu.embed_norm));
@@ -259,12 +272,14 @@ impl Drafter {
             xb.extend_from_slice(&self.mask);
         }
         g.htod(self.x, &xb);
+        // htod は転送を待つので、GPU が空いている今のうちに Markov ヘッドの res も送る
+        g.htod(self.res, &[next, 1f32.to_bits()]);
         for l in &self.layers {
             Self::rms(g, self.x, l.attn_norm, self.h, B);
             self.mv(g, &l.qkv, self.h, self.qkv, B);
             k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32);
             let lo = p.saturating_sub(l.win);
-            let ns = (p - lo + B).div_ceil(256);
+            let ns = (p - lo + B).div_ceil(DR_SPLIT);
             k!(g, "dr_attn", (8, ns), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.part);
             k!(g, "dr_fin", (24, B), 128, 0; self.part, ns as i32, self.att);
             self.mv(g, &l.wo, self.att, self.o, B);
@@ -285,28 +300,30 @@ impl Drafter {
         g.gemm(self.jctx, self.x2, self.ctxm, 768, 2 * D, B);
         k!(g, "add_bias_rows", (B * 768).div_ceil(256), 256, 0; self.ctxm, self.jb, 768i32, (B * 768) as i32);
         // Markov ヘッド: 行 i は位置 P+i のトークンを選ぶ。前のトークンは、行 1 では next、以降は1つ前の行で選んだもの。
-        // 7 手を GPU で続けて計算し (res[i] = (位置, sum exp)、res[0] は next)、最後に1回読む。top-1 確率の積で打ち切るのは読んだあと
-        g.htod(self.res, &[next, 0]);
+        // 7 手を GPU で続けて計算し (res[i] = (位置, sum exp)、res[0] は next)、最後に1回読む。top-1 確率の積が tau を下回った行の後は GPU でも計算を止める (cum = res[1])
         // SAFETY: state は R 個の f32
         unsafe { result::memset_d8_async(self.state, 0, R * 4, g.stream.cu_stream()) }.unwrap();
         for i in 1..B {
             let at = |j: usize| self.res + (8 * j) as u64;
-            k!(g, "markov_raw", 96, 256, 0; self.ctxm + f4(i * 768), self.j01, self.w1, self.state, at(i - 1), self.raw);
-            k!(g, "markov_step", 1, 256, 0; self.raw, self.state, self.lat);
+            let cum = self.res + 4;
+            k!(g, "markov_raw", 96, 256, 0; self.ctxm + f4(i * 768), self.j01, self.w1, self.state, at(i - 1), self.raw, cum);
+            k!(g, "markov_step", 1, 256, 0; self.raw, self.state, self.lat, cum);
             let nb = VOCAB.div_ceil(64);
-            k!(g, "fold_mv", nb, 256, 0; self.fold.w, self.fold.s, self.lat, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.fpart);
-            k!(g, "fold_fin", 1, 256, 0; self.fpart, nb as i32, at(i), at(i) + 4);
+            k!(g, "fold_mv", nb, 256, 0; self.fold.w, self.fold.s, self.lat, self.fold_b, self.base + f4(i * 201024), VOCAB as i32, self.fpart, cum);
+            k!(g, "fold_fin", 1, 256, 0; self.fpart, nb as i32, at(i), at(i) + 4, cum, tau, (i >= max) as i32);
         }
         let r: Vec<u32> = g.dtoh(self.res, 2 * B);
-        let mut cum = 1f32;
+        let (mut cum, mut ps) = (1f32, 0f32);
         let mut out = vec![];
         for i in 1..B {
             cum /= f32::from_bits(r[2 * i + 1]).max(1.0);
-            if cum < tau() || out.len() == max {
+            if cum < tau || out.len() == max {
                 break;
             }
             out.push(r[2 * i]);
+            ps += cum;
         }
+        self.sent = Some((ps, out.len()));
         out
     }
 }

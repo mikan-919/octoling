@@ -218,6 +218,8 @@ struct Bufs {
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
+/// (T <= SPEC_T) attn_part がキーの範囲を分ける数 (gpu.cu の NSPLIT と同じ)
+const NSPLIT: usize = 16;
 
 impl Bufs {
     /// t トークン分をとる。alloc(バイト数) が場所を返す。acc は主記憶の KV 用の途中結果をとるか
@@ -255,7 +257,7 @@ impl Bufs {
             order: fz(t * TOP_K),
             off: fz(129),
             logits: fz(201024),
-            part: fz(SPEC_T * 24 * 32 * 130),
+            part: fz(SPEC_T * 24 * NSPLIT * 130),
             taps: fz(4 * t * D),
             amax: fz(SPEC_T),
             logits_all: fz(SPEC_T * 201024),
@@ -626,7 +628,7 @@ impl Gpu {
     /// 出力層: y[t] = unembed x[t] (語彙 201024 行)。SQ 形式で t <= SPEC_T なら S6_K のまま計算する
     pub(crate) fn logits(&self, x: P, y: P, t: usize) {
         if self.unembed_s6 != 0 && t <= SPEC_T {
-            k!(self, "mv_s6", (201024 / 4 * 32usize).div_ceil(256), 256, 0; self.unembed_s6, x, y, 201024i32, t as i32);
+            k!(self, "mv_s6", 201024 / 32, 256, 0; self.unembed_s6, x, y, 201024i32, t as i32);
         } else {
             self.gemm(self.unembed, x, y, 201024, D, t);
         }
@@ -639,8 +641,7 @@ impl Gpu {
         } else if t == 1 {
             k!(self, "mv_q8", (rows * 32).div_ceil(256), 256, 0; m.p, x, y, rows as i32, cols as i32);
         } else if t <= SPEC_T {
-            debug_assert!(rows.is_multiple_of(4));
-            k!(self, "mv_q8_t", (rows / 4 * 32).div_ceil(256), 256, 0; m.p, x, y, rows as i32, cols as i32, t as i32);
+            k!(self, "mv_q8_t", rows.div_ceil(32), 256, 0; m.p, x, y, rows as i32, cols as i32, t as i32);
         } else {
             // 活性は 64 要素ごとに int8 に量子化して、int8 のテンソルコアで掛ける
             let b = &self.big;
@@ -677,7 +678,7 @@ impl Gpu {
         if t <= SPEC_T {
             let w = |j: usize, f: fn(&GCtrl) -> P| cs.get(j).map_or(0, f);
             let stride = if shared { 0 } else { (t * D) as i32 };
-            k!(self, "ctrl_down_t", (8, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g, t as i32);
+            k!(self, "ctrl_down_t", (16, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g, t as i32);
             k!(self, "ctrl_up_t", (D * 32).div_ceil(256), 256, 0;
                 cur, stride, out, msg, w(0, |c| c.gf), w(1, |c| c.gf), w(2, |c| c.gf), b.g, cs.len() as i32, t as i32);
             return;
@@ -1463,7 +1464,7 @@ impl Gpu {
             k!(self, "mv3_bf16", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
                 l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32);
         } else if t <= SPEC_T && l.wq.q8 && l.wk.q8 && l.wv.q8 {
-            k!(self, "mv3_q8_t", ((QX + 2 * nk) / 4 * 32).div_ceil(256), 256, 0;
+            k!(self, "mv3_q8_t", QX.div_ceil(32) + 2 * nk.div_ceil(32), 256, 0;
                 l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32, ti);
         } else {
             self.gemm_m(l.wq, xq, b.qx, QX, D, t);
@@ -1490,7 +1491,7 @@ impl Gpu {
             k!(self, "wait_host", 1, 32, 0; at(HA_FO), 0u64, 0u64, 0i32);
             k!(self, "attn_from_host", 12, 256, 0; b.qx, at(HA_O), b.o);
         } else if t <= SPEC_T {
-            k!(self, "attn_part", (8, 32 * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
+            k!(self, "attn_part", (8, NSPLIT * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {
             self.attn_host(host, l, t);
         } else {
