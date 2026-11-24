@@ -36,6 +36,7 @@ prompt 34 tokens (0 reused, prefill 738 ms), generated 348 tokens (111.9 tok/s, 
 - [問題への対処](#問題への対処)
 - [開発](#開発)
 - [参考にしたもの](#参考にしたもの)
+- [ライセンス](#ライセンス)
 
 ## 性能
 
@@ -339,4 +340,6 @@ nix develop -c target/release/examples/spec_bench models/sq10 @prompt.txt 256
 - `.strata` の形式は [Strata](https://github.com/Niko1221/Strata)（MIT）の `strata_reader.cpp`・`ink_manifest.h`・`sk_codecs.cpp` に合わせました。
 - 下書きモデル DSpark の構造は [Xolotl](https://github.com/Indras-Mirror/Xolotl)（MIT）の `src/program/inkling_dspark.cpp` と、llama.cpp の `src/models/dspark.cpp` に合わせました。
 
-このリポジトリにはまだライセンスのファイルがありません。モデルの重みには、それぞれの配布元のライセンスと利用規定が適用されます。
+## ライセンス
+
+[MIT License](LICENSE) です。モデルの重みには、それぞれの配布元のライセンスと利用規定が適用されます。
