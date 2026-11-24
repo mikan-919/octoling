@@ -1357,9 +1357,12 @@ struct SkMat {
     float g; // SF4 の大域スケール。S_K は 1
 };
 
+// 平面の並び (strata.rs の split_sk): lo, hi は [4 ブロックの塊][レコード][4]、u は [64 要素の組][レコード]、D は [256 要素の組][レコード]
+__device__ __forceinline__ size_t sk_blk(int nrec, int rec, int blk) { return ((size_t)(blk / 4) * nrec + rec) * 4 + blk % 4; }
+
 __device__ __forceinline__ float sk_scale(const u8* sc, int nrec, int rec, int g) {
-    const half_t* d = (const half_t*)(sc + (size_t)nrec * 36) + (size_t)rec * 9 + g / 4;
-    return h2f(__ldg(d)) * ((float)__ldg(sc + (size_t)rec * 36 + g) / 255.f);
+    const half_t* d = (const half_t*)(sc + (size_t)nrec * 36) + (size_t)(g / 4) * nrec + rec;
+    return h2f(__ldg(d)) * ((float)__ldg(sc + (size_t)g * nrec + rec) / 255.f);
 }
 
 // S_K の16要素のブロック (lo: 2ビット x 16、hi: S3 の3ビット目 x 16) を、要素 (n, n+8) の組の f16 x2 8個にする。値は (q - half) / 8。
@@ -1411,19 +1414,21 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
     int ag = asg(g), ac[2] = {asg(2 * t), asg(2 * t + 1)};
     const unsigned* xr = ag < 0 ? nullptr : x + (size_t)(which ? ag : g) * (cols / 2);
     int r0 = blockIdx.y * 128 + warp * 32, row = r0 + lane, rec = row >> which, b0r = (row & which) * (cols / 16);
-    size_t sat = (size_t)rec * 144 + b0r;
+    // k4 (4 の倍数) からの 4 ブロックの位置は sk_blk(nrec, rec, b0r + k4) から連続する
     uint4 L[2];
     uint2 H;
     unsigned SC;
     float us = 1024.f; // SF4 の値は 2^-10 倍で展開する
     auto fetch = [&](int k4) {
         if (fp4) {
-            L[0] = *(const uint4*)((const uint2*)m.lo + sat + k4);
-            L[1] = *(const uint4*)((const uint2*)m.lo + sat + k4 + 2);
-            SC = *(const unsigned*)((const u8*)m.sc + sat + k4);
+            size_t at = sk_blk(nrec, rec, b0r + k4);
+            L[0] = *(const uint4*)((const uint2*)m.lo + at);
+            L[1] = *(const uint4*)((const uint2*)m.lo + at + 2);
+            SC = *(const unsigned*)((const u8*)m.sc + at);
         } else {
-            L[0] = *(const uint4*)((const unsigned*)m.lo + sat + k4);
-            if (s3) H = *(const uint2*)((const unsigned short*)(m.lo + (size_t)nrec * 576) + sat + k4);
+            size_t at = sk_blk(nrec, rec, b0r + k4);
+            L[0] = *(const uint4*)((const unsigned*)m.lo + at);
+            if (s3) H = *(const uint2*)((const unsigned short*)(m.lo + (size_t)nrec * 576) + at);
             us = 16777216.f * sk_scale((const u8*)m.sc, nrec, rec, (b0r + k4) / 4);
         }
     };
@@ -1525,11 +1530,11 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
             for (int i = 0; i < 2; i++) {
                 int blk = blk0 + k0 / 16 + (tid % 2) * 2 + i;
                 if (fp4) {
-                    wl[i] = ((const uint2*)m.lo)[(size_t)rec * 144 + blk];
-                    wh[i] = ((const u8*)m.sc)[(size_t)rec * 144 + blk];
+                    wl[i] = ((const uint2*)m.lo)[sk_blk(nrec, rec, blk)];
+                    wh[i] = ((const u8*)m.sc)[sk_blk(nrec, rec, blk)];
                 } else {
-                    wl[i].x = ((const unsigned*)m.lo)[(size_t)rec * 144 + blk];
-                    wh[i] = s3 ? ((const unsigned short*)(m.lo + (size_t)nrec * 576))[(size_t)rec * 144 + blk] : 0u;
+                    wl[i].x = ((const unsigned*)m.lo)[sk_blk(nrec, rec, blk)];
+                    wh[i] = s3 ? ((const unsigned short*)(m.lo + (size_t)nrec * 576))[sk_blk(nrec, rec, blk)] : 0u;
                 }
             }
             #pragma unroll

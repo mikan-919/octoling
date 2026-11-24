@@ -266,7 +266,14 @@ fn planes(code: u8, recs: usize) -> [usize; 3] {
     }
 }
 
-/// S_K のレコード (super-block の並び) を、lo [576]、hi [288]、u [36]、D [9 x u16] の平面に分ける
+/// GPU の expert の平面で、レコード rec の 16 要素のブロック blk の位置。4 ブロック (64 要素) の塊ごとに全レコードを並べる
+/// ([塊][レコード][4])。GPU のワープは連続するレコードを受け持つので、1 回の読み込みが連続した領域になる
+fn blk_at(recs: usize, rec: usize, blk: usize) -> usize {
+    (blk / 4 * recs + rec) * 4 + blk % 4
+}
+
+/// S_K のレコード (super-block の並び) を、lo (2ビット x 16 の u32)、hi (3ビット目 x 16 の u16)、u [36][レコード] (u8)、
+/// D [9][レコード] (u16) の平面に分ける。lo と hi の並びは blk_at
 fn split_sk(code: u8, raw: &[u8], recs: usize, out: &mut [u8]) {
     let [lo_n, hi_n, _] = planes(code, recs);
     let (lo, rest) = out.split_at_mut(lo_n);
@@ -274,11 +281,29 @@ fn split_sk(code: u8, raw: &[u8], recs: usize, out: &mut [u8]) {
     let (u, d) = sc.split_at_mut(recs * 36);
     let sb = sb_bytes(code);
     for (i, b) in raw[..recs * SB_REC * sb].chunks_exact(sb).enumerate() {
-        d[i * 2..i * 2 + 2].copy_from_slice(&b[..2]);
-        u[i * 4..i * 4 + 4].copy_from_slice(&b[2..6]);
-        lo[i * 64..i * 64 + 64].copy_from_slice(&b[6..70]);
-        if code == 3 {
-            hi[i * 32..i * 32 + 32].copy_from_slice(&b[70..102]);
+        let (rec, s) = (i / SB_REC, i % SB_REC);
+        d[(s * recs + rec) * 2..][..2].copy_from_slice(&b[..2]);
+        for j in 0..4 {
+            u[(s * 4 + j) * recs + rec] = b[2 + j];
+        }
+        for k in 0..16 {
+            let at = blk_at(recs, rec, s * 16 + k);
+            lo[at * 4..][..4].copy_from_slice(&b[6 + k * 4..][..4]);
+            if code == 3 {
+                hi[at * 2..][..2].copy_from_slice(&b[70 + k * 2..][..2]);
+            }
+        }
+    }
+}
+
+/// SF4 の lo [レコード][144] (u64) と sc [レコード][144] (u8) を blk_at の並びにする
+fn split_sf4(raw: &[u8], recs: usize, out: &mut [u8]) {
+    let (lo, sc) = out.split_at_mut(recs * 1152);
+    for rec in 0..recs {
+        for blk in 0..144 {
+            let at = blk_at(recs, rec, blk);
+            lo[at * 8..][..8].copy_from_slice(&raw[(rec * 144 + blk) * 8..][..8]);
+            sc[at] = raw[recs * 1152 + rec * 144 + blk];
         }
     }
 }
@@ -332,10 +357,8 @@ impl SkLayer {
             let g = planes(b.gu, GU_RECS).iter().sum::<usize>().next_multiple_of(16);
             let (gu, dn) = out.split_at_mut(g);
             if b.gu == SF4 {
-                let n = GU_RECS * 1152 + GU_RECS * 144;
-                gu[..n].copy_from_slice(&b.body[16..16 + n]);
-                let n = DN_RECS * 1152 + DN_RECS * 144;
-                dn[..n].copy_from_slice(&b.body[b.dn_off..b.dn_off + n]);
+                split_sf4(&b.body[16..], GU_RECS, gu);
+                split_sf4(&b.body[b.dn_off..], DN_RECS, dn);
             } else {
                 split_sk(b.gu, &b.body[2 * FF..], GU_RECS, gu);
                 split_sk(b.dn, &b.body[b.dn_off..], DN_RECS, dn);
