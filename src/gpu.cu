@@ -2188,6 +2188,85 @@ extern "C" __global__ void attn_from_host(const float* qx, const float* ho, floa
     out[i] = __ldcv(ho + i) * sigmoidf(qx[GATE_OFF + i]);
 }
 
+// (2 <= T <= 8 用) ctrl_down と ctrl_up の、T トークンをまとめて計算する版。control j の入力は cur + j * cs (cs = 0 なら共通)、
+// メッセージは msg + j * T * D、出力は out + j * T * D で、どれも [T][D]。g は [j][T][64]。重みは1回読んで T 本と積和する
+
+// g[j][t][r] = down_j[r] . [rmsnorm(cur_j[t]), rmsnorm(msg_j[t])] (r < 64)。グリッドは (8, n)、256 スレッド
+extern "C" __global__ void ctrl_down_t(const float* cur, int cs, const float* msg, const bf16* w0, const bf16* w1, const bf16* w2, float* g, int T) {
+    PDL();
+    __shared__ float kc[8], km[8];
+    int jc = blockIdx.y, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    cur += (size_t)jc * cs;
+    msg += (size_t)jc * T * D;
+    const bf16* w = jc == 0 ? w0 : jc == 1 ? w1 : w2;
+    for (int t = 0; t < T; t++)
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const float* x = (h ? msg : cur) + (size_t)t * D;
+            float ss = 0.f;
+            for (int i = threadIdx.x; i < D; i += blockDim.x) ss += x[i] * x[i];
+            float k = rsqrtf(block_sum(ss) / D + 1e-6f);
+            if (threadIdx.x == 0) (h ? km : kc)[t] = k;
+        }
+    __syncthreads();
+    int row = blockIdx.x * 8 + warp;
+    const uint4* wr = (const uint4*)(w + (size_t)row * 2 * D);
+    float acc[8] = {};
+    for (int i = lane; i < 2 * D / 8; i += 32) {
+        uint4 v = __ldg(wr + i);
+        float wf[8] = {bf(v.x & 0xffffu), bf(v.x >> 16), bf(v.y & 0xffffu), bf(v.y >> 16), bf(v.z & 0xffffu), bf(v.z >> 16), bf(v.w & 0xffffu), bf(v.w >> 16)};
+        int h = i >= D / 8;
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= T) break;
+            const float4* xx = (const float4*)((h ? msg : cur) + (size_t)t * D + (i * 8 - h * D));
+            float4 a = xx[0], b = xx[1];
+            float k = h ? km[t] : kc[t];
+            acc[t] += k * (wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y + wf[6] * b.z + wf[7] * b.w);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (t >= T) break;
+        float s = warp_sum(acc[t]);
+        if (lane == 0) g[((size_t)jc * T + t) * 64 + row] = s;
+    }
+}
+
+// 1ワープが要素 i について、control j の gain と forget をレーン 8j..8j+7 で、トークンごとに求めて out_j[t][i] を書く。
+// 重みの行は1回だけ読む。入力を読んでから書くので、out が cur と重なってよい
+extern "C" __global__ void ctrl_up_t(const float* cur, int cs, float* out, const float* msg, const bf16* w0, const bf16* w1, const bf16* w2, const float* g, int n, int T) {
+    PDL();
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31, jc = lane >> 3, l8 = lane & 7;
+    if (i >= D) return;
+    const bf16* w = jc == 0 ? w0 : jc == 1 ? w1 : w2;
+    float wf[2][8] = {};
+    if (jc < n)
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            uint4 u = __ldg((const uint4*)(w + (size_t)(h * D + i) * 64) + l8);
+            float f[8] = {bf(u.x & 0xffffu), bf(u.x >> 16), bf(u.y & 0xffffu), bf(u.y >> 16), bf(u.z & 0xffffu), bf(u.z >> 16), bf(u.w & 0xffffu), bf(u.w >> 16)};
+            #pragma unroll
+            for (int e = 0; e < 8; e++) wf[h][e] = f[e];
+        }
+    for (int t = 0; t < T; t++) {
+        float c = jc < n ? cur[(size_t)jc * cs + (size_t)t * D + i] : 0.f, s[2];
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            float v = 0.f;
+            if (jc < n) {
+                const float4* gg = (const float4*)(g + ((size_t)jc * T + t) * 64) + l8 * 2;
+                float4 a = gg[0], b = gg[1];
+                v = wf[h][0] * a.x + wf[h][1] * a.y + wf[h][2] * a.z + wf[h][3] * a.w + wf[h][4] * b.x + wf[h][5] * b.y + wf[h][6] * b.z + wf[h][7] * b.w;
+            }
+            for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+            s[h] = v;
+        }
+        __syncwarp();
+        if (l8 == 0 && jc < n) out[((size_t)jc * T + t) * D + i] = c - tanhf(s[1]) * c + tanhf(s[0]) * msg[((size_t)jc * T + t) * D + i];
+    }
+}
+
 // ---- control (T = 1 用) ----
 // norm2、down の行列×ベクトル、gf の行列×ベクトル、control の4カーネルを2つにまとめ、さらに n (<= 3) 本の control を1回の起動で計算する。
 // control j の入力は cur + j * cs (cs = 0 なら共通)、メッセージは msg + j * D、出力は out + j * D。足す順はまとめる前と同じ
@@ -2324,6 +2403,51 @@ extern "C" __global__ void qkv_conv_post(float* qx, const float* kx, const float
     else vc[row + c] = f2h(y * rsqrtf(block_sum(y * y) / HD + 1e-6f));
     // KV が主記憶にあれば、CPU が読む前に書き終える
     if (host) __threadfence_system();
+}
+
+// (2 <= T <= 8 用) router_topk の、T トークンをまとめて計算する版。重みの行は1回読んで T 本と積和する。
+// 64 ブロック x 256 スレッドで、ブロックが 2 行、最後に終わったブロックがトークンごとに topk をとる (ワープ t がトークン t)
+extern "C" __global__ void router_topk_t(const bf16* __restrict__ w, const float* __restrict__ x, float* rl, const float* bias, int* ids, float* wts,
+                                         unsigned* done, int T) {
+    __shared__ float part[2][4][8];
+    int lane = threadIdx.x & 31, wq = (threadIdx.x >> 5) & 3, rb = threadIdx.x >> 7, row = blockIdx.x * 2 + rb;
+    const uint4* wr = (const uint4*)(w + (size_t)row * D) + wq * (D / 32);
+    if (lane < 9) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + lane * 8));
+    PDL();
+    float acc[8] = {};
+    #pragma unroll
+    for (int i = lane; i < D / 32; i += 32) {
+        uint4 v = __ldg(wr + i);
+        float wf[8] = {bf(v.x & 0xffffu), bf(v.x >> 16), bf(v.y & 0xffffu), bf(v.y >> 16), bf(v.z & 0xffffu), bf(v.z >> 16), bf(v.w & 0xffffu), bf(v.w >> 16)};
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= T) break;
+            const float4* xx = (const float4*)(x + (size_t)t * D + wq * (D / 4) + i * 8);
+            float4 a = xx[0], b = xx[1];
+            acc[t] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y + wf[6] * b.z + wf[7] * b.w;
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 8; t++) {
+        if (t >= T) break;
+        float s = warp_sum(acc[t]);
+        if (lane == 0) part[rb][wq][t] = s;
+    }
+    __syncthreads();
+    if (threadIdx.x < 2 * T) {
+        int r = threadIdx.x / T, t = threadIdx.x % T;
+        rl[t * NEXP + blockIdx.x * 2 + r] = part[r][0][t] + part[r][1][t] + part[r][2][t] + part[r][3][t];
+    }
+    __shared__ bool last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x == 0) *done = 0;
+    int t = threadIdx.x >> 5;
+    if (t < T) topk_warp(rl + t * NEXP, bias, ids + t * TOPK, wts + t * TOPK, lane);
 }
 
 // (T = 1 用) ルーターの行列×ベクトル (128 行) と topk を1回の起動で。64 ブロック x 256 スレッド。

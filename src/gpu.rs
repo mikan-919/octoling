@@ -241,7 +241,7 @@ impl Bufs {
             h: fz(t * D),
             y: fz(t * D),
             cat: fz(t * 2 * D),
-            g: fz(t * 64),
+            g: fz(t * 64 * 3), // T <= SPEC_T では control 3つ分 [j][T][64]
             gf: fz(t * 2 * D),
             rl: fz(t * 128),
             ids: fz(t * TOP_K),
@@ -370,10 +370,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 68] = [
+const KERNELS: [&str; 71] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_part", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "mv3_bf16", "qkv_conv_post", "router_topk", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "gemm_q8", "mv_s6",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_part", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "gemm_q8", "mv_s6",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -664,6 +664,14 @@ impl Gpu {
             k!(self, "ctrl_down", (8, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g, cur_rms, msg_rms);
             k!(self, "ctrl_up", (D * 32).div_ceil(256), 256, 0;
                 cur, stride, out, msg, w(0, |c| c.gf), w(1, |c| c.gf), w(2, |c| c.gf), b.g, cs.len() as i32);
+            return;
+        }
+        if t <= SPEC_T {
+            let w = |j: usize, f: fn(&GCtrl) -> P| cs.get(j).map_or(0, f);
+            let stride = if shared { 0 } else { (t * D) as i32 };
+            k!(self, "ctrl_down_t", (8, cs.len()), 256, 0; cur, stride, msg, w(0, |c| c.down), w(1, |c| c.down), w(2, |c| c.down), b.g, t as i32);
+            k!(self, "ctrl_up_t", (D * 32).div_ceil(256), 256, 0;
+                cur, stride, out, msg, w(0, |c| c.gf), w(1, |c| c.gf), w(2, |c| c.gf), b.g, cs.len() as i32, t as i32);
             return;
         }
         // 共通の入力を上書きする前に写す
@@ -1495,6 +1503,8 @@ impl Gpu {
         if !matches!(l.experts, GExperts::Host) {
             if t == 1 {
                 k!(self, "router_topk", 64, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24));
+            } else if t <= SPEC_T {
+                k!(self, "router_topk_t", 64, 256, 0; l.router, b.h, b.rl, l.router_bias, b.ids, b.wts, b.done + f4(SPEC_T * 24), ti);
             } else {
                 self.gemm(l.router, b.h, b.rl, 128, D, t);
                 k!(self, "topk", t, 128, 0; b.rl, l.router_bias, b.ids, b.wts);
@@ -1664,5 +1674,20 @@ fn mapped(bytes: usize) -> (P, usize) {
         let mut d: sys::CUdeviceptr = 0;
         sys::cuMemHostGetDevicePointer_v2(&mut d, h, 0).result().unwrap();
         (d, h as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// カーネルが NVRTC でコンパイルでき、KERNELS の名前がどれも gpu.cu にある (GPU がなくても確かめられる)
+    #[test]
+    fn kernels_compile() {
+        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
+        let src = ptx.to_src();
+        for k in KERNELS {
+            assert!(src.contains(&format!(".entry {k}(")), "{k} がない");
+        }
     }
 }
