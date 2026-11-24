@@ -62,12 +62,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// dir の tokenizer.json を読む。OCTO_DRAFT=1 で mtp.safetensors があれば下書きモデルとして読み、生成を投機的デコードにする。
-    /// 公式の重みでは検証が遅く、下書きの時間を取り返せないことが多いので、既定では使わない
+    /// dir の tokenizer.json を読む。mtp.safetensors があれば下書きモデルとして読み、生成を投機的デコードにする。
+    /// SQ 形式では既定で使い (OCTO_DRAFT=0 で止める)、公式の重みでは検証が遅く下書きの時間を取り返せないことが多いので OCTO_DRAFT=1 のときだけ使う
     pub fn new(gpu: Gpu, dir: &std::path::Path) -> Self {
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json を読めない");
         let mtp = dir.join("mtp.safetensors");
-        let want = mtp.exists() && std::env::var_os("OCTO_DRAFT").is_some();
+        let want = mtp.exists() && std::env::var("OCTO_DRAFT").map_or(gpu.sq(), |v| v != "0");
         if want && gpu.host_kv() {
             eprintln!("global 層の KV が主記憶にあるので下書きモデルは使わない");
         }

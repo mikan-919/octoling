@@ -318,9 +318,8 @@ extern "C" __global__ void mv3_q8(const float* w0, const float* x0, float* y0, i
 }
 
 // (T <= 8 用) mv_bf16_t の Q8 版。1ワープが 4 行を受け持ち、活性の読み込みを 4 行で使い回す (rows は 4 の倍数)
-extern "C" __global__ void mv_q8_t(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
-    int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4, lane = threadIdx.x & 31;
-    if (row0 >= rows) return;
+__device__ __forceinline__ void q8t_rows(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T, int row0) {
+    int lane = threadIdx.x & 31;
     const uint4* wr[4];
     #pragma unroll
     for (int r = 0; r < 4; r++) {
@@ -360,6 +359,21 @@ extern "C" __global__ void mv_q8_t(const float* __restrict__ w, const float* __r
             if (lane == 0) y[(size_t)t * rows + row0 + r] = s * sc;
         }
     }
+}
+
+extern "C" __global__ void mv_q8_t(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
+    int row0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4;
+    if (row0 < rows) q8t_rows(w, x, y, rows, cols, T, row0);
+}
+
+// (T <= 8 用) Q, K, V の3つの行列 (列は D) を1回の起動で。行 r < r0 は (w0, x0, y0)、r < r0 + r1 は (w1, x1, y1)、残りは (w2, x2, y2)
+extern "C" __global__ void mv3_q8_t(const float* w0, const float* x0, float* y0, int r0, const float* w1, const float* x1, float* y1, int r1,
+                                    const float* w2, const float* x2, float* y2, int r2, int T) {
+    int row = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * 4;
+    if (row >= r0 + r1 + r2) return;
+    if (row < r0) q8t_rows(w0, x0, y0, r0, D, T, row);
+    else if (row < r0 + r1) q8t_rows(w1, x1, y1, r1, D, T, row - r0);
+    else q8t_rows(w2, x2, y2, r2, D, T, row - r0 - r1);
 }
 
 // logits: y[t][r] = sum_c W[r][c] x[t][c] (t < T <= 8, c < D)。W は S6_K を並べ直したもの (Pack::s6): 下位4ビット [rows][D/2]、上位2ビット [rows][D/4]、

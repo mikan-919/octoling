@@ -19,7 +19,7 @@ use std::time::Instant;
 pub const VRAM_CTX: usize = 8192;
 
 /// prefill で一度に処理するトークン数の上限
-pub const TMAX: usize = 2048;
+pub const TMAX: usize = 1536;
 
 /// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
 const RING: usize = EXTENT + TMAX;
@@ -221,7 +221,9 @@ const QX: usize = 3072 + 384 + 3072 + 24;
 
 impl Bufs {
     /// t トークン分をとる。alloc(バイト数) が場所を返す。acc は主記憶の KV 用の途中結果をとるか
-    fn new(t: usize, acc: bool, mut alloc: impl FnMut(usize) -> P) -> Self {
+    /// sq (SQ 形式) の prefill では、gate/up の出力 (gu) は使わず、act は f16 なので半分でよい
+    fn new(t: usize, acc: bool, sq: bool, mut alloc: impl FnMut(usize) -> P) -> Self {
+        let sqp = sq && t > SPEC_T;
         let mut fz = |n: usize| alloc(n * 4);
         Bufs {
             cap: t,
@@ -247,8 +249,8 @@ impl Bufs {
             rl: fz(t * 128),
             ids: fz(t * TOP_K),
             wts: fz(t * TOP_K),
-            act: fz(t * TOP_K * FF),
-            gu: fz(t * TOP_K * 2 * FF),
+            act: fz(if sqp { t * TOP_K * FF / 2 } else { t * TOP_K * FF }),
+            gu: if sqp { 0 } else { fz(t * TOP_K * 2 * FF) },
             yd: fz(t * TOP_K * D),
             order: fz(t * TOP_K),
             off: fz(129),
@@ -372,10 +374,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 72] = [
+const KERNELS: [&str; 73] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "quant_q8", "gemm_q8i", "mv_s6",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "mv3_q8_t", "quant_q8", "gemm_q8i", "mv_s6",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -477,7 +479,7 @@ impl Gpu {
                 }
             })
             .collect();
-        let small = Bufs::new(SPEC_T, false, |n| up.zeros(n));
+        let small = Bufs::new(SPEC_T, false, false, |n| up.zeros(n));
         let unembed = up.bytes(as_bytes(cpu.unembed));
         let unembed_s6 = cpu.unembed_s6.map_or(0, |b| up.bytes(b));
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
@@ -488,7 +490,7 @@ impl Gpu {
         // 先頭の枠は prefill の置き場 (staging、2 * GROUP 枠) と prefill 用の作業領域を兼ねる
         let align = |n: usize| n.div_ceil(256) * 256;
         let mut big_bytes = 0;
-        Bufs::new(TMAX, host_kv, |n| {
+        Bufs::new(TMAX, host_kv, cpu.unembed_s6.is_some(), |n| {
             big_bytes += align(n);
             0
         });
@@ -505,7 +507,7 @@ impl Gpu {
         let xbase = up.zeros(n_slots * XSLOT);
         let staging = [xbase, xbase + (GROUP * XSLOT) as u64];
         let mut at = xbase + (2 * GROUP * XSLOT) as u64;
-        let big = Bufs::new(TMAX, host_kv, |n| {
+        let big = Bufs::new(TMAX, host_kv, cpu.unembed_s6.is_some(), |n| {
             let p = at;
             at += align(n) as u64;
             p
@@ -927,6 +929,11 @@ impl Gpu {
         }
         self.stream.synchronize().unwrap();
         self.pos = 0;
+    }
+
+    /// SQ 形式 (Strata の SQ-10) の重みか
+    pub fn sq(&self) -> bool {
+        self.unembed_s6 != 0
     }
 
     /// global 層の KV が主記憶にあるか
@@ -1455,6 +1462,9 @@ impl Gpu {
         } else if t == 1 && !l.wq.q8 && !l.wk.q8 && !l.wv.q8 {
             k!(self, "mv3_bf16", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
                 l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32);
+        } else if t <= SPEC_T && l.wq.q8 && l.wk.q8 && l.wv.q8 {
+            k!(self, "mv3_q8_t", ((QX + 2 * nk) / 4 * 32).div_ceil(256), 256, 0;
+                l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32, ti);
         } else {
             self.gemm_m(l.wq, xq, b.qx, QX, D, t);
             self.gemm_m(l.wk, xk, b.kx, nk, D, t);
