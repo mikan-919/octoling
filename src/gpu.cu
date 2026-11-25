@@ -462,8 +462,11 @@ extern "C" __global__ void __launch_bounds__(256) mv_s6(const u8* __restrict__ w
         }
 }
 // ---- (prefill 用) int8 のテンソルコアで計算する Q8 の行列積 ----
-// 活性を 64 要素ごとに int8 に量子化する (Strata と同じ精度)。グリッドは (n, cols / 64 / 8)、256 スレッド (ワープが 64 要素の組 1つ)
-extern "C" __global__ void quant_q8(const float* x, int cols, signed char* q, float* s) {
+// 活性を 64 要素ごとに int8 に量子化する (Strata と同じ精度)。グリッドは (n, cols / 64 / 8)、256 スレッド (ワープが 64 要素の組 1つ)。
+// perm なら 16 要素のブロックの中を pq16 の並びにする (gemm_sk_i8 の入力)
+// 16要素のブロックの中の並び (位置 4(j%4) + j/4 に要素 j)。S_K の lo を 2n ビットずらして 0x03030303 で取ると、この並びの位置 4n..4n+3 の4要素になる
+__device__ __forceinline__ int pq16(int j) { return (j & ~15) | ((j & 3) << 2) | ((j >> 2) & 3); }
+extern "C" __global__ void quant_q8(const float* x, int cols, signed char* q, float* s, int perm) {
     PDL();
     int r = blockIdx.x, gi = blockIdx.y * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31, G = cols / 64;
     if (gi >= G) return;
@@ -471,8 +474,10 @@ extern "C" __global__ void quant_q8(const float* x, int cols, signed char* q, fl
     float mx = fmaxf(fabsf(v.x), fabsf(v.y));
     for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
     float sc = mx > 0.f ? mx / 127.f : 1.f;
-    char2 c = make_char2((signed char)__float2int_rn(v.x / sc), (signed char)__float2int_rn(v.y / sc));
-    ((char2*)(q + (size_t)r * cols + gi * 64))[lane] = c;
+    signed char c0 = (signed char)__float2int_rn(v.x / sc), c1 = (signed char)__float2int_rn(v.y / sc);
+    signed char* o = q + (size_t)r * cols + gi * 64;
+    if (perm) o[pq16(2 * lane)] = c0, o[pq16(2 * lane + 1)] = c1;
+    else ((char2*)o)[lane] = make_char2(c0, c1);
     if (lane == 0) s[(size_t)r * G + gi] = sc;
 }
 
@@ -1425,24 +1430,6 @@ struct SkMat {
 // 平面の並び (strata.rs の split_sk): lo, hi は [4 ブロックの塊][レコード][4]、u は [64 要素の組][レコード]、D は [256 要素の組][レコード]
 __device__ __forceinline__ size_t sk_blk(int nrec, int rec, int blk) { return ((size_t)(blk / 4) * nrec + rec) * 4 + blk % 4; }
 
-__device__ __forceinline__ float sk_scale(const u8* sc, int nrec, int rec, int g) {
-    const half_t* d = (const half_t*)(sc + (size_t)nrec * 36) + (size_t)(g / 4) * nrec + rec;
-    return h2f(__ldg(d)) * ((float)__ldg(sc + (size_t)g * nrec + rec) / 255.f);
-}
-
-// S_K の16要素のブロック (lo: 2ビット x 16、hi: S3 の3ビット目 x 16) を、要素 (n, n+8) の組の f16 x2 8個にする。値は (q - half) / 8。
-// f16 の 64 は仮数部の1目盛りが 1/16 なので、仮数部に 2q を置くと 64 + q/8 になる。そこから 64 + half/8 を引く
-__device__ __forceinline__ void sk_unpack(unsigned lo, unsigned hi, bool s3, unsigned v[8]) {
-    unsigned h2 = (hi & 0xffu) | ((hi & 0xff00u) << 8), bias = s3 ? 0x54075407u : 0x54035403u;
-    #pragma unroll
-    for (int n = 0; n < 8; n++) {
-        unsigned x = (n == 0 ? lo << 1 : lo >> (2 * n - 1)) & 0x00060006u;
-        if (s3) x |= (n <= 3 ? h2 << (3 - n) : h2 >> (n - 3)) & 0x00080008u;
-        asm("sub.f16x2 %0, %1, %2;" : "=r"(v[n]) : "r"(x | 0x54005400u), "r"(bias));
-    }
-}
-
-
 // (T <= 8 用) SQ 形式の expert の行列とベクトルの積をテンソルコアで計算する。同じ expert を選んだトークンは、重みを1回読んでまとめて掛ける。
 // グリッドは (T*8, rows/128)、128スレッド。ブロックは割り当て a の expert の 128行を受け持つ (それより前の割り当てと同じ expert なら何もしない)。
 // ワープは 32行を、K の全部について mma (16行 x K16 x 8列 を2つ) で計算する。列 n はトークン n で、その expert を選んでいなければ 0 になる。
@@ -1586,8 +1573,8 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
     else skb<2>(m, e, which, rows, cols, x, ids, T, y);
 }
 
-// (prefill 用) SQ 形式の expert の行列積。y[a] = W_e x[a / xdiv] (x は f16_perm で並べ替えた f16) を、expert e に割り当てた a (order[off[e]..off[e+1]]) について求める。
-// グリッドは (rows/64, 128 * SKP)、128スレッド。ブロックは 64行 x 割り当て 32 個ずつを受け持ち (expert の割り当ての 32 個の組を SKP 個のブロックで分ける)、K は 64 ずつ (S_K の u の1単位) 共有メモリに載せる。
+// (prefill 用) SQ 形式の SF4 の expert の行列積 (S_K は gemm_sk_i8)。y[a] = W_e x[a / xdiv] (x は f16_perm で並べ替えた f16) を、expert e に割り当てた a (order[off[e]..off[e+1]]) について求める。
+// グリッドは (rows/64, 128 * SKP)、128スレッド。ブロックは 64行 x 割り当て 32 個ずつを受け持ち (expert の割り当ての 32 個の組を SKP 個のブロックで分ける)、K は 64 ずつ共有メモリに載せる。
 // テンソルコアは f16 入力、f32 累積。16要素のブロックの中の並びを、重みと活性の両方で (0, 8, 1, 9, ...) に入れ替えてある (積和は変わらない)。
 // 次の K の分は、今の分の積和の前にレジスタへ読んでおく
 #define SKP 8
@@ -1604,7 +1591,7 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     int r0 = blockIdx.x * 64, nrec = which ? D / 2 : 2 * FF;
     const SkMat m = tab[e * 2 + which];
-    bool fp4 = m.code == 15, s3 = m.code == 3;
+    if (m.code != 15) return; // S_K は gemm_sk_i8
     // 重みはスレッドあたり 16要素のブロック2つ (行 tid/2、ブロック (tid%2)*2 + i)、活性は割り当て tid/4 の 16要素 (ブロック tid%4)
     int wr = tid / 2, xj = tid / 4, xb = tid % 4;
     int rrow = r0 + wr, rec = rrow >> which, blk0 = (rrow & which) * (cols / 16);
@@ -1618,28 +1605,15 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
         uint2 wl[2];
         unsigned wh[2];
         uint4 xv[2];
-        float nsc[2] = {1.f, 1.f};
         auto fetch = [&](int k0) {
             #pragma unroll
             for (int i = 0; i < 2; i++) {
                 int blk = blk0 + k0 / 16 + (tid % 2) * 2 + i;
-                if (fp4) {
-                    wl[i] = ((const uint2*)m.lo)[sk_blk(nrec, rec, blk)];
-                    wh[i] = ((const u8*)m.sc)[sk_blk(nrec, rec, blk)];
-                } else {
-                    wl[i].x = ((const unsigned*)m.lo)[sk_blk(nrec, rec, blk)];
-                    wh[i] = s3 ? ((const unsigned short*)(m.lo + (size_t)nrec * 576))[sk_blk(nrec, rec, blk)] : 0u;
-                }
+                wl[i] = ((const uint2*)m.lo)[sk_blk(nrec, rec, blk)];
+                wh[i] = ((const u8*)m.sc)[sk_blk(nrec, rec, blk)];
             }
             #pragma unroll
             for (int q = 0; q < 2; q++) xv[q] = xr >= 0 ? x[((size_t)xr * cols + k0 + xb * 16) / 8 + q] : make_uint4(0, 0, 0, 0);
-            if (!fp4) {
-                #pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    int row = r0 + warp * 16 + g + h * 8;
-                    nsc[h] = 8.f * sk_scale((const u8*)m.sc, nrec, row >> which, (row & which) * (cols / 64) + k0 / 64);
-                }
-            }
         };
         fetch(0);
         for (int k0 = 0; k0 < cols; k0 += 64) {
@@ -1647,13 +1621,9 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
             #pragma unroll
             for (int i = 0; i < 2; i++) {
                 unsigned v[8];
-                if (fp4) {
-                    float sc = e4m3(wh[i]);
-                    #pragma unroll
-                    for (int n = 0; n < 8; n++) v[n] = h2pack(e2m1(wl[i].x >> (4 * n)) * sc, e2m1(wl[i].y >> (4 * n)) * sc);
-                } else {
-                    sk_unpack(wl[i].x, wh[i], s3, v);
-                }
+                float sc = e4m3(wh[i]);
+                #pragma unroll
+                for (int n = 0; n < 8; n++) v[n] = h2pack(e2m1(wl[i].x >> (4 * n)) * sc, e2m1(wl[i].y >> (4 * n)) * sc);
                 unsigned* dst = Ws + wr * (WST / 2) + ((tid % 2) * 2 + i) * 8;
                 *(uint4*)dst = make_uint4(v[0], v[1], v[2], v[3]);
                 *(uint4*)(dst + 4) = make_uint4(v[4], v[5], v[6], v[7]);
@@ -1661,23 +1631,15 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
             *(uint4*)(Xs + xj * (WST / 2) + xb * 8) = xv[0];
             *(uint4*)(Xs + xj * (WST / 2) + xb * 8 + 4) = xv[1];
             __syncthreads();
-            float sc[2] = {nsc[0], nsc[1]};
             int kn = k0 + 64;
             if (kn < cols) fetch(kn);
-            float seg[4][4] = {};
             #pragma unroll
             for (int ks = 0; ks < 4; ks++) {
                 int r = warp * 16 + g, k = ks * 8 + t;
                 unsigned a[4] = {Ws[r * (WST / 2) + k], Ws[(r + 8) * (WST / 2) + k], Ws[r * (WST / 2) + k + 4], Ws[(r + 8) * (WST / 2) + k + 4]};
                 #pragma unroll
                 for (int j = 0; j < 4; j++)
-                    if (j < nj) mma_f16(seg[j], a, Xs[(j * 8 + g) * (WST / 2) + k], Xs[(j * 8 + g) * (WST / 2) + k + 4]);
-            }
-            // u は 64 要素ごとなので、K の1単位ごとに行のスケールを掛けて足す (S_K の値は 1/8 にしてある)
-            #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                acc[j][0] += seg[j][0] * sc[0], acc[j][1] += seg[j][1] * sc[0];
-                acc[j][2] += seg[j][2] * sc[1], acc[j][3] += seg[j][3] * sc[1];
+                    if (j < nj) mma_f16(acc[j], a, Xs[(j * 8 + g) * (WST / 2) + k], Xs[(j * 8 + g) * (WST / 2) + k + 4]);
             }
         }
         if (which == 0) {
@@ -1703,6 +1665,199 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
             });
         }
     }
+}
+
+// S_K の16要素のブロックを、pq16 の並びの int8 の 2(q - half) (S2 は -3..3、S3 は -7..7 の奇数) 16個にする。
+// 2q+1 は 1..15 なので、2q+1 - 4 (S2) / 2q+1 - 8 (S3) は、q の最上位ビットが 0 なら下位ビットに 0xfc / 0xf8 を重ね、1 なら最上位ビットを落とした値
+__device__ __forceinline__ void sk_i8(unsigned lo, unsigned hi, bool s3, unsigned v[4]) {
+    // S3 の最上位ビット: 要素 n + 4i は hi のビット n + 4i。バイト i に hi のバイト (0, hi>>4 の 0, 1, hi>>4 の 1) を置くと、どれもビット n になる
+    unsigned nh = ~(s3 ? __byte_perm(hi, hi >> 4, 0x5140) : lo >> 1);
+    #pragma unroll
+    for (int n = 0; n < 4; n++) {
+        unsigned r2 = (n ? lo >> (2 * n - 1) : lo << 1) & (s3 ? 0x06060606u : 0x02020202u);
+        unsigned neg = ((nh >> (s3 ? n : 2 * n)) & 0x01010101u) * (s3 ? 0xf8u : 0xfcu);
+        v[n] = r2 | 0x01010101u | neg;
+    }
+}
+
+// (prefill 用) gemm_sk_grouped の S_K (S2_K, S3_K) の expert の分を、重みと活性を int8 にして int8 のテンソルコア (m16n8k32) で計算する。
+// x は pq16 の並びの int8 で、which = 0 (gate/up) は quant_q8 の出力 (行はトークン、64 要素ごとのスケール)、which = 1 (down) は which = 0 が書いた aq (行は割り当て、32 要素ごとのスケール)。
+// which = 0 は出力に SITU と ixd をかけ、割り当てごとに 32 要素 (このブロックの分) ずつ int8 にして aq と as_ に書く。
+// グリッドは (rows/64, 128 * SKI)、128スレッド。ブロックは 64行 x 割り当て SKN 個を受け持ち、K は 64 ずつ共有メモリに載せる。重みを int8 にする手間を SKN 個の割り当てで分け合う。
+// ワープは 32行 x 64列 (割り当て) を計算する。活性は cp.async で2段に分けて読む
+#define SKN 128
+#define SKI 4
+struct SkI8Smem {
+    unsigned Ws[64 * Q8ST], Xs[2][SKN * Q8ST];
+    float sxs[2][2][SKN], sws[64], red[2][SKN];
+    int as[SKN];
+};
+// 共有メモリへ n バイト (4, 8, 16) を直接読む。ok でなければ 0 で埋める
+template <int N>
+__device__ __forceinline__ void cp_async(void* dst, const void* src, bool ok) {
+    unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    if (N == 16) asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(d), "l"(src), "r"(ok ? 16 : 0));
+    else asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" :: "r"(d), "l"(src), "n"(N), "r"(ok ? N : 0));
+}
+template <bool DN>
+__device__ __forceinline__ void sk_i8_body(SkI8Smem& sm, const SkMat& m, int e, int rows, int cols, const signed char* __restrict__ xq, const float* __restrict__ xs, int xdiv, const int* order, const int* off, float* y, signed char* aq, float* as_, const float* ixd) {
+    constexpr int which = DN, xg = DN ? 32 : 64;
+    unsigned* Ws = sm.Ws;
+    auto& red = sm.red;
+    float* sws = sm.sws;
+    int* as = sm.as;
+    int beg = off[e] + blockIdx.y % SKI * SKN, end = off[e + 1];
+    bool s3 = m.code == 3;
+    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3, wm = warp & 1, wn = warp >> 1;
+    int r0 = blockIdx.x * 64, nrec = DN ? D / 2 : 2 * FF, G = cols / xg;
+    // 重みはスレッドあたり 16要素のブロック2つ (行 tid/2、ブロック (tid%2)*2 + i)、活性は割り当て tid の 64 要素。
+    // K が 64 進むと、lo, hi はブロック 4つ分 (nrec * 4 個)、u は nrec 個進む。D は 256 要素ごと
+    int wr = tid / 2, rrow = r0 + wr, rec = rrow >> which, blk0 = (rrow & which) * (cols / 16), u0 = (rrow & which) * (cols / 64);
+    const unsigned* lo0 = (const unsigned*)m.lo + sk_blk(nrec, rec, blk0 + (tid % 2) * 2);
+    const unsigned short* hi0 = (const unsigned short*)(m.lo + (size_t)nrec * 576) + sk_blk(nrec, rec, blk0 + (tid % 2) * 2);
+    const u8* uu = (const u8*)m.sc + (size_t)u0 * nrec + rec;
+    const half_t* dd = (const half_t*)((const u8*)m.sc + (size_t)nrec * 36) + rec;
+    for (int c0 = beg; c0 < end; c0 += SKN * SKI) {
+        __syncthreads();
+        as[tid] = c0 + tid < end ? order[c0 + tid] : -1;
+        __syncthreads();
+        int nj = min(max((min(end - c0, SKN) - 64 * wn + 7) / 8, 0), 8); // このワープの、割り当てのある 8列の組の数
+        bool xok = as[tid] >= 0;
+        const signed char* xp = xq + (size_t)(xok ? as[tid] / xdiv : 0) * cols;
+        const float* sp = xs + (size_t)(xok ? as[tid] / xdiv : 0) * G;
+        float acc[2][8][4] = {};
+        unsigned wl[2], wh[2], wu = 0;
+        half_t wd = 0; // 次の K の分の u と D。使うのは書き込むとき (読み込みを待たない)
+        auto fetch_w = [&](int k0) {
+            size_t o = (size_t)(k0 / 64) * nrec * 4;
+            #pragma unroll
+            for (int i = 0; i < 2; i++) wl[i] = __ldg(lo0 + o + i), wh[i] = s3 ? __ldg(hi0 + o + i) : 0u;
+            if (tid % 2 == 0) wd = __ldg(dd + (size_t)((u0 + k0 / 64) / 4) * nrec), wu = __ldg(uu + (size_t)(k0 / 64) * nrec);
+        };
+        auto fetch_x = [&](int k0, int buf) {
+            #pragma unroll
+            for (int q = 0; q < 4; q++) cp_async<16>(&sm.Xs[buf][tid * Q8ST + q * 4], xp + k0 + q * 16, xok);
+            #pragma unroll
+            for (int s = 0; s < 2; s++) cp_async<4>(&sm.sxs[buf][s][tid], sp + (k0 + 32 * s) / xg, xok);
+            asm volatile("cp.async.commit_group;");
+        };
+        fetch_w(0);
+        fetch_x(0, 0);
+        for (int k0 = 0, buf = 0; k0 < cols; k0 += 64, buf ^= 1) {
+            __syncthreads();
+            #pragma unroll
+            for (int i = 0; i < 2; i++) {
+                unsigned v[4];
+                sk_i8(wl[i], wh[i], s3, v);
+                *(uint4*)(Ws + wr * Q8ST + ((tid % 2) * 2 + i) * 4) = make_uint4(v[0], v[1], v[2], v[3]);
+            }
+            if (tid % 2 == 0) sws[wr] = h2f(wd) * (float)wu * (0.5f / 255.f);
+            if (k0 + 64 < cols) {
+                fetch_x(k0 + 64, buf ^ 1);
+                asm volatile("cp.async.wait_group 1;");
+            } else {
+                asm volatile("cp.async.wait_group 0;");
+            }
+            __syncthreads();
+            if (k0 + 64 < cols) fetch_w(k0 + 64);
+            const unsigned* Xs = sm.Xs[buf];
+            unsigned a[2][2][4];
+            float ws[2][2];
+            #pragma unroll
+            for (int rt = 0; rt < 2; rt++) {
+                int r = wm * 32 + rt * 16 + g;
+                // ldmatrix で読む (asm volatile なので、コンパイラが列の組ごとに読み直すことはない)
+                #pragma unroll
+                for (int kk = 0; kk < 2; kk++) ldsm4(Ws + (wm * 32 + rt * 16 + (lane & 8) + (lane & 7)) * Q8ST + kk * 8 + (lane >> 4) * 4, a[rt][kk]);
+                ws[rt][0] = sws[r], ws[rt][1] = sws[r + 8];
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                if (j >= nj) break;
+                int c = wn * 64 + j * 8;
+                unsigned b[2][2];
+                ldsm4(Xs + (c + (lane & 7)) * Q8ST + (lane >> 3) * 4, &b[0][0]);
+                float2 x0 = *(const float2*)&sm.sxs[buf][0][c + 2 * t], x1 = DN ? *(const float2*)&sm.sxs[buf][1][c + 2 * t] : x0;
+                #pragma unroll
+                for (int rt = 0; rt < 2; rt++) {
+                    int s0[4] = {}, s1[4] = {};
+                    mma_s8(s0, a[rt][0], b[0][0], b[0][1]);
+                    mma_s8(DN ? s1 : s0, a[rt][1], b[1][0], b[1][1]);
+                    #pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        float xa = q & 1 ? x0.y : x0.x, xb = q & 1 ? x1.y : x1.x;
+                        float p = DN ? (float)s0[q] * xa + (float)s1[q] * xb : (float)s0[q] * xa;
+                        acc[rt][j][q] += p * ws[rt][q >> 1];
+                    }
+                }
+            }
+        }
+        // acc[rt][j][q] は 行 32wm + 16rt + g + 8(q/2)、列 64wn + 8j + 2t + q%2
+        if (!DN) {
+            // 行 2i (gate) と 2i+1 (up) は、g が隣り合うレーン (lane ^ 4) にある。値は g が偶数のレーンに置く
+            float mx[8][2] = {};
+            #pragma unroll
+            for (int rt = 0; rt < 2; rt++)
+                #pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    float d = ixd[(size_t)e * FF + (r0 + wm * 32 + rt * 16 + (g & ~1) + 8 * h) / 2];
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++)
+                        #pragma unroll
+                        for (int q = 0; q < 2; q++) {
+                            float& v = acc[rt][j][2 * h + q];
+                            float u = __shfl_xor_sync(0xffffffffu, v, 4);
+                            v = g & 1 ? 0.f : situ(v, u) * d;
+                            mx[j][q] = fmaxf(mx[j][q], fabsf(v));
+                        }
+                }
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+                #pragma unroll
+                for (int q = 0; q < 2; q++) {
+                    #pragma unroll
+                    for (int o = 4; o < 32; o <<= 1) mx[j][q] = fmaxf(mx[j][q], __shfl_xor_sync(0xffffffffu, mx[j][q], o));
+                    if (g == 0) red[wm][wn * 64 + j * 8 + 2 * t + q] = mx[j][q];
+                }
+            __syncthreads();
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+                #pragma unroll
+                for (int q = 0; q < 2; q++) {
+                    int c = wn * 64 + j * 8 + 2 * t + q;
+                    if (as[c] < 0) continue;
+                    float M = fmaxf(red[0][c], red[1][c]), s = M > 0.f ? M / 127.f : 1.f, inv = 1.f / s;
+                    if (wm == 0 && g == 0) as_[(size_t)as[c] * (FF / 32) + blockIdx.x] = s;
+                    if (g & 1) continue;
+                    #pragma unroll
+                    for (int rt = 0; rt < 2; rt++)
+                        #pragma unroll
+                        for (int h = 0; h < 2; h++)
+                            aq[(size_t)as[c] * FF + pq16((r0 + wm * 32 + rt * 16 + g + 8 * h) / 2)] = (signed char)__float2int_rn(acc[rt][j][2 * h + q] * inv);
+                }
+        } else {
+            #pragma unroll
+            for (int rt = 0; rt < 2; rt++)
+                #pragma unroll
+                for (int j = 0; j < 8; j++)
+                    #pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        int c = wn * 64 + j * 8 + 2 * t + (q & 1);
+                        if (as[c] >= 0) y[(size_t)as[c] * rows + r0 + wm * 32 + rt * 16 + g + 8 * (q >> 1)] = acc[rt][j][q];
+                    }
+        }
+    }
+}
+
+extern "C" __global__ void gemm_sk_i8(const SkMat* tab, int which, int rows, int cols, const signed char* __restrict__ xq, const float* __restrict__ xs, int xdiv, const int* order, const int* off, float* y, signed char* aq, float* as_, const float* ixd) {
+    PDL();
+    int e = blockIdx.y / SKI;
+    if (off[e] + blockIdx.y % SKI * SKN >= off[e + 1]) return;
+    const SkMat m = tab[e * 2 + which];
+    if (m.code == 15) return;
+    __shared__ __align__(16) SkI8Smem sm;
+    if (which) sk_i8_body<true>(sm, m, e, rows, cols, xq, xs, xdiv, order, off, y, aq, as_, ixd);
+    else sk_i8_body<false>(sm, m, e, rows, cols, xq, xs, xdiv, order, off, y, aq, as_, ixd);
 }
 
 // (prefill 用) x [n] を f16 にして、16要素のブロックの中を perm16 の並びにする (gemm_sk_grouped の入力)

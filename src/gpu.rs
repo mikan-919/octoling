@@ -23,6 +23,8 @@ pub const TMAX: usize = 1536;
 
 /// SWA 層の KV のリングバッファの行数。バッチの全トークンを書いてから注意を計算するので、窓幅に TMAX を足す
 const RING: usize = EXTENT + TMAX;
+/// gemm_sk_i8 で、expert 1つの割り当てを分けるブロックの数 (gpu.cu の SKI と同じ)
+const SKI: usize = 4;
 /// gemm_sk_grouped で、expert 1つの割り当てを分けるブロックの数 (gpu.cu の SKP と同じ)
 const SKP: usize = 8;
 
@@ -215,6 +217,7 @@ struct Bufs {
     rms: P,        // (T = 1) RMS の逆数: [0..3] 注意の入力、[3] FFN の入力、[4..52] ループ 12 層のメッセージ
     relb: P,       // (prefill) [T][24][EXTENT]。相対位置のバイアス
     q8: P,         // (prefill の Q8 の行列積) int8 に量子化した活性 [T][cols] と、64 要素ごとのスケール (f32)
+    aq: P,         // (SQ 形式の prefill) int8 にした down の入力 [T*8][FF] と、32 要素ごとのスケール (f32)
 }
 
 const QX: usize = 3072 + 384 + 3072 + 24;
@@ -268,6 +271,7 @@ impl Bufs {
             rms: fz(64),
             relb: if t > SPEC_T { fz(t * 24 * EXTENT) } else { 0 },
             q8: if t > SPEC_T { fz(t * 3072 / 4 + t * 3072 / 64) } else { 0 },
+            aq: if sqp { fz(t * TOP_K * FF / 4 + t * TOP_K * FF / 32) } else { 0 },
         }
     }
 }
@@ -376,10 +380,10 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 73] = [
+const KERNELS: [&str; 74] = [
     "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
     "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "mv3_q8_t", "quant_q8", "gemm_q8i", "mv_s6",
+    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "mv3_q8_t", "quant_q8", "gemm_q8i", "mv_s6", "gemm_sk_i8",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -646,7 +650,7 @@ impl Gpu {
             // 活性は 64 要素ごとに int8 に量子化して、int8 のテンソルコアで掛ける
             let b = &self.big;
             let (xq, xs) = (b.q8, b.q8 + (t * cols) as u64);
-            k!(self, "quant_q8", (t, (cols / 64).div_ceil(8)), 256, 0; x, cols as i32, xq, xs);
+            k!(self, "quant_q8", (t, (cols / 64).div_ceil(8)), 256, 0; x, cols as i32, xq, xs, 0i32);
             k!(self, "gemm_q8i", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
         }
     }
@@ -1540,9 +1544,14 @@ impl Gpu {
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 } else {
                     k!(self, "moe_sort", 1, 1024, 0; b.ids, n, b.order, b.off);
-                    // gate/up の出力には、カーネルの中で SITU をかけて act に書く
+                    // S_K の expert は gemm_sk_i8、SF4 は gemm_sk_grouped で計算する。gate/up の出力には、カーネルの中で SITU をかけて act (SF4) か aq (S_K) に書く
+                    let (xq, xs) = (b.q8, b.q8 + (t * D) as u64);
+                    let (aq, as_) = (b.aq, b.aq + (t * TOP_K * FF) as u64);
+                    k!(self, "quant_q8", (t, (D / 64).div_ceil(8)), 256, 0; b.h, D as i32, xq, xs, 1i32);
                     k!(self, "gemm_sk_grouped", (2 * FF / 64, 128 * SKP), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, TOP_K as i32, b.order, b.off, b.gu, b.act, ixd);
+                    k!(self, "gemm_sk_i8", (2 * FF / 64, 128 * SKI), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, xq, xs, TOP_K as i32, b.order, b.off, b.gu, aq, as_, ixd);
                     k!(self, "gemm_sk_grouped", (D / 64, 128 * SKP), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd, b.act, ixd);
+                    k!(self, "gemm_sk_i8", (D / 64, 128 * SKI), 128, 0; tab, 1i32, D as i32, FF as i32, aq, as_, 1i32, b.order, b.off, b.yd, aq, as_, ixd);
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }
             }
