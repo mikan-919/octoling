@@ -380,7 +380,7 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 83] = [
+const KERNELS: [&str; 84] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
@@ -391,6 +391,7 @@ const KERNELS: [&str; 83] = [
     "conv",
     "qkv_post",
     "attn_part",
+    "attn_tc",
     "attn_fa",
     "rel_table",
     "add",
@@ -1608,6 +1609,9 @@ impl Gpu {
             k!(self, "attn_to_host", 1, 256, 0; b.qx, at(HA_Q), at(HA_FQ));
             k!(self, "wait_host", 1, 32, 0; at(HA_FO), 0u64, 0u64, 0i32);
             k!(self, "attn_from_host", 12, 256, 0; b.qx, at(HA_O), b.o);
+        } else if t > 1 && t <= SPEC_T && s.host.is_none() {
+            // 検証は、T トークン x 3 ヘッドの行をまとめてテンソルコアで計算する (KV を1回だけ読む)
+            k!(self, "attn_tc", (8, NSPLIT), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done, ti);
         } else if t <= SPEC_T {
             k!(self, "attn_part", (8, NSPLIT * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {
