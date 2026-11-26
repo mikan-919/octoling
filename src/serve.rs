@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 
 pub const MODEL_ID: &str = "inkling-2-mini";
@@ -502,9 +502,30 @@ pub fn serve(engine: &mut Engine, addr: &str) -> std::io::Result<()> {
 }
 
 const MAX_BODY: usize = 8 << 20;
+const MAX_HEAD: usize = 64 << 10;
+// 1つずつ処理するので、何も送らない接続や読まない接続が残ると後のリクエストが全部止まる
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn handle(engine: &mut Engine, s: &mut TcpStream) -> std::io::Result<()> {
-    let mut r = BufReader::new(s.try_clone()?);
+    s.set_read_timeout(Some(IO_TIMEOUT))?;
+    s.set_write_timeout(Some(IO_TIMEOUT))?;
+    let Some((method, path, body)) = read_request(s)? else {
+        return respond(s, 413, &err_json("本文が大きすぎる"));
+    };
+    match (method.as_str(), path.trim_end_matches('/')) {
+        ("GET", "/v1/models") => respond(s, 200, &json!({"object": "list", "data": [{"id": MODEL_ID, "object": "model", "owned_by": "octoling"}]})),
+        ("POST", "/v1/chat/completions") => match serde_json::from_slice::<Value>(&body) {
+            Ok(req) => chat(engine, &req, s),
+            Err(e) => respond(s, 400, &err_json(&format!("JSON を読めない: {e}"))),
+        },
+        _ => respond(s, 404, &err_json(&format!("{method} {path} はない"))),
+    }
+}
+
+/// メソッド、パス、本文を読む。本文が MAX_BODY を超えるときは None。
+/// 読む量はヘッダーと本文を合わせて MAX_HEAD + MAX_BODY までに抑える
+fn read_request(s: &TcpStream) -> std::io::Result<Option<(String, String, Vec<u8>)>> {
+    let mut r = BufReader::new(s.try_clone()?.take((MAX_HEAD + MAX_BODY) as u64));
     let mut line = String::new();
     r.read_line(&mut line)?;
     let mut it = line.split_whitespace();
@@ -522,18 +543,11 @@ fn handle(engine: &mut Engine, s: &mut TcpStream) -> std::io::Result<()> {
         }
     }
     if len > MAX_BODY {
-        return respond(s, 413, &err_json("本文が大きすぎる"));
+        return Ok(None);
     }
     let mut body = vec![0; len];
     r.read_exact(&mut body)?;
-    match (method.as_str(), path.trim_end_matches('/')) {
-        ("GET", "/v1/models") => respond(s, 200, &json!({"object": "list", "data": [{"id": MODEL_ID, "object": "model", "owned_by": "octoling"}]})),
-        ("POST", "/v1/chat/completions") => match serde_json::from_slice::<Value>(&body) {
-            Ok(req) => chat(engine, &req, s),
-            Err(e) => respond(s, 400, &err_json(&format!("JSON を読めない: {e}"))),
-        },
-        _ => respond(s, 404, &err_json(&format!("{method} {path} はない"))),
-    }
+    Ok(Some((method, path, body)))
 }
 
 fn err_json(msg: &str) -> Value {
@@ -671,5 +685,34 @@ mod tests {
         assert_eq!(m[1].name.as_deref(), Some("read"));
         // テンプレートの sort_keys と同じ順に並ぶ
         assert_eq!(m[0].tool_calls[0].1.to_string(), r#"{"a":2,"b":1}"#);
+    }
+
+    /// クライアントが bytes を送った時に、サーバー側で read_request が返すもの
+    fn read_sent(bytes: Vec<u8>) -> Option<(String, String, Vec<u8>)> {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        // 送り切る前にサーバーが読むのをやめても、書き込みの失敗は無視する
+        let w = std::thread::spawn(move || _ = c.write_all(&bytes));
+        let r = read_request(&l.accept().unwrap().0).unwrap();
+        w.join().unwrap();
+        r
+    }
+
+    #[test]
+    fn reads_request() {
+        let (m, p, b) = read_sent(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec()).unwrap();
+        assert_eq!((m.as_str(), p.as_str(), b.as_slice()), ("POST", "/v1/chat/completions", b"{}".as_slice()));
+    }
+
+    #[test]
+    fn rejects_large_body() {
+        assert!(read_sent(format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1).into_bytes()).is_none());
+    }
+
+    #[test]
+    fn stops_reading_endless_header() {
+        // 改行のない行を上限より多く送っても、読む量は上限で止まる
+        let (m, _, _) = read_sent(vec![b'a'; 2 * (MAX_HEAD + MAX_BODY)]).unwrap();
+        assert_eq!(m.len(), MAX_HEAD + MAX_BODY);
     }
 }

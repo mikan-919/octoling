@@ -196,7 +196,7 @@ Reasoning is returned in `reasoning_content` and the answer in `content`. Even w
 
 The GPU holds one context. If the next prompt continues the context on the GPU, only the new part is prefilled. Otherwise the longest matching context among past prompts kept in RAM (up to `OCTO_KV_GB` in total, 4 GB by default) is copied back to the GPU first. This helps when prompts share the same beginning, such as the next turn of a chat.
 
-Requests are processed one at a time. Concurrent requests wait until the previous one finishes.
+Requests are processed one at a time. Concurrent requests wait until the previous one finishes. So that later requests are not blocked, a connection that makes no read or write progress for 30 seconds is closed.
 
 ### Benchmark (bench)
 
