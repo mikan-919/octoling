@@ -287,7 +287,7 @@ impl DSpark {
         for l in &self.layers {
             Self::rms(g, self.x, l.attn_norm, self.h, B);
             self.mv(g, &l.qkv, self.h, self.qkv, B);
-            k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32, 3i32, THETA);
+            k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32, 3i32, THETA, 0u64);
             let lo = p.saturating_sub(l.win);
             let ns = (p - lo + B).div_ceil(DR_SPLIT);
             k!(g, "dr_attn", (8, ns), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.part);

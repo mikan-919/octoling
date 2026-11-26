@@ -2036,9 +2036,10 @@ extern "C" __global__ void dr_ctx_store(const float* kv, const float* knorm, int
     vc[at] = f2h(kv[(size_t)t * 2048 + 1024 + h * HD + d]);
 }
 
-// ブロック 8 行の q と k を正規化と RoPE (位置 pos0+行)。グリッドは (q 8G + k 8, 8)、128スレッド
-extern "C" __global__ void dr_qk(float* qkv, const float* qn, const float* kn, int pos0, int G, float theta) {
+// ブロック 8 行の q と k を正規化と RoPE (位置 pos0+行)。posp が 0 でなければ pos0 は *posp (CUDA Graph で再生するとき)。グリッドは (q 8G + k 8, 8)、128スレッド
+extern "C" __global__ void dr_qk(float* qkv, const float* qn, const float* kn, int pos0, int G, float theta, const int* posp) {
     PDL();
+    if (posp) pos0 = *posp;
     int hh = blockIdx.x, t = blockIdx.y, d = threadIdx.x, nq = 8 * G;
     float* p = qkv + (size_t)t * DQKV(G) + hh * HD; // k は q の直後に並ぶ
     float r = head_norm_rope(p[d], hh < nq ? qn : kn, pos0 + t, theta);
@@ -2059,6 +2060,14 @@ __device__ void dr_attn_t(const float* qkv, const half_t* kc, const half_t* vc, 
     __shared__ float Qs[NR][HD], Ks[DR_K][HD + 1], Vs[DR_K][HD], Ps[NR][DR_K];
     int nz = G / RH, kvh = blockIdx.x, s = blockIdx.y / nz, h0 = blockIdx.y % nz * RH, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     int nc = hi - lo, n = nc + 8, j0 = s * DR_SPLIT, j1 = min(n, j0 + DR_SPLIT), dq = DQKV(G);
+    if (j0 >= n) {
+        // キーの無い分割 (グリッドを最大の分割数で固定したとき)。空の部分結果 (最大値 -inf、指数和 0) を書く
+        for (int i = tid; i < NR * (HD + 2); i += blockDim.x) {
+            int r = i / (HD + 2), c = i % (HD + 2);
+            part[(((size_t)s * 8 + kvh) * 8 * G + h0 * 8 + r) * (HD + 2) + c] = c == 0 ? -INFINITY : 0.f;
+        }
+        return;
+    }
     for (int i = tid; i < NR * HD; i += blockDim.x) {
         int r = i / HD, d = i % HD; // 行 r = ヘッド h0 + r/8 の、ブロックの行 r%8
         Qs[r][d] = qkv[(size_t)(r % 8) * dq + (kvh * G + h0 + r / 8) * HD + d] * rsqrtf((float)HD);
@@ -2131,9 +2140,10 @@ extern "C" __global__ void dr_attn(const float* qkv, const half_t* kc, const hal
     dr_attn_t<3>(qkv, kc, vc, ring, lo, hi, part, 3, 0);
 }
 
-extern "C" __global__ void dr_attn2(const float* qkv, const half_t* kc, const half_t* vc, int ring, int lo, int hi, float* part, int G, int win) {
+// 文脈の範囲は st = [hi, lo] から読む (CUDA Graph で同じ引数のまま再生する)
+extern "C" __global__ void dr_attn2(const float* qkv, const half_t* kc, const half_t* vc, int ring, const int* st, float* part, int G, int win) {
     PDL();
-    dr_attn_t<2>(qkv, kc, vc, ring, lo, hi, part, G, win);
+    dr_attn_t<2>(qkv, kc, vc, ring, st[1], st[0], part, G, win);
 }
 
 // dr_attn の部分結果をまとめて out [8][8G x HD] に書く。グリッドは (q のヘッド 8G, 行 8)、128スレッド
@@ -2272,16 +2282,16 @@ extern "C" __global__ void sel_top2(const float* pv, const int* pi, const float*
 
 // 候補の経路選択 (DFlash2 の candidate selector、貪欲法)。行 r の候補 c の点数は
 //   s[r][c] = cv[r][c] + sum_k pred[前のトークン][k] hp[r][k] succ[ci[r][c]][k]
-// で、前のトークンは行 0 では anchor、以降は1つ前の行で選んだもの。最大の候補を選ぶ。
+// で、前のトークンは行 0 では *anchor、以降は1つ前の行で選んだもの。最大の候補を選ぶ。
 // 確信度は、softcap した点数の softmax (候補以外の語彙は zr) での選んだ候補の確率。res[r] = (トークン, 確率) を R 行書く。
 // 1ブロック、256スレッド (ワープ w が候補 2w, 2w+1 を受け持つ)
 #define SEL_R 256 // selector_rank
-extern "C" __global__ void sel_walk(const float* cv, const int* ci, const float* zr, const float* hp, const bf16* pred, const bf16* succ, int anchor, int R, unsigned* res) {
+extern "C" __global__ void sel_walk(const float* cv, const int* ci, const float* zr, const float* hp, const bf16* pred, const bf16* succ, const int* anchor, int R, unsigned* res) {
     PDL();
     __shared__ float w[SEL_R], sc[SEL_K];
     __shared__ int prev;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    if (threadIdx.x == 0) prev = anchor;
+    if (threadIdx.x == 0) prev = *anchor;
     __syncthreads();
     for (int r = 0; r < R; r++) {
         w[threadIdx.x] = bf(pred[(size_t)prev * SEL_R + threadIdx.x]) * hp[r * SEL_R + threadIdx.x];
