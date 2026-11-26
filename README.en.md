@@ -6,7 +6,7 @@
 
 An inference engine that runs the text part of Thinking Machines Lab's [Inkling-2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single NVIDIA GPU. Written in Rust and CUDA. It has three modes: an OpenAI-compatible HTTP API, a one-shot question in the terminal, and a benchmark.
 
-It reads two weight formats: the official safetensors (NVFP4 and MXFP8), and SQ-10 (`.strata`, about 10.5 GB), a quantized format distributed by [Strata](https://github.com/Niko1221/Strata). With SQ-10 the whole model fits in VRAM on a 16 GB GPU. Generation uses speculative decoding with the official draft model (`mtp.safetensors`): a small model guesses a few tokens ahead, the main model checks them in one pass, and only the tokens the main model confirms are kept.
+It reads two weight formats: the official safetensors (NVFP4 and MXFP8), and SQ-10 (`.strata`, about 10.5 GB), a quantized format distributed by [Strata](https://github.com/Niko1221/Strata). With SQ-10 the whole model fits in VRAM on a 16 GB GPU. Generation uses speculative decoding: a small draft model guesses a few tokens ahead, the main model checks them in one pass, and only the tokens the main model confirms are kept. The draft model is either [DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2) from Inco AI (`dflash2.safetensors`) or the official DSpark (`mtp.safetensors`).
 
 Development and measurements were done on one RTX 5060 Ti 16 GB, a Ryzen 7 7700, and WSL2 on Windows 11 (about 25 GB of RAM assigned). Other environments have not been tested.
 
@@ -41,7 +41,22 @@ The prompt asks, in Japanese, for a Rust function that computes the first 10 Fib
 
 ## Performance
 
+### Draft models (DSpark and DFlash2)
+
+Setup: RTX 5060 Ti 16 GB, WSL2, SQ-10, greedy decoding (temperature 0), 256 tokens generated after each input. Measured with `spec_bench` at commit c966b8a; DSpark was run with `OCTO_DRAFT=dspark`. The four inputs were made with `prompt_ids` (reasoning_effort in parentheses): a code request "Rustでフィボナッチ数列の10項目を求める関数を書いて" (low), an English writing request "Write a short essay about why the sky is blue, for a curious ten-year-old." (low), a Japanese request "日本の四季について、それぞれの特徴を説明してください" (low), and a reasoning request (an English word problem about when one train catches up with another, high).
+
+| Input | Tokens confirmed per step, DSpark | DFlash2 | tokens/s, DSpark | DFlash2 |
+|---|---|---|---|---|
+| Code request | 2.67 | 3.82 | 132.0 | 178.2 |
+| English writing request | 1.72 | 2.31 | 98.1 | 119.3 |
+| Japanese request | 1.42 | 2.02 | 87.7 | 113.8 |
+| Request with reasoning | 4.13 | 4.65 | 178.4 | 205.8 |
+
+Greedy decoding without a draft model ran at 88–95 tokens/s. Drafting takes about 3.2 ms per step with either model. VRAM use is 0.50 GB for DSpark and 0.65 GB for DFlash2. Comparing the draft cutoff `OCTO_TAU` at 0.15, 0.25, 0.35, and 0.5, the default 0.35 was the fastest or close to it on all four inputs with DFlash2 as well.
+
 ### Generation speed (compared with Strata)
+
+The octoling numbers in this section were measured with DSpark.
 
 Setup: RTX 5060 Ti 16 GB, WSL2, SQ-10, greedy decoding (temperature 0), 256 tokens generated after each input. Strata is version 0.1.66 with the same SQ-10 weights and the same draft model (`--draft dspark`). octoling was measured with `spec_bench` at commit 2354069 (`OCTO_CTX=16384`). To reduce the effect of GPU temperature, Strata and octoling were run alternately twice each, 60 seconds apart. Unit: tokens/s.
 
@@ -114,16 +129,20 @@ cargo build --release
 
 ## Getting the weights
 
-The weight directory holds `tokenizer.json` and one of the two formats below. If `mtp.safetensors` is present, it is loaded as the draft model. The examples use the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (`hf`).
+The weight directory holds `tokenizer.json` and one of the two formats below. For the draft model, `dflash2.safetensors` (DFlash2) is loaded if present, otherwise `mtp.safetensors` (DSpark). Set `OCTO_DRAFT=dspark` to use DSpark even when `dflash2.safetensors` is present, or `OCTO_DRAFT=0` to use no draft model. The examples use the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (`hf`).
 
 ### SQ-10 (for 16 GB GPUs)
 
-SQ-10 is a quantized format distributed by Strata. The tokenizer and the draft model come from the official repository.
+SQ-10 is a quantized format distributed by Strata. The tokenizer and DSpark come from the official repository, and DFlash2 from Inco AI's repository. DFlash2's file is named `model.safetensors`, so rename it to `dflash2.safetensors`.
 
 ```sh
 hf download strata-engine/Inkling-2-Mini-Strata Inkling-2-Mini-SQ-10.strata --local-dir models/sq10
 hf download thinkingmachines/Inkling-2-Mini tokenizer.json mtp.safetensors --local-dir models/sq10
+hf download incoai/Inkling-2-Mini-DFlash2 model.safetensors --local-dir models/dflash2
+mv models/dflash2/model.safetensors models/sq10/dflash2.safetensors
 ```
+
+To skip DFlash2, leave out the last two lines.
 
 octoling reads only `.strata` v1.1 with SQ-10 experts (S2_K, S3_K, SF4). Other combinations such as SQ-15 are not supported.
 

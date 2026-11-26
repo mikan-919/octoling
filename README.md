@@ -6,7 +6,7 @@
 
 Thinking Machines Lab の言語モデル [Inkling-2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) の文章の部分を、NVIDIA の GPU 1枚で動かす推論エンジンです。Rust と CUDA で書いています。OpenAI 互換の HTTP API、ターミナルでの1回の質問、速さの測定の3つの使い方があります。
 
-重みは2つの形式を読めます。1つは公式の safetensors（NVFP4 と MXFP8）、もう1つは [Strata](https://github.com/Niko1221/Strata) が配布する量子化済みの SQ-10（`.strata`、約 10.5 GB）です。16 GB の GPU では SQ-10 を使うと全体が VRAM に載ります。生成には、公式の下書きモデル（`mtp.safetensors`）による投機的デコード（小さなモデルが数トークン先を予想し、本体がそれを1回の計算でまとめて確かめる方法。採用するのは本体が確かめたトークンだけ）を使います。
+重みは2つの形式を読めます。1つは公式の safetensors（NVFP4 と MXFP8）、もう1つは [Strata](https://github.com/Niko1221/Strata) が配布する量子化済みの SQ-10（`.strata`、約 10.5 GB）です。16 GB の GPU では SQ-10 を使うと全体が VRAM に載ります。生成には投機的デコード（小さなモデルが数トークン先を予想し、本体がそれを1回の計算でまとめて確かめる方法。採用するのは本体が確かめたトークンだけ）を使います。下書きモデルは、Inco AI が配布する [DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)（`dflash2.safetensors`）か、公式の DSpark（`mtp.safetensors`）です。
 
 開発と測定に使ったのは、RTX 5060 Ti 16 GB 1枚、Ryzen 7 7700、Windows 11 上の WSL2（割り当てた主記憶は約 25 GB）です。ほかの環境では確かめていません。
 
@@ -44,7 +44,22 @@ prompt 34 tokens (0 reused, prefill 738 ms), generated 348 tokens (111.9 tok/s, 
 
 ## 性能
 
+### 下書きモデルの比較（DSpark と DFlash2）
+
+条件：RTX 5060 Ti 16 GB・WSL2・SQ-10・貪欲法（温度 0）・各入力の後に 256 トークンを生成。commit c966b8a の `spec_bench` で、DSpark は `OCTO_DRAFT=dspark` を付けて測りました。入力は `prompt_ids` で作った次の4つです（括弧の中は reasoning_effort）。コードの依頼「Rustでフィボナッチ数列の10項目を求める関数を書いて」（low）、英語の文章の依頼「Write a short essay about why the sky is blue, for a curious ten-year-old.」（low）、日本語の依頼「日本の四季について、それぞれの特徴を説明してください」（low）、思考ありの依頼（列車が追いつく時刻を問う英語の文章題、high）。
+
+| 入力 | 1ステップで確定するトークン数 DSpark | DFlash2 | tokens/s DSpark | DFlash2 |
+|---|---|---|---|---|
+| コードの依頼 | 2.67 | 3.82 | 132.0 | 178.2 |
+| 英語の文章の依頼 | 1.72 | 2.31 | 98.1 | 119.3 |
+| 日本語の依頼 | 1.42 | 2.02 | 87.7 | 113.8 |
+| 思考ありの依頼 | 4.13 | 4.65 | 178.4 | 205.8 |
+
+下書きなしの貪欲法は 88〜95 tokens/s でした。1ステップの下書きの時間は、どちらも約 3.2 ms です。VRAM は DSpark が 0.50 GB、DFlash2 が 0.65 GB です。下書きを止めるしきい値 `OCTO_TAU` を 0.15・0.25・0.35・0.5 で比べると、DFlash2 でも既定の 0.35 が4つの入力で最も速いか、それに近い値でした。
+
 ### 生成の速さ（Strata との比較）
+
+この節の octoling の数字は DSpark で測ったものです。
 
 条件：RTX 5060 Ti 16 GB・WSL2・SQ-10・貪欲法（温度 0）・各入力の後に 256 トークンを生成。Strata は 0.1.66 で、同じ SQ-10 と同じ下書きモデル（`--draft dspark`）を使いました。octoling は commit 2354069 の `spec_bench`（`OCTO_CTX=16384`）で測りました。GPU の温度の影響を減らすため、Strata と octoling を 60 秒の間を空けて交互に2回ずつ測っています。単位は tokens/s です。
 
@@ -117,16 +132,20 @@ cargo build --release
 
 ## 重みの用意
 
-重みのディレクトリには `tokenizer.json` と、次のどちらかを置きます。`mtp.safetensors` があれば下書きモデルとして読みます。以下の例は [Hugging Face の CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)（`hf`）を使います。
+重みのディレクトリには `tokenizer.json` と、次のどちらかを置きます。下書きモデルは、`dflash2.safetensors` があれば DFlash2 を、無ければ `mtp.safetensors`（DSpark）を読みます。以下の例は [Hugging Face の CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)（`hf`）を使います。
 
 ### SQ-10（16 GB の GPU 向け）
 
-SQ-10 は Strata が配布する量子化済みの重みです。トークナイザーと下書きモデルは公式のリポジトリから取ります。
+SQ-10 は Strata が配布する量子化済みの重みです。トークナイザーと DSpark は公式のリポジトリから、DFlash2 は Inco AI のリポジトリから取ります。DFlash2 のファイル名は `model.safetensors` なので、`dflash2.safetensors` に変えて置きます。
 
 ```sh
 hf download strata-engine/Inkling-2-Mini-Strata Inkling-2-Mini-SQ-10.strata --local-dir models/sq10
 hf download thinkingmachines/Inkling-2-Mini tokenizer.json mtp.safetensors --local-dir models/sq10
+hf download incoai/Inkling-2-Mini-DFlash2 model.safetensors --local-dir models/dflash2
+mv models/dflash2/model.safetensors models/sq10/dflash2.safetensors
 ```
+
+DFlash2 を使わない場合は、最後の2行を省きます。
 
 octoling が読めるのは `.strata` の v1.1 で、expert が S2_K・S3_K・SF4 の SQ-10 だけです。SQ-15 などほかの組み合わせは読めません。
 
@@ -243,7 +262,7 @@ generated 128 tokens: 98.3 tok/s
 | 変数 | 意味 | 既定 |
 |---|---|---|
 | `OCTO_CTX` | 文脈長の上限（トークン）。公式の重みでは 8,192 を超えると、global 層（文脈の全体を見る注意の層）の KV を主記憶に置き、注意を CPU で計算する（1 トークンに 32 KB）。この時は下書きモデルを使わない。SQ-10 では KV を VRAM に置き、16 GB の GPU で 65,536 まで入ることを確かめた | 8192 |
-| `OCTO_DRAFT` | `0` で下書きモデルを使わない。公式の重みでは `1` の時だけ使う（確かめる計算が遅く、下書きの分を取り返せないことが多いため） | SQ-10 は使う |
+| `OCTO_DRAFT` | `0` で下書きモデルを使わない。`dspark` で、`dflash2.safetensors` があっても DSpark を使う。公式の重みでは `1` の時だけ使う（確かめる計算が遅く、下書きの分を取り返せないことが多いため） | SQ-10 は使う |
 | `OCTO_TAU` | 下書きを止めるしきい値。下書きの第1候補の確率の積がこれを下回ったら、そこで下書きを止める。実際のしきい値は、それまでの当たり方で 0.5〜2 倍に補正する | 0.35 |
 | `OCTO_KV_GB` | serve が主記憶に残す文脈の合計の上限（GB） | 4 |
 | `OCTO_EXPERT_SLOTS` | 公式の重みで、主記憶の expert を VRAM に置く枠の数（最大 255） | VRAM の空きから決める |
@@ -262,7 +281,7 @@ Inkling-2 Mini の文章の部分は 24 層で、そのうち 6〜17 層を3回�
 
 - **prefill:** 最大 1,536 トークンをまとめて、テンソルコア（GPU の行列積専用の演算器）で計算します。重みを読む回数をトークン数で割れるので、計算の速さが上限になります。
 - **生成:** 1トークンごとの計算は、重みをメモリから読む速さが上限になります。カーネルの列を CUDA Graph（GPU の処理の並びを記録して、まとめて再生する仕組み）に記録して再生し、起動の待ち時間を減らしています。
-- **投機的デコード:** 下書きモデル（DSpark。本体の途中の層の出力を入力にする3層のモデル）が最大 7 トークン先を予想します。本体は最大 8 トークンを1回で計算し、予想と一致した所までを確定します。8 トークン以下の計算は、重みを1回読むあいだに全トークン分を掛ける専用のカーネルで行います。
+- **投機的デコード:** 下書きモデルが最大 7 トークン先を予想します。どちらの下書きモデルも、本体の4つの層の出力を入力にし、8 トークンのブロックを1回の計算で予想します。DSpark は3層で、語彙全体のロジットに前のトークンからの補正（Markov ヘッド）を足します。DFlash2 は5層で、注意と MLP の前後に2タップの動的畳み込み（1つ前の位置の値を、隠れ状態から計算した係数で混ぜる処理）を入れ、各位置のロジットの上位 16 個から、隣り合う候補の組の点数で1本の経路を選びます。本体は最大 8 トークンを1回で計算し、予想と一致した所までを確定します。8 トークン以下の計算は、重みを1回読むあいだに全トークン分を掛ける専用のカーネルで行います。
 
 ### 重みの形式と置き場
 
@@ -284,6 +303,7 @@ SQ-10 の expert は、量子化したまま GPU で展開してテンソルコ�
 | `src/serve.rs` | チャットのテンプレート、サンプリング、ツール呼び出しの解釈、HTTP サーバー |
 | `src/gpu.rs`・`src/gpu.cu` | GPU の順伝播と CUDA のカーネル |
 | `src/gpu/draft.rs` | 下書きモデル DSpark |
+| `src/gpu/dflash2.rs` | 下書きモデル DFlash2 |
 | `src/gpu/host_attn.rs` | 主記憶の KV に対する注意（CPU） |
 | `src/model.rs` | CPU だけの順伝播（GPU 版と比べる基準） |
 | `src/strata.rs` | `.strata` の読み込み |
@@ -345,6 +365,7 @@ nix develop -c target/release/examples/spec_bench models/sq10 @prompt.txt 256
 - 順伝播の仕様は [llama.cpp](https://github.com/ggml-org/llama.cpp) の `src/models/inkling2.cpp` と `inkling2-loop.cpp` に合わせました。
 - `.strata` の形式は [Strata](https://github.com/Niko1221/Strata)（MIT）の `strata_reader.cpp`・`ink_manifest.h`・`sk_codecs.cpp` に合わせました。
 - 下書きモデル DSpark の構造は [Xolotl](https://github.com/Indras-Mirror/Xolotl)（MIT）の `src/program/inkling_dspark.cpp` と、llama.cpp の `src/models/dspark.cpp` に合わせました。
+- 下書きモデル DFlash2 の計算は [z-lab/dflash](https://github.com/z-lab/dflash) の `dflash/model.py`、[SGLang](https://github.com/sgl-project/sglang) の `srt/models/dflash.py`、[incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)（Apache-2.0）の `sglang_inkling_dflash2.py` に合わせました。方式の説明は [Inco AI のブログ](https://inco.ai/blog/dflash2/) にあります。
 
 ## ライセンス
 
