@@ -24,7 +24,7 @@ fn main() {
     let m = octoling::model::Model::open(dir);
     let ctx = std::env::var("OCTO_CTX").map_or(VRAM_CTX, |s| s.parse().unwrap());
     let mut g = Gpu::new(m, ctx);
-    let mut d = Drafter::load(&g, &dir.join("mtp.safetensors"));
+    let mut d = Drafter::load(&g, &Drafter::file(dir).expect("下書きモデルが無い"));
     let repeat = std::env::var("OCTO_REPEAT").map_or(1, |s| s.parse().unwrap());
     let force: Option<Vec<u32>> =
         std::env::var("OCTO_FORCE").ok().map(|f| std::fs::read_to_string(f).unwrap().trim().split(',').map(|t| t.parse().unwrap()).collect());

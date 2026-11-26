@@ -62,16 +62,16 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// dir の tokenizer.json を読む。mtp.safetensors があれば下書きモデルとして読み、生成を投機的デコードにする。
+    /// dir の tokenizer.json を読む。下書きモデル (dflash2.safetensors か mtp.safetensors) があれば読み、生成を投機的デコードにする。
     /// SQ 形式では既定で使い (OCTO_DRAFT=0 で止める)、公式の重みでは検証が遅く下書きの時間を取り返せないことが多いので OCTO_DRAFT=1 のときだけ使う
     pub fn new(gpu: Gpu, dir: &std::path::Path) -> Self {
         let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json を読めない");
-        let mtp = dir.join("mtp.safetensors");
-        let want = mtp.exists() && std::env::var("OCTO_DRAFT").map_or(gpu.sq(), |v| v != "0");
+        let file = Drafter::file(dir);
+        let want = file.is_some() && std::env::var("OCTO_DRAFT").map_or(gpu.sq(), |v| v != "0");
         if want && gpu.host_kv() {
             eprintln!("global 層の KV が主記憶にあるので下書きモデルは使わない");
         }
-        let draft = (want && !gpu.host_kv()).then(|| Drafter::load(&gpu, &mtp));
+        let draft = file.filter(|_| want && !gpu.host_kv()).map(|f| Drafter::load(&gpu, &f));
         let kv_max = std::env::var("OCTO_KV_GB").ok().map_or(4.0, |s| s.parse::<f64>().expect("OCTO_KV_GB は数"));
         let id = |s: &str| tok.token_to_id(s).unwrap_or_else(|| panic!("{s} がない"));
         let sp = Special {

@@ -17,21 +17,22 @@ const B: usize = 8; // ブロックの行数
 const DRAFT_CTX: usize = 8192;
 const DRING: usize = 2048; // 局所層の文脈 K/V のリングバッファの行数
 const LOCAL_WIN: usize = 1025; // 局所層が見る文脈の位置数
-const DR_SPLIT: usize = 64; // dr_attn が1ブロックで受け持つキーの数 (gpu.cu と同じ)
+pub(super) const DR_SPLIT: usize = 64; // dr_attn が1ブロックで受け持つキーの数 (gpu.cu と同じ)
 /// 下書きの top-1 確率の積がこれを下回ったら下書きを止める。OCTO_TAU で変えられる (既定 0.35 は Xolotl と同じ)
-fn tau() -> f32 {
+pub(super) fn tau() -> f32 {
     static T: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| std::env::var("OCTO_TAU").ok().and_then(|s| s.parse().ok()).unwrap_or(0.35));
     *T
 }
 const R: usize = 256; // Markov ヘッドの幅
 const HD: usize = 128;
+const THETA: f32 = 1e6; // RoPE の base
 const STAGE: usize = GROUP * (W13 + S13 + W2 + S2); // 置き場 1 つのバイト数
 
-struct Fp8 {
-    w: P,
-    s: P,
-    rows: usize,
-    cols: usize,
+pub(super) struct Fp8 {
+    pub(super) w: P,
+    pub(super) s: P,
+    pub(super) rows: usize,
+    pub(super) cols: usize,
 }
 
 struct DLayer {
@@ -52,7 +53,7 @@ struct DLayer {
     win: usize,  // 注意が読む直近の位置数
 }
 
-pub struct Drafter {
+pub struct DSpark {
     layers: Vec<DLayer>,
     norm: P,
     markov_norm: P,
@@ -92,7 +93,7 @@ pub struct Drafter {
 }
 
 /// BF16 の行列 (parts を縦に並べたもの、列数 cols) を FP8 にして VRAM に置く。置き場 0 を経由する
-fn fp8(g: &Gpu, up: &mut Uploader, parts: &[&'static [u16]], cols: usize) -> Fp8 {
+pub(super) fn fp8(g: &Gpu, up: &mut Uploader, parts: &[&'static [u16]], cols: usize) -> Fp8 {
     let rows: usize = parts.iter().map(|p| p.len() / cols).sum();
     let m = Fp8 { w: up.zeros(rows * cols), s: up.zeros(rows * 4), rows, cols };
     let chunk = STAGE / (cols * 2);
@@ -109,7 +110,7 @@ fn fp8(g: &Gpu, up: &mut Uploader, parts: &[&'static [u16]], cols: usize) -> Fp8
     m
 }
 
-impl Drafter {
+impl DSpark {
     pub fn load(g: &Gpu, path: &Path) -> Self {
         let st: &'static SafeTensors = Box::leak(Box::new(SafeTensors::open(path).expect("mtp.safetensors を開けない")));
         let get = |name: &str, shape: &[usize]| -> &'static [u16] {
@@ -257,7 +258,7 @@ impl Drafter {
                 k!(g, "tapmix", (m * D).div_ceil(256), 256, 0; taps + f4(c0 * D), (cap * D) as i32, a[0], a[1], a[2], a[3], m as i32, self.mix);
                 Self::rms(g, self.mix, l.dflare, self.mix, m);
                 self.mv(g, &l.kvc, self.mix, self.kv, m);
-                k!(g, "dr_ctx_store", (8, m), 128, 0; self.kv, l.knc, (self.ctx_end + c0) as i32, l.ring as i32, l.kc, l.vc);
+                k!(g, "dr_ctx_store", (8, m), 128, 0; self.kv, l.knc, (self.ctx_end + c0) as i32, l.ring as i32, l.kc, l.vc, THETA);
             }
         }
         for j in 0..4 {
@@ -286,16 +287,16 @@ impl Drafter {
         for l in &self.layers {
             Self::rms(g, self.x, l.attn_norm, self.h, B);
             self.mv(g, &l.qkv, self.h, self.qkv, B);
-            k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32);
+            k!(g, "dr_qk", (32, B), 128, 0; self.qkv, l.qn, l.kn, p as i32, 3i32, THETA);
             let lo = p.saturating_sub(l.win);
             let ns = (p - lo + B).div_ceil(DR_SPLIT);
             k!(g, "dr_attn", (8, ns), 128, 0; self.qkv, l.kc, l.vc, l.ring as i32, lo as i32, p as i32, self.part);
-            k!(g, "dr_fin", (24, B), 128, 0; self.part, ns as i32, self.att);
+            k!(g, "dr_fin", (24, B), 128, 0; self.part, ns as i32, self.att, 3i32);
             self.mv(g, &l.wo, self.att, self.o, B);
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
             Self::rms(g, self.x, l.ffn_norm, self.h, B);
             self.mv(g, &l.gu, self.h, self.gu, B);
-            k!(g, "silu_mul", (B * 9216).div_ceil(256), 256, 0; self.gu, self.act, B as i32);
+            k!(g, "silu_mul", (B * 9216).div_ceil(256), 256, 0; self.gu, self.act, B as i32, 9216i32);
             self.mv(g, &l.down, self.act, self.o, B);
             k!(g, "add", (B * D).div_ceil(256), 256, 0; self.x, self.o, self.x, (B * D) as i32);
         }

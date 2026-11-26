@@ -380,7 +380,7 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 74] = [
+const KERNELS: [&str; 80] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
@@ -412,8 +412,14 @@ const KERNELS: [&str; 74] = [
     "dr_ctx_store",
     "dr_qk",
     "dr_attn",
+    "dr_attn2",
     "dr_fin",
     "silu_mul",
+    "tapcat",
+    "dconv",
+    "sel_top1",
+    "sel_top2",
+    "sel_walk",
     "concat_frnn",
     "add_bias_rows",
     "fold_mv",
@@ -1101,7 +1107,7 @@ impl Gpu {
         }
         self.pos = s.tokens.len();
         if let Some(d) = d {
-            d.ctx_end = self.pos;
+            d.set_ctx_end(self.pos);
         }
     }
 
@@ -1780,9 +1786,68 @@ unsafe fn par_copy(src: &[u8], dst: *mut u8) {
     });
 }
 
+mod dflash2;
 mod draft;
 mod host_attn;
-pub use draft::Drafter;
+pub use dflash2::DFlash2;
+pub use draft::DSpark;
+
+/// 投機的デコードの下書きモデル
+pub enum Drafter {
+    DSpark(DSpark),
+    DFlash2(DFlash2),
+}
+
+impl Drafter {
+    /// dir の下書きモデルのファイル。dflash2.safetensors があれば DFlash2、無ければ mtp.safetensors (DSpark)。
+    /// OCTO_DRAFT=dspark なら DSpark にする
+    pub fn file(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let dspark = std::env::var("OCTO_DRAFT").is_ok_and(|v| v == "dspark");
+        let f = if dspark { None } else { Some(dir.join("dflash2.safetensors")).filter(|f| f.exists()) };
+        f.or_else(|| Some(dir.join("mtp.safetensors")).filter(|f| f.exists()))
+    }
+
+    pub fn load(g: &Gpu, file: &std::path::Path) -> Self {
+        if file.ends_with("dflash2.safetensors") { Self::DFlash2(DFlash2::load(g, file)) } else { Self::DSpark(DSpark::load(g, file)) }
+    }
+
+    pub fn reset(&mut self) {
+        match self {
+            Self::DSpark(d) => d.reset(),
+            Self::DFlash2(d) => d.reset(),
+        }
+    }
+
+    fn kv_regions(&self) -> Vec<(P, usize)> {
+        match self {
+            Self::DSpark(d) => d.kv_regions(),
+            Self::DFlash2(d) => d.kv_regions(),
+        }
+    }
+
+    fn set_ctx_end(&mut self, n: usize) {
+        match self {
+            Self::DSpark(d) => d.ctx_end = n,
+            Self::DFlash2(d) => d.ctx_end = n,
+        }
+    }
+
+    /// 本体が今処理した n トークン (g.taps の行 0..n) を文脈に加える
+    pub fn add_ctx(&mut self, g: &Gpu, n: usize) {
+        match self {
+            Self::DSpark(d) => d.add_ctx(g, n),
+            Self::DFlash2(d) => d.add_ctx(g, n),
+        }
+    }
+
+    /// next の後に続くトークンを最大 max 個推測する
+    pub fn draft(&mut self, g: &Gpu, next: u32, max: usize) -> Vec<u32> {
+        match self {
+            Self::DSpark(d) => d.draft(g, next, max),
+            Self::DFlash2(d) => d.draft(g, next, max),
+        }
+    }
+}
 
 /// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
 fn mapped(bytes: usize) -> (P, usize) {
