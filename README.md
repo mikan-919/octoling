@@ -358,6 +358,7 @@ nix develop -c target/release/examples/spec_bench models/sq10 @prompt.txt 256
 | `OCTO_STAMP` | 生成の CUDA Graph のカーネルごとに GPU の時刻を記録し、カーネルの種類別の時間を出す |
 | `OCTO_PROF` | 層や区切りごとに GPU と CPU の時間を出す |
 | `OCTO_TRACE` | CPU 版の各層の出力を、llama.cpp の `l_out-N` と比べられる形で出す |
+| `OCTO_DUMP` | CPU 版（`OCTO_CPU`）で、MoE の入力とルーターが選んだ expert と重みを、指定したファイルに1件ずつ書き出す（層 u32、入力 f32 × 2304、expert u32 × 8、重み f32 × 8）。量子化の誤差を実際の活性で測るのに使う |
 | `OCTO_FORCE` | spec_bench で、本体が選んだトークンをファイルのトークン ID の列に置き換える |
 
 ## 参考にしたもの
