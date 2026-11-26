@@ -2,6 +2,8 @@
 
 日本語 | [English](README.en.md)
 
+[![CI](https://github.com/mikan-919/octoling/actions/workflows/ci.yml/badge.svg)](https://github.com/mikan-919/octoling/actions/workflows/ci.yml)
+
 Thinking Machines Lab の言語モデル [Inkling-2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) の文章の部分を、NVIDIA の GPU 1枚で動かす推論エンジンです。Rust と CUDA で書いています。OpenAI 互換の HTTP API、ターミナルでの1回の質問、速さの測定の3つの使い方があります。
 
 重みは2つの形式を読めます。1つは公式の safetensors（NVFP4 と MXFP8）、もう1つは [Strata](https://github.com/Niko1221/Strata) が配布する量子化済みの SQ-10（`.strata`、約 10.5 GB）です。16 GB の GPU では SQ-10 を使うと全体が VRAM に載ります。生成には、公式の下書きモデル（`mtp.safetensors`）による投機的デコード（小さなモデルが数トークン先を予想し、本体がそれを1回の計算でまとめて確かめる方法。採用するのは本体が確かめたトークンだけ）を使います。
@@ -102,7 +104,7 @@ cd octoling
 nix develop -c cargo build --release
 ```
 
-実行ファイルは `target/release/octoling` にできます。flake の `LD_LIBRARY_PATH` は WSL2 の `libcuda.so` の場所（`/usr/lib/wsl/lib`）と NVRTC を指します。WSL2 ではない Linux では、`libcuda.so` のあるディレクトリをこの変数に足してください。
+実行ファイルは `target/release/octoling` にできます。flake の `LD_LIBRARY_PATH` は `libcuda.so` の場所として WSL2 の `/usr/lib/wsl/lib` と NixOS の `/run/opengl-driver/lib` を、ほかに NVRTC を指します。それ以外の Linux では、`libcuda.so` のあるディレクトリをこの変数に足してください。
 
 Nix を使わない場合は、Rust と、ドライバに合う版の NVRTC（`libnvrtc.so`）を用意し、`LD_LIBRARY_PATH` に `libcuda.so` と `libnvrtc.so` のディレクトリを入れてから組み立てます。ドライバより新しい NVRTC が作る PTX はドライバが読めません。
 

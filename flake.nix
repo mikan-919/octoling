@@ -12,8 +12,8 @@
     in {
       devShells.x86_64-linux.default = pkgs.mkShell {
         packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
-        # libcuda は WSL が /usr/lib/wsl/lib に置く。libnvrtc は nix から
-        LD_LIBRARY_PATH = "/usr/lib/wsl/lib:${nvrtc.lib}/lib";
+        # libcuda は WSL が /usr/lib/wsl/lib に、NixOS が /run/opengl-driver/lib に置く。libnvrtc は nix から
+        LD_LIBRARY_PATH = "/usr/lib/wsl/lib:/run/opengl-driver/lib:${nvrtc.lib}/lib";
       };
     };
 }

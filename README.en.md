@@ -2,6 +2,8 @@
 
 [日本語](README.md) | English
 
+[![CI](https://github.com/mikan-919/octoling/actions/workflows/ci.yml/badge.svg)](https://github.com/mikan-919/octoling/actions/workflows/ci.yml)
+
 An inference engine that runs the text part of Thinking Machines Lab's [Inkling-2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on a single NVIDIA GPU. Written in Rust and CUDA. It has three modes: an OpenAI-compatible HTTP API, a one-shot question in the terminal, and a benchmark.
 
 It reads two weight formats: the official safetensors (NVFP4 and MXFP8), and SQ-10 (`.strata`, about 10.5 GB), a quantized format distributed by [Strata](https://github.com/Niko1221/Strata). With SQ-10 the whole model fits in VRAM on a 16 GB GPU. Generation uses speculative decoding with the official draft model (`mtp.safetensors`): a small model guesses a few tokens ahead, the main model checks them in one pass, and only the tokens the main model confirms are kept.
@@ -99,7 +101,7 @@ cd octoling
 nix develop -c cargo build --release
 ```
 
-The binary is `target/release/octoling`. The flake's `LD_LIBRARY_PATH` points to the WSL2 location of `libcuda.so` (`/usr/lib/wsl/lib`) and to NVRTC. On Linux outside WSL2, add the directory that contains `libcuda.so` to this variable.
+The binary is `target/release/octoling`. The flake's `LD_LIBRARY_PATH` points to the locations of `libcuda.so` on WSL2 (`/usr/lib/wsl/lib`) and NixOS (`/run/opengl-driver/lib`), and to NVRTC. On other Linux systems, add the directory that contains `libcuda.so` to this variable.
 
 Without Nix, install Rust and an NVRTC (`libnvrtc.so`) that matches your driver, put the directories of `libcuda.so` and `libnvrtc.so` in `LD_LIBRARY_PATH`, and build. The driver cannot load PTX produced by an NVRTC newer than itself.
 
