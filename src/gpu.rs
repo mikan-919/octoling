@@ -793,7 +793,8 @@ impl Gpu {
     fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize, seq: P, res: P) {
         let d = dyn_.map_or(-1, |d| d as i32);
         assert!(t <= 16 || cur != out, "conv: T > CONV_T なら out と cur は別の場所");
-        k!(self, "conv", (ch.div_ceil(256), t.div_ceil(16)), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
+        // 64 スレッドのブロックにして、ch = 1024 でも 16 個の SM に配る (256 では 4 個)
+        k!(self, "conv", (ch.div_ceil(64), t.div_ceil(16)), 64, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
     }
 
     /// トークンの埋め込みと先頭の位置を GPU に送る

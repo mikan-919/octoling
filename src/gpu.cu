@@ -661,18 +661,30 @@ extern "C" __global__ void conv(const float* cur, int cs, const float* w, int dy
         seq[2 * ch + c] = h2;
     }
     float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
-    for (int t = t0; t < t1; t++) {
-        const float* row = cur + (size_t)t * cs;
-        float x = row[c];
+    // 入力を先に全部読む (out や res への書き込みの後ろで1トークンずつ読むと、L2 の待ちが積み重なる)
+    float xs[CONV_T], ds[CONV_T][4], rs[CONV_T];
+    #pragma unroll
+    for (int i = 0; i < CONV_T; i++)
+        if (t0 + i < t1) {
+            const float* row = cur + (size_t)(t0 + i) * cs;
+            xs[i] = row[c];
+            if (dyn >= 0) {
+                float4 d = *(const float4*)(row + dyn + (c / cph) * 4);
+                ds[i][0] = d.x, ds[i][1] = d.y, ds[i][2] = d.z, ds[i][3] = d.w;
+            }
+            if (res) rs[i] = res[(size_t)(t0 + i) * os + c];
+        }
+    #pragma unroll
+    for (int i = 0; i < CONV_T; i++) {
+        if (t0 + i >= t1) break;
+        int t = t0 + i;
+        float x = xs[i];
         if (seq) seq[(size_t)(3 + t) * ch + c] = x;
         float o = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x;
-        if (dyn >= 0) {
-            const float* d = row + dyn + (c / cph) * 4;
-            o += d[0] * x + d[1] * h2 + d[2] * h1 + d[3] * h0;
-        }
+        if (dyn >= 0) o += ds[i][0] * x + ds[i][1] * h2 + ds[i][2] * h1 + ds[i][3] * h0;
         float y = (x + o) * (dyn >= 0 ? 1.f / 3.f : rsqrtf(5.f));
         out[(size_t)t * os + c] = y;
-        if (res) res[(size_t)t * os + c] += y;
+        if (res) res[(size_t)t * os + c] = rs[i] + y;
         h0 = h1;
         h1 = h2;
         h2 = x;
