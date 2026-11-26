@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # 注釈付きタグの本文をリリースノートの先頭に置き、その後に GitHub が作る変更の一覧を続ける
+      # 注釈付きタグの本文 (1行目の件名を除く) をリリースノートの先頭に置き、その後に GitHub が作る変更の一覧を続ける
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -21,4 +21,4 @@ jobs:
         run: |
           git fetch --force origin "+refs/tags/$TAG:refs/tags/$TAG"
           gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes \
-            --notes "$(git tag -l --format='%(contents)' "$TAG")"
+            --notes "$(git tag -l --format='%(contents:body)' "$TAG")"
