@@ -316,7 +316,7 @@ SQ-10 の expert は、量子化したまま GPU で展開してテンソルコ�
 nix develop -c cargo test --release
 ```
 
-単体のテストは CPU だけで動き、GPU のカーネルが翻訳できるかも確かめます。モデルを使う確認は例（`examples/`）で行います。
+単体のテストは CPU だけで動き、GPU のカーネルが翻訳できるかも確かめます。モデルを使う確認は例（`examples/`）で行います。CI（GitHub Actions）では、テストに加えて `cargo fmt --check` と `cargo clippy --release --all-targets -- -D warnings` も実行します。
 
 | 例 | 内容 |
 |---|---|
