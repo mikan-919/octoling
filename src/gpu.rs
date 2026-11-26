@@ -602,7 +602,12 @@ impl Gpu {
         let tab: Vec<u64> = slots.iter().flat_map(|s: &GSlot| (0..4).flat_map(move |k| [s.seq[k], s.hist[k], [1024, 1024, D, D][k] as u64])).collect();
         let rewind_tab = up.bytes(as_bytes(&tab));
         let (free, _) = result::mem_get_info().unwrap();
-        eprintln!("GPU に {:.2} GB 載せた (expert の枠 {n_slots} 個)。残り {:.2} GB", up.total as f64 / 1e9, free as f64 / 1e9);
+        eprintln!(
+            "GPU に {:.2} GB 載せた (expert の枠 {n_slots} 個、global 層の KV は {})。残り {:.2} GB",
+            up.total as f64 / 1e9,
+            ["f16", "FP8"][kvq as usize],
+            free as f64 / 1e9
+        );
         let ev = || ctx.new_event(None).unwrap();
         Self {
             cpu,
@@ -1865,7 +1870,6 @@ impl Drafter {
     }
 }
 
-/// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
 /// global 層の KV の形式 (gpu.cu の KVQ)。0 は f16、1 は FP8。OCTO_KV (f16 か fp8) で決め、無ければ文脈長の上限が VRAM_CTX を超えるとき FP8。
 /// KV が主記憶にあるときは CPU が f16 で読むので f16
 fn kv_format(n_ctx: usize, host_kv: bool) -> u32 {
@@ -1882,6 +1886,7 @@ fn cuda_opts(kvq: u32) -> CompileOptions {
     CompileOptions { arch: Some("sm_120"), options: vec![format!("-DKVQ={kvq}")], ..Default::default() }
 }
 
+/// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
 fn mapped(bytes: usize) -> (P, usize) {
     // SAFETY: 確保に失敗したら止まる。DEVICEMAP で確保した領域の GPU 側のアドレスを得る
     unsafe {

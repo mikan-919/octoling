@@ -12,7 +12,7 @@ Thinking Machines Lab の言語モデル [Inkling-2 Mini](https://huggingface.co
 
 ````console
 $ octoling chat models/sq10 "Rustでフィボナッチ数列の10項目を求める関数を書いて" low
-GPU に 11.47 GB 載せた (expert の枠 118 個)。残り 4.15 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
 下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 The user asks in Japanese: write a function in Rust to compute 10 items of Fibonacci sequence. ...（思考。端末では灰色）
 Rustでフィボナッチ数列の最初の10項目（0,1,1,2,3,...）を返す関数例：
@@ -204,7 +204,7 @@ octoling bench <重みのディレクトリ> <トークンID,トークンID,...>
 ```
 
 ```text
-GPU に 11.47 GB 載せた (expert の枠 118 個)。残り 4.15 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
 下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 http://127.0.0.1:8080/v1 で待ち受け中 (POST /v1/chat/completions, GET /v1/models)
 ```
@@ -270,7 +270,7 @@ nix develop -c cargo run --release --example prompt_ids -- models/sq10/tokenizer
 ```
 
 ```text
-GPU に 11.47 GB 載せた (expert の枠 118 個)。残り 4.15 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
 prefill 19 tokens: 66 ms, 286.0 tok/s
 tok 200010 -> 200001:27.942 9850:8.904 2986:7.256 20698:7.141 18057:7.123 (66 ms, first [-2.0983 -4.4991 -1.8066] sum -2325645.5000)
 generated 128 tokens: 98.3 tok/s

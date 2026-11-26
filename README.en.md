@@ -14,7 +14,7 @@ This English README covers performance, requirements, building, and usage. Envir
 
 ````console
 $ octoling chat models/sq10 "Rustでフィボナッチ数列の10項目を求める関数を書いて" low
-GPU に 11.47 GB 載せた (expert の枠 118 個)。残り 4.15 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
 下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 The user asks in Japanese: write a function in Rust to compute 10 items of Fibonacci sequence. ...（reasoning, shown in gray in the terminal）
 Rustでフィボナッチ数列の最初の10項目（0,1,1,2,3,...）を返す関数例：
