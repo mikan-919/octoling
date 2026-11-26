@@ -380,7 +380,7 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 82] = [
+const KERNELS: [&str; 83] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
@@ -461,6 +461,7 @@ const KERNELS: [&str; 82] = [
     "mv3_q8_t",
     "quant_q8",
     "gemm_q8i",
+    "gemm_q8i2",
     "mv_s6",
     "gemm_sk_i8",
 ];
@@ -740,7 +741,11 @@ impl Gpu {
             let b = &self.big;
             let (xq, xs) = (b.q8, b.q8 + (t * cols) as u64);
             k!(self, "quant_q8", (t, (cols / 64).div_ceil(8)), 256, 0; x, cols as i32, xq, xs, 0i32);
-            k!(self, "gemm_q8i", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            if t >= 64 {
+                k!(self, "gemm_q8i2", (rows.div_ceil(128), t.div_ceil(64)), 256, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            } else {
+                k!(self, "gemm_q8i", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            }
         }
     }
 

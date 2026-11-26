@@ -535,6 +535,70 @@ extern "C" __global__ void gemm_q8i(const float* __restrict__ w, const signed ch
     });
 }
 
+// gemm_q8i の大きいタイル版 (T >= 64 用)。ブロック (256 スレッド) は 128行 x 64列 (トークン) を受け持ち、ワープは 32行 x 32列。
+// 重みと活性を L2 から読む回数が gemm_q8i の半分になる。K の 64 ごとの int32 の積和と、それを float で足す順は gemm_q8i と同じなので、結果も同じ
+extern "C" __global__ void gemm_q8i2(const float* __restrict__ w, const signed char* __restrict__ xq, const float* __restrict__ xs, float* __restrict__ y, int rows, int cols, int T) {
+    PDL();
+    __shared__ __align__(16) unsigned Ws[128 * Q8ST], Xs[64 * Q8ST];
+    __shared__ float sxs[64];
+    int r0 = blockIdx.x * 128, t0 = blockIdx.y * 64, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    int wm = warp & 3, wn = warp >> 2;
+    // 重みはスレッドあたり 行 tid/2 の 32 バイト、活性は トークン tid/4 の 16 バイト
+    int wr = tid / 2, wc = (tid % 2) * 32, xj = tid / 4, xc = (tid % 4) * 16;
+    bool wok = r0 + wr < rows, xok = t0 + xj < T;
+    const u8* wq = (const u8*)(w + rows);
+    uint4 wv[2], xv;
+    auto fetch = [&](int k0) {
+        #pragma unroll
+        for (int q = 0; q < 2; q++) wv[q] = wok ? __ldg((const uint4*)(wq + (size_t)(r0 + wr) * cols + k0 + wc) + q) : make_uint4(0, 0, 0, 0);
+        xv = xok ? *(const uint4*)(xq + (size_t)(t0 + xj) * cols + k0 + xc) : make_uint4(0, 0, 0, 0);
+    };
+    float acc[2][4][4] = {};
+    fetch(0);
+    for (int k0 = 0; k0 < cols; k0 += 64) {
+        __syncthreads();
+        *(uint4*)(Ws + wr * Q8ST + wc / 4) = wv[0];
+        *(uint4*)(Ws + wr * Q8ST + wc / 4 + 4) = wv[1];
+        *(uint4*)(Xs + xj * Q8ST + xc / 4) = xv;
+        if (tid < 64) sxs[tid] = t0 + tid < T ? xs[(size_t)(t0 + tid) * (cols / 64) + k0 / 64] : 0.f;
+        __syncthreads();
+        if (k0 + 64 < cols) fetch(k0 + 64);
+        int seg[2][4][4] = {};
+        #pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            int k = kk * 8 + t;
+            #pragma unroll
+            for (int mi = 0; mi < 2; mi++) {
+                int r = wm * 32 + mi * 16 + g;
+                unsigned a[4] = {Ws[r * Q8ST + k], Ws[(r + 8) * Q8ST + k], Ws[r * Q8ST + k + 4], Ws[(r + 8) * Q8ST + k + 4]};
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    int c = wn * 32 + j * 8 + g;
+                    mma_s8(seg[mi][j], a, Xs[c * Q8ST + k], Xs[c * Q8ST + k + 4]);
+                }
+            }
+        }
+        #pragma unroll
+        for (int mi = 0; mi < 2; mi++)
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float x0 = sxs[wn * 32 + j * 8 + 2 * t], x1 = sxs[wn * 32 + j * 8 + 2 * t + 1];
+                acc[mi][j][0] += (float)seg[mi][j][0] * x0, acc[mi][j][1] += (float)seg[mi][j][1] * x1;
+                acc[mi][j][2] += (float)seg[mi][j][2] * x0, acc[mi][j][3] += (float)seg[mi][j][3] * x1;
+            }
+    }
+    // acc[mi][j] は行 32wm + 16mi + g (+8)、列 32wn + 8j + 2t (+1)
+    #pragma unroll
+    for (int mi = 0; mi < 2; mi++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int r = r0 + wm * 32 + mi * 16 + g + (e >> 1) * 8, c = t0 + wn * 32 + j * 8 + 2 * t + (e & 1);
+                if (r < rows && c < T) y[(size_t)c * rows + r] = acc[mi][j][e] * w[r];
+            }
+}
+
 // 長さ D のベクトル gridDim.x 本をそれぞれ RMS 正規化する。並びは [種類][T][D] で、重みは種類ごとに wstride ずつずれる (0 なら共通)
 extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int wstride, int T) {
     PDL();
