@@ -380,7 +380,7 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 80] = [
+const KERNELS: [&str; 81] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
@@ -460,6 +460,7 @@ const KERNELS: [&str; 80] = [
     "quant_q8",
     "gemm_q8i",
     "mv_s6",
+    "s6_to_bf16",
     "gemm_sk_i8",
 ];
 
@@ -563,8 +564,9 @@ impl Gpu {
             })
             .collect();
         let small = Bufs::new(SPEC_T, false, false, |n| up.zeros(n));
-        let unembed = up.bytes(as_bytes(cpu.unembed));
+        // SQ 形式は出力層を S6_K のまま計算するので、BF16 の出力層は VRAM に置かない (0.93 GB)
         let unembed_s6 = cpu.unembed_s6.map_or(0, |b| up.bytes(b));
+        let unembed = if unembed_s6 == 0 { up.bytes(as_bytes(cpu.unembed)) } else { 0 };
         let norm = f32s(&model::bf_vec(cpu.norm), &mut up);
         let output_query = f32s(cpu.output_query, &mut up);
         let mq: Vec<f32> = cpu.layers[CORE.0..CORE.1].iter().flat_map(|l| l.msg_query.as_ref().unwrap().iter().copied()).collect();
@@ -715,13 +717,24 @@ impl Gpu {
         }
     }
 
-    /// 出力層: y[t] = unembed x[t] (語彙 201024 行)。SQ 形式で t <= SPEC_T なら S6_K のまま計算する
+    /// 出力層: y[t] = unembed x[t] (語彙 201024 行)。SQ 形式は S6_K のまま、SPEC_T トークンずつ計算する
     pub(crate) fn logits(&self, x: P, y: P, t: usize) {
-        if self.unembed_s6 != 0 && t <= SPEC_T {
-            k!(self, "mv_s6", 201024 / 32, 256, 0; self.unembed_s6, x, y, 201024i32, t as i32);
-        } else {
-            self.gemm(self.unembed, x, y, 201024, D, t);
+        if self.unembed_s6 == 0 {
+            return self.gemm(self.unembed, x, y, 201024, D, t);
         }
+        for t0 in (0..t).step_by(SPEC_T) {
+            let n = SPEC_T.min(t - t0);
+            k!(self, "mv_s6", 201024 / 32, 256, 0; self.unembed_s6, x + f4(t0 * D), y + f4(t0 * 201024), 201024i32, n as i32);
+        }
+    }
+
+    /// 出力層の行 v0..v0+n の BF16 の場所。SQ 形式は S6_K を tmp ([n][D] の BF16) に広げて、その場所を返す
+    pub(crate) fn unembed_bf16(&self, v0: usize, n: usize, tmp: P) -> P {
+        if self.unembed_s6 == 0 {
+            return self.unembed + (v0 * D * 2) as u64;
+        }
+        k!(self, "s6_to_bf16", n, 256, 0; self.unembed_s6, 201024i32, v0 as i32, tmp);
+        tmp
     }
 
     /// 本体の行列 m で Y[t] = W X[t]。Q8 なら T に応じて Q8 のカーネルを使う

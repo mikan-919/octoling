@@ -398,6 +398,19 @@ extern "C" __global__ void __launch_bounds__(256) mv3_q8_t(const float* w0, cons
     else mv_tc<true>((const u8*)(w2 + r2), w2, x2, y2, r2, D, T, (b - b0 - b1) * 32);
 }
 
+// S6_K を並べ直したもの (行数 rows) の行 r0..r0+gridDim.x を BF16 に広げて out [gridDim.x][D] に書く。下書きモデルの初期化で使う
+extern "C" __global__ void s6_to_bf16(const u8* w, int rows, int r0, bf16* out) {
+    PDL();
+    int r = r0 + blockIdx.x;
+    const u8* lo = w + (size_t)r * (D / 2);
+    const u8* hi = w + (size_t)rows * (D / 2) + (size_t)r * (D / 4);
+    const float* sc = (const float*)(w + (size_t)rows * (D / 2 + D / 4)) + (size_t)r * (D / 64);
+    for (int k = threadIdx.x; k < D; k += blockDim.x) {
+        int q = ((lo[k / 2] >> (4 * (k & 1))) & 15) | (((hi[k / 4] >> (2 * (k & 3))) & 3) << 4);
+        out[(size_t)blockIdx.x * D + k] = f2bf((q - 31.5f) * sc[k / 64]);
+    }
+}
+
 // logits: y[t][r] = sum_c W[r][c] x[t][c] (t < T <= 8, c < D)。W は S6_K を並べ直したもの (Pack::s6): 下位4ビット [rows][D/2]、上位2ビット [rows][D/4]、
 // 64 要素ごとのスケール [rows][D/64] (f32)。値は (q - 31.5) * スケール。tensor core (f16 入力、f32 累積) で 64 要素ごとに積を取り、スケールを掛けて足す。
 // ブロックは 32 行を受け持ち、8ワープが K を分ける (K の割り当ては mv_fp8 と同じ)
