@@ -326,7 +326,12 @@ impl SkLayer {
         let b = &self.bodies[ex];
         if b.dn == SF4 {
             let mut w = [0.0; FF];
-            crate::nvfp4::dequant_row(&b.body[b.dn_off + r * FF / 2..][..FF / 2], &b.body[b.dn_off + D * FF / 2 + r * FF / 16..][..FF / 16], b.outer()[1], &mut w);
+            crate::nvfp4::dequant_row(
+                &b.body[b.dn_off + r * FF / 2..][..FF / 2],
+                &b.body[b.dn_off + D * FF / 2 + r * FF / 16..][..FF / 16],
+                b.outer()[1],
+                &mut w,
+            );
             return w.iter().zip(act).map(|(w, x)| w * x).sum();
         }
         let mut pair = [0.0; D];

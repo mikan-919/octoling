@@ -161,17 +161,17 @@ fn q8_mat(parts: &[(Option<&'static [u8]>, W)], cols: usize) -> Option<Vec<u8>> 
 
 #[derive(Clone, Copy)]
 enum GExperts {
-    Fp4([P; 6]),            // w13, s13, a13, w2, s2, a2
-    Sk { tab: P, ixd: P },  // SQ 形式。tab は行列ごとの SkMat、ixd は活性の逆スケール [128][FF]
-    Host,                   // MXFP8。CPU と分担する
+    Fp4([P; 6]),           // w13, s13, a13, w2, s2, a2
+    Sk { tab: P, ixd: P }, // SQ 形式。tab は行列ごとの SkMat、ixd は活性の逆スケール [128][FF]
+    Host,                  // MXFP8。CPU と分担する
 }
 
 struct GSlot {
     kc: P,
     vc: P,
     host: Option<[usize; 2]>, // KV が主記憶にあれば、その K と V の主記憶側のアドレス
-    hist: [P; 4], // k, v, attn 出力, mlp 出力
-    seq: [P; 4],  // 検証のバッチの [直前の入力3つ; 入力 SPEC_T 個]。外れた下書きを捨てるとき hist を戻す
+    hist: [P; 4],             // k, v, attn 出力, mlp 出力
+    seq: [P; 4],              // 検証のバッチの [直前の入力3つ; 入力 SPEC_T 個]。外れた下書きを捨てるとき hist を戻す
 }
 
 // cap トークン分の作業領域。並びは gpu.cu の先頭に書いたとおり [種類][T][要素]。
@@ -315,7 +315,7 @@ pub struct Gpu {
     // 生成で、主記憶の KV への注意を CPU と受け渡す主記憶 (GPU 側, 主記憶側のアドレス)。スロットごとに HA バイト。文脈が VRAM_CTX 以下なら使わない
     ha: (P, usize),
     host_seq: RefCell<Vec<HostEv>>, // 1トークンのグラフが CPU を待つ順番
-    token_done: CudaEvent, // 生成の1トークン分の CUDA Graph の終わり
+    token_done: CudaEvent,          // 生成の1トークン分の CUDA Graph の終わり
 }
 
 /// 生成のグラフが CPU に頼む処理
@@ -366,13 +366,13 @@ const HIO_LOGITS: usize = 16384;
 /// 枠 j は base + j * XSLOT。先頭の 2 * GROUP 枠は prefill の置き場 (staging) と同じ場所なので、prefill で使ったら空にする
 struct XCache {
     base: P,
-    reserved: usize, // 先頭のこの数の枠は、prefill の置き場と作業領域を兼ねる
+    reserved: usize,                    // 先頭のこの数の枠は、prefill の置き場と作業領域を兼ねる
     owner: Vec<Option<(usize, usize)>>, // 枠 → (層 - 20, expert)
     slot: [[Option<usize>; N_EXP]; 4],
-    cnt: [[f32; N_EXP]; 4], // 選ばれた回数 (XDECAY で減らす)
+    cnt: [[f32; N_EXP]; 4],              // 選ばれた回数 (XDECAY で減らす)
     pending: Vec<(usize, usize, usize)>, // このトークンで入れ替えると決めた (層 - 20, expert, 枠)。23層のあとにまとめて送る
-    ready: Vec<bool>,   // 枠の中身が届いているか。入れ替えると決めた枠は、転送が終わるまで使わない
-    issued: Vec<usize>, // 転送を出したが、届いたのをまだ確かめていない枠
+    ready: Vec<bool>,                    // 枠の中身が届いているか。入れ替えると決めた枠は、転送が終わるまで使わない
+    issued: Vec<usize>,                  // 転送を出したが、届いたのをまだ確かめていない枠
 }
 
 /// GPU と CPU の分担を釣り合わせるための見積もり (秒)。expert 8個 (66 MB) を PCIe で送る時間と、CPU で割り当て1つを計算する時間。
@@ -381,9 +381,80 @@ const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
 const KERNELS: [&str; 74] = [
-    "mv_bf16", "gemm_bf16", "rmsnorm", "mix", "norm2", "control", "conv", "qkv_post", "attn_part", "attn_fa", "rel_table", "add", "softcap", "topk", "moe_up_nvfp4", "moe_down_nvfp4",
-    "moe_sort", "gemm_nvfp4_grouped", "situ_rows", "moe_sum", "gemm_mxfp8_grouped", "situ_sel", "conv_rewind", "argmax_rows",
-    "quant_rows_bf16", "quant_cols_f32", "mv_fp8", "tapmix", "dr_ctx_store", "dr_qk", "dr_attn", "dr_fin", "silu_mul", "concat_frnn", "add_bias_rows", "fold_mv", "fold_fin", "markov_raw", "markov_step", "mv_bf16_t", "attn_blk", "attn_fin", "moe_up_mx", "moe_down_mx", "ctrl_down", "ctrl_up", "ctrl_down_t", "ctrl_up_t", "mv3_bf16", "qkv_conv_post", "router_topk", "router_topk_t", "stamp", "to_host", "wait_host", "add_host", "from_host", "done_host", "attn_to_host", "attn_from_host", "moe_up_mx_g", "moe_down_mx_g", "gemm_sk_grouped", "situ_sk", "f16_perm", "moe_skb", "mv_q8", "mv3_q8", "mv_q8_t", "mv3_q8_t", "quant_q8", "gemm_q8i", "mv_s6", "gemm_sk_i8",
+    "mv_bf16",
+    "gemm_bf16",
+    "rmsnorm",
+    "mix",
+    "norm2",
+    "control",
+    "conv",
+    "qkv_post",
+    "attn_part",
+    "attn_fa",
+    "rel_table",
+    "add",
+    "softcap",
+    "topk",
+    "moe_up_nvfp4",
+    "moe_down_nvfp4",
+    "moe_sort",
+    "gemm_nvfp4_grouped",
+    "situ_rows",
+    "moe_sum",
+    "gemm_mxfp8_grouped",
+    "situ_sel",
+    "conv_rewind",
+    "argmax_rows",
+    "quant_rows_bf16",
+    "quant_cols_f32",
+    "mv_fp8",
+    "tapmix",
+    "dr_ctx_store",
+    "dr_qk",
+    "dr_attn",
+    "dr_fin",
+    "silu_mul",
+    "concat_frnn",
+    "add_bias_rows",
+    "fold_mv",
+    "fold_fin",
+    "markov_raw",
+    "markov_step",
+    "mv_bf16_t",
+    "attn_blk",
+    "attn_fin",
+    "moe_up_mx",
+    "moe_down_mx",
+    "ctrl_down",
+    "ctrl_up",
+    "ctrl_down_t",
+    "ctrl_up_t",
+    "mv3_bf16",
+    "qkv_conv_post",
+    "router_topk",
+    "router_topk_t",
+    "stamp",
+    "to_host",
+    "wait_host",
+    "add_host",
+    "from_host",
+    "done_host",
+    "attn_to_host",
+    "attn_from_host",
+    "moe_up_mx_g",
+    "moe_down_mx_g",
+    "gemm_sk_grouped",
+    "situ_sk",
+    "f16_perm",
+    "moe_skb",
+    "mv_q8",
+    "mv3_q8",
+    "mv_q8_t",
+    "mv3_q8_t",
+    "quant_q8",
+    "gemm_q8i",
+    "mv_s6",
+    "gemm_sk_i8",
 ];
 
 fn as_bytes<T>(v: &[T]) -> &[u8] {
@@ -407,7 +478,7 @@ impl Gpu {
             (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
         }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
-        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"),CompileOptions { arch: Some("sm_120"), ..Default::default() })
+        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() })
             .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
         // 既定のストリームは CUDA Graph に記録できない
         let stream = ctx.new_stream().unwrap();
@@ -529,7 +600,16 @@ impl Gpu {
             staging,
             up_done: [ev(), ev()],
             comp_done: [ev(), ev()],
-            xc: RefCell::new(XCache { base: xbase, reserved, owner: vec![None; n_slots], slot: [[None; N_EXP]; 4], cnt: [[0.0; N_EXP]; 4], pending: vec![], ready: vec![false; n_slots], issued: vec![] }),
+            xc: RefCell::new(XCache {
+                base: xbase,
+                reserved,
+                owner: vec![None; n_slots],
+                slot: [[None; N_EXP]; 4],
+                cnt: [[0.0; N_EXP]; 4],
+                pending: vec![],
+                ready: vec![false; n_slots],
+                issued: vec![],
+            }),
             fill_done: ev(),
             hx: mapped(4 * HX),
             hio: mapped(HIO_LOGITS + VOCAB * 4),
@@ -760,7 +840,10 @@ impl Gpu {
     fn run(&self, t: usize, verify: bool) {
         let key = (t, verify);
         let small = t <= SPEC_T && !model::tracing();
-        if small && !stamping() && let Some(gs) = self.graphs.borrow().get(&key) {
+        if small
+            && !stamping()
+            && let Some(gs) = self.graphs.borrow().get(&key)
+        {
             if t == 1 {
                 gs[0].launch().unwrap();
                 self.serve_host();
@@ -1285,7 +1368,6 @@ impl Gpu {
         }
     }
 
-
     /// (prefill) 20〜23層の MoE を、expert 8個ずつの組に分け、一部の組は PCIe で送って GPU で、残りは CPU で同時に計算する。
     /// b.h を読み b.y に書く
     fn hybrid_moe(&self, il: usize, t: usize) {
@@ -1444,7 +1526,17 @@ impl Gpu {
         let wstride = if l.global { D } else { 0 };
         let fused = il > 0 && !msgs;
         if il > 0 {
-            self.mix(b.blocks, *nb, b.x, l.attn_query, if l.global { 3 } else { 1 }, b.inp, t, fused.then_some((l.norms, wstride)), if msgs && t == 1 { b.rms } else { 0 });
+            self.mix(
+                b.blocks,
+                *nb,
+                b.x,
+                l.attn_query,
+                if l.global { 3 } else { 1 },
+                b.inp,
+                t,
+                fused.then_some((l.norms, wstride)),
+                if msgs && t == 1 { b.rms } else { 0 },
+            );
         } else {
             self.copy(b.inp, b.x, t * D);
         }
@@ -1710,7 +1802,8 @@ mod tests {
     /// カーネルが NVRTC でコンパイルでき、KERNELS の名前がどれも gpu.cu にある (GPU がなくても確かめられる)
     #[test]
     fn kernels_compile() {
-        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
+        let ptx =
+            compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
         let src = ptx.to_src();
         for k in KERNELS {
             assert!(src.contains(&format!(".entry {k}(")), "{k} がない");

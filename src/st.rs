@@ -23,8 +23,7 @@ impl SafeTensors {
         // SAFETY: 重みファイルは読み取り専用で、実行中に書き換えられない前提
         let mmap = unsafe { Mmap::map(&file)? };
         let n = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-        let header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&mmap[8..8 + n]).map_err(std::io::Error::other)?;
+        let header: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&mmap[8..8 + n]).map_err(std::io::Error::other)?;
         let mut index = HashMap::new();
         for (name, v) in header {
             if name == "__metadata__" {

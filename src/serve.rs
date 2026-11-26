@@ -173,7 +173,9 @@ impl Engine {
             return Err(format!("プロンプトが {} トークンあり、文脈長の上限 {max_ctx} を超えている", prompt.len()));
         }
         let live = if prompt.len() > self.cached.len() && prompt.starts_with(&self.cached) { self.cached.len() } else { 0 };
-        let best = (0..self.kv.len()).filter(|&i| self.kv[i].tokens.len() < prompt.len() && prompt.starts_with(&self.kv[i].tokens)).max_by_key(|&i| self.kv[i].tokens.len());
+        let best = (0..self.kv.len())
+            .filter(|&i| self.kv[i].tokens.len() < prompt.len() && prompt.starts_with(&self.kv[i].tokens))
+            .max_by_key(|&i| self.kv[i].tokens.len());
         if let Some(i) = best.filter(|&i| self.kv[i].tokens.len() > live) {
             self.kv[..=i].rotate_right(1);
             let s = &self.kv[0];
@@ -399,7 +401,13 @@ fn sample(logits: &[f32], p: &Params, rng: &mut u64) -> u32 {
         return argmax(logits);
     }
     let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-    let limit = if p.top_k > 0 { p.top_k } else if p.top_p < 1.0 { 1000 } else { 0 };
+    let limit = if p.top_k > 0 {
+        p.top_k
+    } else if p.top_p < 1.0 {
+        1000
+    } else {
+        0
+    };
     if limit > 0 && limit < idx.len() {
         idx.select_nth_unstable_by(limit, |&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
         idx.truncate(limit);
@@ -578,7 +586,8 @@ fn tool_call(text: &str, id: String, index: usize) -> Option<Value> {
 
 fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
     let tools = if req["tool_choice"] == "none" { vec![] } else { req["tools"].as_array().cloned().unwrap_or_default() };
-    let prompt = match parse_messages(&req["messages"]).and_then(|m| Ok((m, effort(&req["reasoning_effort"])?))).and_then(|(m, e)| engine.prompt(&m, &tools, e)) {
+    let prompt = match parse_messages(&req["messages"]).and_then(|m| Ok((m, effort(&req["reasoning_effort"])?))).and_then(|(m, e)| engine.prompt(&m, &tools, e))
+    {
         Ok(p) => p,
         Err(e) => return respond(s, 400, &err_json(&e)),
     };
@@ -655,8 +664,12 @@ fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<
             if !calls.is_empty() {
                 msg["tool_calls"] = json!(calls);
             }
-            respond(s, 200, &json!({"id": id, "object": "chat.completion", "created": created, "model": MODEL_ID,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage(n)}))
+            respond(
+                s,
+                200,
+                &json!({"id": id, "object": "chat.completion", "created": created, "model": MODEL_ID,
+                "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage(n)}),
+            )
         }
         Err(e) => respond(s, 400, &err_json(&e)),
     }

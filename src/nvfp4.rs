@@ -16,11 +16,7 @@ pub fn e4m3(b: u8) -> f32 {
     if exp == 0xf && b & 7 == 7 {
         return f32::NAN;
     }
-    if exp == 0 {
-        sign * man / 8.0 * 2f32.powi(-6)
-    } else {
-        sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-    }
+    if exp == 0 { sign * man / 8.0 * 2f32.powi(-6) } else { sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7) }
 }
 
 /// 1行を展開する。packed は n/2 バイト、scales は n/16 バイト。下位ニブルが偶数番目の要素。

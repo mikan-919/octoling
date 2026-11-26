@@ -60,12 +60,12 @@ pub struct Drafter {
     alpha: [[f32; 4]; 4],
     jctx: P,
     jb: P,
-    j01: P, // [768][512] f32: rnn_proj の、状態と前のトークンに掛かる列
-    w1: P,  // [201024][256] BF16: 前のトークンの幅 256 の埋め込み
-    state: P, // [256]: Markov ヘッドの状態
-    raw: P,   // [768]: Markov ヘッドの1手の rnn_proj の出力
-    fpart: P, // fold_mv の結果 [語彙 / 64][3]
-    fold: Fp8,          // [201024][256] = 本体の出力層 x hidden_out
+    j01: P,    // [768][512] f32: rnn_proj の、状態と前のトークンに掛かる列
+    w1: P,     // [201024][256] BF16: 前のトークンの幅 256 の埋め込み
+    state: P,  // [256]: Markov ヘッドの状態
+    raw: P,    // [768]: Markov ヘッドの1手の rnn_proj の出力
+    fpart: P,  // fold_mv の結果 [語彙 / 64][3]
+    fold: Fp8, // [201024][256] = 本体の出力層 x hidden_out
     fold_b: P,
     pub(super) ctx_end: usize,
     // 確信度の補正: (送った下書きの top-1 確率の積の和, 実際に当たった数) の指数移動平均。比で tau を動かす
@@ -87,7 +87,7 @@ pub struct Drafter {
     kv: P,
     lat: P,
     res: P,
-    part: P, // dr_attn の部分結果 [分割][8][24][HD + 2]
+    part: P,   // dr_attn の部分結果 [分割][8][24][HD + 2]
     anchor: P, // [4][D]: 文脈の最後の位置の taps
 }
 
@@ -132,7 +132,16 @@ impl Drafter {
                     qn: v("self_attn.q_norm.weight", HD, &mut up),
                     kn: v("self_attn.k_norm.weight", HD, &mut up),
                     knc: v("self_attn.k_norm_ctx.weight", HD, &mut up),
-                    qkv: fp8(g, &mut up, &[get(&p("self_attn.q_proj.weight"), &[3072, D]), get(&p("self_attn.k_proj.weight"), &[1024, D]), get(&p("self_attn.v_proj.weight"), &[1024, D])], D),
+                    qkv: fp8(
+                        g,
+                        &mut up,
+                        &[
+                            get(&p("self_attn.q_proj.weight"), &[3072, D]),
+                            get(&p("self_attn.k_proj.weight"), &[1024, D]),
+                            get(&p("self_attn.v_proj.weight"), &[1024, D]),
+                        ],
+                        D,
+                    ),
                     kvc: fp8(g, &mut up, &[get(&p("self_attn.k_proj_ctx.weight"), &[1024, D]), get(&p("self_attn.v_proj_ctx.weight"), &[1024, D])], D),
                     wo: fp8(g, &mut up, &[get(&p("self_attn.o_proj.weight"), &[D, 3072])], 3072),
                     gu: fp8(g, &mut up, &[get(&p("mlp.gate_proj.weight"), &[9216, D]), get(&p("mlp.up_proj.weight"), &[9216, D])], D),

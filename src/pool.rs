@@ -2,8 +2,8 @@
 //! rayon のようにスレッドを眠らせて起こすと、その往復が計算時間より長くなる。
 //! ponytail: 待機中も全スレッドが CPU を使い続ける。常駐サーバーにするなら一定時間後に眠らせる。
 
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::SeqCst};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::SeqCst};
 
 struct Job {
     f: *const (dyn Fn(usize) + Sync),

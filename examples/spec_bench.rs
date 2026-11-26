@@ -26,7 +26,8 @@ fn main() {
     let mut g = Gpu::new(m, ctx);
     let mut d = Drafter::load(&g, &dir.join("mtp.safetensors"));
     let repeat = std::env::var("OCTO_REPEAT").map_or(1, |s| s.parse().unwrap());
-    let force: Option<Vec<u32>> = std::env::var("OCTO_FORCE").ok().map(|f| std::fs::read_to_string(f).unwrap().trim().split(',').map(|t| t.parse().unwrap()).collect());
+    let force: Option<Vec<u32>> =
+        std::env::var("OCTO_FORCE").ok().map(|f| std::fs::read_to_string(f).unwrap().trim().split(',').map(|t| t.parse().unwrap()).collect());
     for _ in 0..repeat {
         for p in &prompts {
             g.reset();
@@ -42,7 +43,9 @@ fn main() {
             g.reset();
             d.reset();
             let mut next = argmax(&g.prefill_with(p, |g, c| d.add_ctx(g, c)));
-            if let Some(f) = &force { next = f[0]; }
+            if let Some(f) = &force {
+                next = f[0];
+            }
             let mut got: Vec<u32> = vec![];
             let (mut steps, mut sent, mut hist) = (0usize, 0usize, [0usize; SPEC_T + 1]);
             let mut ms = [0f64; 3];
@@ -55,7 +58,10 @@ fn main() {
                 ms[0] += t.elapsed().as_secs_f64();
                 let t = Instant::now();
                 let mut pred = g.verify(&chunk);
-                if let Some(f) = &force { let b = got.len(); pred = (0..chunk.len()).map(|i| f[(b + i + 1).min(f.len() - 1)]).collect(); }
+                if let Some(f) = &force {
+                    let b = got.len();
+                    pred = (0..chunk.len()).map(|i| f[(b + i + 1).min(f.len() - 1)]).collect();
+                }
                 ms[1] += t.elapsed().as_secs_f64();
                 let mut k = 1;
                 while k < chunk.len() && pred[k - 1] == chunk[k] {

@@ -63,7 +63,7 @@ pub(crate) struct Layer {
     pub(crate) sink: W,
     pub(crate) q_clip: W,
     pub(crate) rel_clip: W,
-    pub(crate) rel_proj: W, // [N_REL, EXTENT]
+    pub(crate) rel_proj: W,           // [N_REL, EXTENT]
     pub(crate) k_conv: Vec<[f32; 4]>, // [ch][k]、k=3 が現在のトークン
     pub(crate) v_conv: Vec<[f32; 4]>,
     pub(crate) k_dyn: Option<W>,
@@ -74,7 +74,7 @@ pub(crate) struct Layer {
     pub(crate) router: W,
     pub(crate) router_bias: &'static [f32],
     pub(crate) experts: Experts,
-    pub(crate) ctrl: Option<[Ctrl; 4]>, // q, k, v, mlp
+    pub(crate) ctrl: Option<[Ctrl; 4]>,     // q, k, v, mlp
     pub(crate) msg_query: Option<Vec<f32>>, // [4, D]
     /// (SQ 形式) wq, wr, gate_attn, wk, wv, wo が Q8_ROW なら、その生のバイト列。GPU は BF16 に広げずに使う
     pub(crate) q8: [Option<&'static [u8]>; 6],
@@ -185,13 +185,16 @@ impl Model {
         Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i), &|name| pack.q8(name), pack.s6("model.llm.unembed.weight"))
     }
 
-    fn build(get: &dyn Fn(&str, &str, &[usize]) -> &'static [u8], experts: &dyn Fn(usize) -> Experts, q8: &dyn Fn(&str) -> Option<&'static [u8]>, unembed_s6: Option<&'static [u8]>) -> Self {
+    fn build(
+        get: &dyn Fn(&str, &str, &[usize]) -> &'static [u8],
+        experts: &dyn Fn(usize) -> Experts,
+        q8: &dyn Fn(&str) -> Option<&'static [u8]>,
+        unembed_s6: Option<&'static [u8]>,
+    ) -> Self {
         let bf = |name: &str, shape: &[usize]| -> W { cast(get(name, "BF16", shape)) };
         let f32s = |name: &str, shape: &[usize]| -> &'static [f32] { cast(get(name, "F32", shape)) };
         let bf_f32 = |name: &str, shape: &[usize]| -> Vec<f32> { bf(name, shape).iter().map(|&x| bf16(x)).collect() };
-        let conv = |name: &str, ch: usize| -> Vec<[f32; 4]> {
-            bf_f32(name, &[ch, 1, 4]).chunks(4).map(|c| c.try_into().unwrap()).collect()
-        };
+        let conv = |name: &str, ch: usize| -> Vec<[f32; 4]> { bf_f32(name, &[ch, 1, 4]).chunks(4).map(|c| c.try_into().unwrap()).collect() };
         // static_w は [lag, ch] で lag=0 が現在のトークン
         let static_conv = |name: &str, ch: usize| -> Vec<[f32; 4]> {
             let w = bf_f32(name, &[4, ch]);
@@ -242,7 +245,8 @@ impl Model {
                     wr: bf(&n("attn.wr_du.weight"), &[N_REL * N_HEAD, D]),
                     gate_attn: bf(&n("attn.gate_attn.weight"), &[N_HEAD * HD, D]),
                     sink: bf(&n("attn.attn_sink_proj.weight"), &[N_HEAD, D]),
-                    q8: ["attn.wq_du.weight", "attn.wr_du.weight", "attn.gate_attn.weight", "attn.wk_dv.weight", "attn.wv_dv.weight", "attn.wo_ud.weight"].map(|s| q8(&n(s))),
+                    q8: ["attn.wq_du.weight", "attn.wr_du.weight", "attn.gate_attn.weight", "attn.wk_dv.weight", "attn.wv_dv.weight", "attn.wo_ud.weight"]
+                        .map(|s| q8(&n(s))),
                     q_clip: bf(&n("attn.q_l2_clip.scale"), &[N_HEAD, HD]),
                     rel_clip: bf(&n("attn.rel_l2_clip.scale"), &[N_HEAD, N_REL]),
                     rel_proj: bf(&n("attn.rel_logits_proj.proj"), &[N_REL, EXTENT]),
@@ -480,10 +484,19 @@ impl Model {
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
             let r0 = (task % chunks) * 64;
-            block_gemm(e, e.w13, e.s13, ex * 2 * FF + r0, D, &lists[ex], |a| &xs[a / TOP_K * D..][..D], |a, r, v| {
-                // SAFETY: (expert, 行) ごとに書く場所は重ならない
-                unsafe { *out.at(a * 2 * FF + r0 + r) = v * e.g13(ex) };
-            });
+            block_gemm(
+                e,
+                e.w13,
+                e.s13,
+                ex * 2 * FF + r0,
+                D,
+                &lists[ex],
+                |a| &xs[a / TOP_K * D..][..D],
+                |a, r, v| {
+                    // SAFETY: (expert, 行) ごとに書く場所は重ならない
+                    unsafe { *out.at(a * 2 * FF + r0 + r) = v * e.g13(ex) };
+                },
+            );
         });
         let mut act = vec![0.0; n_assign * FF];
         crate::pool::chunks_mut(&mut act, FF, |a, o| o.copy_from_slice(&situ_pairs(&gu[a * 2 * FF..][..2 * FF])));
@@ -494,10 +507,19 @@ impl Model {
         crate::pool::run(used.len() * chunks, &|task| {
             let ex = used[task / chunks];
             let r0 = (task % chunks) * 64;
-            block_gemm(e, e.w2, e.s2, ex * D + r0, FF, &lists[ex], |a| &act[a * FF..][..FF], |a, r, v| {
-                // SAFETY: 同上
-                unsafe { *out.at(a * D + r0 + r) = v * e.g2(ex) * wts[a] };
-            });
+            block_gemm(
+                e,
+                e.w2,
+                e.s2,
+                ex * D + r0,
+                FF,
+                &lists[ex],
+                |a| &act[a * FF..][..FF],
+                |a, r, v| {
+                    // SAFETY: 同上
+                    unsafe { *out.at(a * D + r0 + r) = v * e.g2(ex) * wts[a] };
+                },
+            );
         });
         let mut y = vec![0.0; t * D];
         crate::pool::chunks_mut(&mut y, D, |tok, o| {
@@ -512,7 +534,16 @@ impl Model {
 /// expert の重みの 64 行 (row0 から) と、list の各割り当ての入力 x(a) (長さ k) の積を out(a, 行, 値) に渡す。
 /// 64 行を f32 に展開し、列を KB ずつに区切って 2行 x 4トークンの組で積和する。
 /// 4トークン分の x の区間 (4 x KB x 4 バイト) が L1 に残り、重みの行は L2 から読む。
-fn block_gemm<'a>(e: &Experts, w: &[u8], s: &[u8], row0: usize, k: usize, list: &[usize], x: impl Fn(usize) -> &'a [f32], mut out: impl FnMut(usize, usize, f32)) {
+fn block_gemm<'a>(
+    e: &Experts,
+    w: &[u8],
+    s: &[u8],
+    row0: usize,
+    k: usize,
+    list: &[usize],
+    x: impl Fn(usize) -> &'a [f32],
+    mut out: impl FnMut(usize, usize, f32),
+) {
     const ROWS: usize = 64;
     const KB: usize = 1152;
     // 割り当てが少ない (検証の小さいバッチ) と、行を f32 に展開する手間のほうが重いので、量子化のまま内積をとる
