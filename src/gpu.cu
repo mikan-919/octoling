@@ -1298,33 +1298,60 @@ extern "C" __global__ void moe_down_nvfp4(const u8* w2, const u8* s2, const floa
     }
 }
 
-// (T <= 8 用) y[t][r] = sum_c W[r][c] x[t][c]。W は BF16。重みを1回読むあいだに T 本と積和する。1行を1ワープで計算する
-extern "C" __global__ void mv_bf16_t(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
-    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (row >= rows) return;
-    const uint4* wr = (const uint4*)(w + (size_t)row * cols);
+// (T <= 8 用) y[t][r] = sum_c W[r][c] x[t][c]。W は BF16。重みを1回読むあいだに T 本と積和する。
+// 1ワープが BF_R 行を計算し、読んだ活性を BF_R 行に使い回す (1行ずつだと、T = 8 では L1 から読む活性が重みの 16 倍になり、VRAM の帯域の半分しか出ない)。
+// 行ごとの足す順は、1ワープで1行を計算するときと同じ
+#define BF_R 4
+__device__ __forceinline__ void mv_bf16_rows(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T, int r0) {
+    int lane = threadIdx.x & 31;
+    const uint4* wr[BF_R]; // rows を超える行は最後の行を読み、書かない
+    #pragma unroll
+    for (int r = 0; r < BF_R; r++) wr[r] = (const uint4*)(w + (size_t)min(r0 + r, rows - 1) * cols);
     // 重みは前のカーネルに依存しないので、待つあいだに L2 へ読み込んでおく
-    for (int i = lane * 8; i < cols / 8; i += 256) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr + i));
+    #pragma unroll
+    for (int r = 0; r < BF_R; r++)
+        for (int i = lane * 8; i < cols / 8; i += 256) asm volatile("prefetch.global.L2 [%0];" :: "l"(wr[r] + i));
     PDL();
-    float acc[8] = {};
-    #pragma unroll 2
+    float acc[BF_R][8] = {};
     for (int i = lane; i < cols / 8; i += 32) {
-        uint4 v = __ldg(wr + i);
-        float wf[8] = {bf(v.x & 0xffffu), bf(v.x >> 16), bf(v.y & 0xffffu), bf(v.y >> 16), bf(v.z & 0xffffu), bf(v.z >> 16), bf(v.w & 0xffffu), bf(v.w >> 16)};
+        float wf[BF_R][8];
+        #pragma unroll
+        for (int r = 0; r < BF_R; r++) {
+            uint4 v = __ldg(wr[r] + i);
+            float f[8] = {bf(v.x & 0xffffu), bf(v.x >> 16), bf(v.y & 0xffffu), bf(v.y >> 16), bf(v.z & 0xffffu), bf(v.z >> 16), bf(v.w & 0xffffu), bf(v.w >> 16)};
+            #pragma unroll
+            for (int e = 0; e < 8; e++) wf[r][e] = f[e];
+        }
         #pragma unroll
         for (int t = 0; t < 8; t++) {
             if (t >= T) break;
             const float4* xx = (const float4*)(x + (size_t)t * cols + i * 8);
             float4 a = xx[0], b = xx[1];
-            acc[t] += wf[0] * a.x + wf[1] * a.y + wf[2] * a.z + wf[3] * a.w + wf[4] * b.x + wf[5] * b.y + wf[6] * b.z + wf[7] * b.w;
+            #pragma unroll
+            for (int r = 0; r < BF_R; r++)
+                acc[r][t] += wf[r][0] * a.x + wf[r][1] * a.y + wf[r][2] * a.z + wf[r][3] * a.w + wf[r][4] * b.x + wf[r][5] * b.y + wf[r][6] * b.z + wf[r][7] * b.w;
         }
     }
     #pragma unroll
-    for (int t = 0; t < 8; t++) {
-        if (t >= T) break;
-        float s = warp_sum(acc[t]);
-        if (lane == 0) y[(size_t)t * rows + row] = s;
-    }
+    for (int r = 0; r < BF_R; r++)
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            if (t >= T) break;
+            float s = warp_sum(acc[r][t]);
+            if (lane == 0 && r0 + r < rows) y[(size_t)t * rows + r0 + r] = s;
+        }
+}
+extern "C" __global__ void mv_bf16_t(const bf16* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int rows, int cols, int T) {
+    int r0 = ((blockIdx.x * blockDim.x + threadIdx.x) >> 5) * BF_R;
+    if (r0 < rows) mv_bf16_rows(w, x, y, rows, cols, T, r0);
+}
+// Q, K, V の3つの行列 (列は D) を1回の起動で。ワープは行列ごとに rows / BF_R (切り上げ) 個ずつ、Q, K, V の順
+extern "C" __global__ void mv3_bf16_t(const bf16* w0, const float* x0, float* y0, int r0, const bf16* w1, const float* x1, float* y1, int r1,
+                                      const bf16* w2, const float* x2, float* y2, int r2, int T) {
+    int wi = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, n0 = (r0 + BF_R - 1) / BF_R, n1 = (r1 + BF_R - 1) / BF_R, n2 = (r2 + BF_R - 1) / BF_R;
+    if (wi < n0) mv_bf16_rows(w0, x0, y0, r0, D, T, wi * BF_R);
+    else if (wi < n0 + n1) mv_bf16_rows(w1, x1, y1, r1, D, T, (wi - n0) * BF_R);
+    else if (wi < n0 + n1 + n2) mv_bf16_rows(w2, x2, y2, r2, D, T, (wi - n0 - n1) * BF_R);
 }
 
 // (prefill 用) T*8 個の割り当て (トークン t の k 番目 = t*8+k) を expert 順に並べる。order[off[e]..off[e+1]] が expert e の割り当て。
