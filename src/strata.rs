@@ -185,8 +185,8 @@ impl Pack {
         }
         let (rows, cols) = if t.fmt == "Q8_ROW" || t.fmt == "S6_K" { (shape[0], shape[1]) } else { (1, shape.iter().product()) };
         let row = |r: usize, o: &mut [f32]| match t.fmt.as_str() {
-            "F32" => o.iter_mut().zip(raw.chunks_exact(4)).for_each(|(o, b)| *o = f32::from_le_bytes(b.try_into().unwrap())),
-            "BF16" => o.iter_mut().zip(raw.chunks_exact(2)).for_each(|(o, b)| *o = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
+            "F32" => o.iter_mut().zip(raw.as_chunks::<4>().0).for_each(|(o, b)| *o = f32::from_le_bytes(*b)),
+            "BF16" => o.iter_mut().zip(raw.as_chunks::<2>().0).for_each(|(o, b)| *o = f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
             "Q8_ROW" => {
                 let sc = f32::from_le_bytes(raw[r * 4..r * 4 + 4].try_into().unwrap());
                 let q = &raw[rows * 4 + r * cols..][..cols];
@@ -336,7 +336,7 @@ impl SkLayer {
         }
         let mut pair = [0.0; D];
         sk_row(b.dn, &b.body[b.dn_off + r / 2 * SB_REC * sb_bytes(b.dn)..], &mut pair);
-        pair[r % 2 * FF..][..FF].iter().zip(act).zip(b.body.chunks_exact(2)).map(|((w, x), s)| w * x / f16(u16::from_le_bytes([s[0], s[1]]))).sum()
+        pair[r % 2 * FF..][..FF].iter().zip(act).zip(b.body.as_chunks::<2>().0).map(|((w, x), s)| w * x / f16(u16::from_le_bytes([s[0], s[1]]))).sum()
     }
 
     pub(crate) fn image(&self) -> SkImage {
@@ -372,7 +372,7 @@ impl SkLayer {
         let mut ixd = vec![1.0; N_EXP * FF];
         for (b, o) in self.bodies.iter().zip(ixd.chunks_mut(FF)) {
             if b.dn != SF4 {
-                o.iter_mut().zip(b.body.chunks_exact(2)).for_each(|(o, s)| *o = 1.0 / f16(u16::from_le_bytes([s[0], s[1]])));
+                o.iter_mut().zip(b.body.as_chunks::<2>().0).for_each(|(o, s)| *o = 1.0 / f16(u16::from_le_bytes([s[0], s[1]])));
             }
         }
         SkImage { bytes, tab, ixd }

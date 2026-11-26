@@ -209,6 +209,8 @@ impl Engine {
         let (mut n, mut steps, mut t_draft, mut t_verify) = (0, 0, 0f64, 0f64);
         let greedy = p.temperature <= 0.0 || p.top_k == 1;
         let mut rng = p.seed | 1;
+        // if let で self.draft を借りたままにすると、中の self.emit を呼べない
+        #[allow(clippy::unnecessary_unwrap)]
         let finish = if self.draft.is_some() {
             // 投機的デコード: 下書きをまとめて検証し、本体の分布から選んだトークンと一致した先頭までを受け入れる。
             // 1行ごとの選び方は1トークンずつ生成するときと同じなので、出力の分布は変わらない

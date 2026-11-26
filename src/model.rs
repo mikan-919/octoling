@@ -105,8 +105,7 @@ pub struct State {
 
 impl State {
     pub fn new() -> Self {
-        let mut s = Slot::default();
-        s.hist = [vec![[0.0; 3]; N_KV * HD], vec![[0.0; 3]; N_KV * HD], vec![[0.0; 3]; D], vec![[0.0; 3]; D]];
+        let s = Slot { hist: [vec![[0.0; 3]; N_KV * HD], vec![[0.0; 3]; N_KV * HD], vec![[0.0; 3]; D], vec![[0.0; 3]; D]], ..Default::default() };
         Self { pos: 0, slots: vec![s; N_SLOT] }
     }
 }
@@ -405,7 +404,7 @@ impl Model {
         let a = convolve(&mv(l.wo, &o), &l.attn_conv, None, &mut slot.hist[2]);
 
         // ブロックの先頭層は残差を引き継がず、入力をブロック列に積む
-        let cur = if ip % BLOCK == 0 {
+        let cur = if ip.is_multiple_of(BLOCK) {
             blocks.push(cur);
             a
         } else {
@@ -561,7 +560,7 @@ fn block_gemm<'a>(
     }
     // 4 の倍数になるよう最後の割り当てを繰り返す (余りの結果は捨てる)
     let mut l4 = list.to_vec();
-    while l4.len() % 4 != 0 {
+    while !l4.len().is_multiple_of(4) {
         l4.push(*list.last().unwrap());
     }
     let n4 = l4.len();

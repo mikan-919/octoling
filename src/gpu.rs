@@ -704,7 +704,7 @@ impl Gpu {
         } else if t <= SPEC_T {
             k!(self, "mv_bf16_t", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
         } else {
-            debug_assert!(cols % 64 == 0);
+            debug_assert!(cols.is_multiple_of(64));
             k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
         }
     }
@@ -1089,7 +1089,7 @@ impl Gpu {
     }
 
     /// s の文脈に戻す。global の KV のうち、VRAM に同じものがある先頭 keep 位置は送らない
-    pub fn load_kv(&mut self, mut d: Option<&mut Drafter>, s: &KvSnap, keep: usize) {
+    pub fn load_kv(&mut self, d: Option<&mut Drafter>, s: &KvSnap, keep: usize) {
         let (rows, fixed) = self.kv_regions(d.as_deref());
         for (v, &p) in s.rows.iter().zip(&rows) {
             self.kv_write(p + (keep * 2048) as u64, &v[keep * 2048..]);
@@ -1100,7 +1100,7 @@ impl Gpu {
             at += n;
         }
         self.pos = s.tokens.len();
-        if let Some(d) = d.as_deref_mut() {
+        if let Some(d) = d {
             d.ctx_end = self.pos;
         }
     }

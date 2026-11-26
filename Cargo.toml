@@ -16,3 +16,10 @@ debug = 1
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[lints.clippy]
+# 数値の計算のコードで、書き方の好みに当たるもの
+excessive_precision = "allow" # 定数は出典の桁のまま書く
+needless_range_loop = "allow" # 同じ添字で複数の配列を読む
+too_many_arguments = "allow"
+type_complexity = "allow"

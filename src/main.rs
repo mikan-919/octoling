@@ -72,7 +72,7 @@ fn bench(model: Model, prompts: &str, n_gen: usize) {
     let tokens = &prompts[0];
     if std::env::var_os("OCTO_CPU").is_some() {
         let mut st = State::new();
-        step_all(&tokens, |t| model.forward(&mut st, t));
+        step_all(tokens, |t| model.forward(&mut st, t));
         return;
     }
     let mut gpu = Gpu::new(model, n_ctx());

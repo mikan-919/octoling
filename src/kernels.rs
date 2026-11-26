@@ -8,7 +8,7 @@ compile_error!("AVX-512 が必要。.cargo/config.toml の target-cpu=native で
 
 /// BF16 の行と x の内積。n は 32 の倍数。
 pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
-    assert!(w.len() == x.len() && x.len() % 32 == 0);
+    assert!(w.len() == x.len() && x.len().is_multiple_of(32));
     // SAFETY: 長さは上で検査した。読み出しは境界内の非整列ロードだけ
     unsafe {
         let (mut a0, mut a1) = (_mm512_setzero_ps(), _mm512_setzero_ps());
@@ -71,7 +71,7 @@ pub fn dot_mxfp8(w: &[u8], scales: &[u8], x: &[f32]) -> f32 {
 
 /// f32 どうしの内積。n は 32 の倍数。
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    assert!(a.len() == b.len() && a.len() % 32 == 0);
+    assert!(a.len() == b.len() && a.len().is_multiple_of(32));
     // SAFETY: 長さは上で検査した
     unsafe {
         let (mut a0, mut a1) = (_mm512_setzero_ps(), _mm512_setzero_ps());
@@ -86,7 +86,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// 2本の w と4本の x の、8通りの内積。読み込み6回で FMA 8回を回し、8本の独立な積和で FMA の待ち時間を埋める。
 pub fn dot_2x4(w: [&[f32]; 2], x: [&[f32]; 4]) -> [[f32; 4]; 2] {
     let n = w[0].len();
-    assert!(n % 16 == 0 && w[1].len() == n && x.iter().all(|x| x.len() == n));
+    assert!(n.is_multiple_of(16) && w[1].len() == n && x.iter().all(|x| x.len() == n));
     // SAFETY: 長さは上で検査した
     unsafe {
         let mut acc = [[_mm512_setzero_ps(); 4]; 2];
