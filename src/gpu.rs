@@ -292,7 +292,8 @@ pub struct Gpu {
     small: Bufs,
     big: Bufs, // expert の枠と同じ場所
     pos: usize,
-    kv_pin: usize, // KV を主記憶へ写すときに経由するページ固定メモリ (PIN バイト)
+    kv_pin: usize,   // KV を主記憶へ写すときに経由するページ固定メモリ (PIN バイト)
+    kv_bytes: usize, // global 層の KV の 1 位置のバイト数 (K か V の片方)。f16 なら 2048、FP8 なら 1024
     ctx: usize,
     // T トークン分の GPU の処理を、CPU で MoE を計算する所で区切って記録した CUDA Graph。(T, 検証か) ごと
     graphs: RefCell<HashMap<(usize, bool), Vec<CudaGraph>>>,
@@ -485,8 +486,11 @@ impl Gpu {
             (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
         }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
-        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() })
-            .unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
+        // SQ 形式は VRAM に余裕があるので、長い文脈の KV も VRAM に置く
+        let host_kv = n_ctx > VRAM_CTX && cpu.layers.iter().any(|l| l.experts.mx);
+        let kvq = kv_format(n_ctx, host_kv);
+        let kv_bytes = if kvq == 1 { 1024 } else { 2048 };
+        let ptx = compile_ptx_with_opts(include_str!("gpu.cu"), cuda_opts(kvq)).unwrap_or_else(|e| panic!("CUDA カーネルのコンパイルに失敗: {e}"));
         // 既定のストリームは CUDA Graph に記録できない
         let stream = ctx.new_stream().unwrap();
         let module = ctx.load_module(ptx).unwrap();
@@ -542,8 +546,6 @@ impl Gpu {
                 }
             })
             .collect();
-        // SQ 形式は VRAM に余裕があるので、長い文脈の KV も VRAM に置く
-        let host_kv = n_ctx > VRAM_CTX && cpu.layers.iter().any(|l| l.experts.mx);
         let slots: Vec<GSlot> = (0..N_SLOT)
             .map(|s| {
                 let global = GLOBAL_LAYERS.contains(&phys(s));
@@ -552,7 +554,7 @@ impl Gpu {
                     let [(kd, kh), (vd, vh)] = [0; 2].map(|_| mapped(rows * 1024 * 2));
                     ([kd, vd], Some([kh, vh]))
                 } else {
-                    ([0; 2].map(|_| up.zeros(rows * 1024 * 2)), None)
+                    ([0; 2].map(|_| up.zeros(rows * if global { kv_bytes } else { 2048 })), None)
                 };
                 GSlot {
                     kc,
@@ -640,6 +642,7 @@ impl Gpu {
             pos: 0,
             // SAFETY: 確保に失敗したら止まる。解放はしない
             kv_pin: unsafe { result::malloc_host(PIN, 0) }.expect("ページ固定メモリを確保できない") as usize,
+            kv_bytes,
             ctx: n_ctx,
             graphs: RefCell::new(HashMap::new()),
             recording: RefCell::new(vec![]),
@@ -1091,10 +1094,10 @@ impl Gpu {
     pub fn save_kv(&self, d: Option<&Drafter>, s: &mut KvSnap, tokens: &[u32]) {
         assert_eq!(tokens.len(), self.pos);
         let (rows, fixed) = self.kv_regions(d);
-        let from = s.tokens.len() * 2048;
+        let from = s.tokens.len() * self.kv_bytes;
         s.rows.resize_with(rows.len(), Vec::new);
         for (v, &p) in s.rows.iter_mut().zip(&rows) {
-            v.resize(self.pos * 2048, 0);
+            v.resize(self.pos * self.kv_bytes, 0);
             self.kv_read(p + from as u64, &mut v[from..]);
         }
         s.fixed.resize(fixed.iter().map(|f| f.1).sum(), 0);
@@ -1111,7 +1114,7 @@ impl Gpu {
     pub fn load_kv(&mut self, d: Option<&mut Drafter>, s: &KvSnap, keep: usize) {
         let (rows, fixed) = self.kv_regions(d.as_deref());
         for (v, &p) in s.rows.iter().zip(&rows) {
-            self.kv_write(p + (keep * 2048) as u64, &v[keep * 2048..]);
+            self.kv_write(p + (keep * self.kv_bytes) as u64, &v[keep * self.kv_bytes..]);
         }
         let mut at = 0;
         for &(p, n) in &fixed {
@@ -1863,6 +1866,22 @@ impl Drafter {
 }
 
 /// GPU から直接読み書きできる、ページ固定の主記憶を確保する。(GPU 側のアドレス, 主記憶側のアドレス)。解放はしない
+/// global 層の KV の形式 (gpu.cu の KVQ)。0 は f16、1 は FP8。OCTO_KV (f16 か fp8) で決め、無ければ文脈長の上限が VRAM_CTX を超えるとき FP8。
+/// KV が主記憶にあるときは CPU が f16 で読むので f16
+fn kv_format(n_ctx: usize, host_kv: bool) -> u32 {
+    match std::env::var("OCTO_KV").as_deref() {
+        _ if host_kv => 0,
+        Ok("fp8") => 1,
+        Ok("f16") => 0,
+        Err(_) => (n_ctx > VRAM_CTX) as u32,
+        Ok(v) => panic!("OCTO_KV は f16 か fp8 ({v})"),
+    }
+}
+
+fn cuda_opts(kvq: u32) -> CompileOptions {
+    CompileOptions { arch: Some("sm_120"), options: vec![format!("-DKVQ={kvq}")], ..Default::default() }
+}
+
 fn mapped(bytes: usize) -> (P, usize) {
     // SAFETY: 確保に失敗したら止まる。DEVICEMAP で確保した領域の GPU 側のアドレスを得る
     unsafe {
@@ -1880,11 +1899,11 @@ mod tests {
     /// カーネルが NVRTC でコンパイルでき、KERNELS の名前がどれも gpu.cu にある (GPU がなくても確かめられる)
     #[test]
     fn kernels_compile() {
-        let ptx =
-            compile_ptx_with_opts(include_str!("gpu.cu"), CompileOptions { arch: Some("sm_120"), ..Default::default() }).unwrap_or_else(|e| panic!("{e}"));
-        let src = ptx.to_src();
-        for k in KERNELS {
-            assert!(src.contains(&format!(".entry {k}(")), "{k} がない");
+        for kvq in 0..2 {
+            let src = compile_ptx_with_opts(include_str!("gpu.cu"), cuda_opts(kvq)).unwrap_or_else(|e| panic!("{e}")).to_src();
+            for k in KERNELS {
+                assert!(src.contains(&format!(".entry {k}(")), "{k} がない");
+            }
         }
     }
 }

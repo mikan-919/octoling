@@ -42,6 +42,44 @@ __device__ __forceinline__ float4 h4(const half_t* p) {
 
 __device__ __forceinline__ float bf(unsigned x) { return __uint_as_float(x << 16); }
 
+// global 層 (ring == 0) の KV キャッシュの形式。0: f16、1: FP8 (E4M3、スケールなし。行は 1024 バイト)。
+// K は L2 ノルムを 22.6 以下に、V は RMS を 1 にしてあるので、E4M3 の範囲 (448) に収まる
+#ifndef KVQ
+#define KVQ 0
+#endif
+__device__ __forceinline__ unsigned f2e4m3(float x) {
+    unsigned short r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(x));
+    return r & 0xffu;
+}
+// E4M3 2つ (下位バイトが先) を f16 2つに
+__device__ __forceinline__ unsigned e4m3x2_h2(unsigned b) {
+    unsigned r;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)b));
+    return r;
+}
+// KV の行の要素 i に x を書く
+__device__ __forceinline__ void kv_put(half_t* base, size_t i, float x, int ring) {
+    if (KVQ == 1 && !ring) ((u8*)base)[i] = f2e4m3(x);
+    else base[i] = f2h(x);
+}
+// KV の行の要素 i から 4 個を f32 で
+__device__ __forceinline__ float4 kv4(const half_t* base, size_t i, int ring) {
+    if (KVQ == 1 && !ring) {
+        unsigned u = *(const unsigned*)((const u8*)base + i), a = e4m3x2_h2(u & 0xffffu), b = e4m3x2_h2(u >> 16);
+        return make_float4(h2f(a & 0xffff), h2f(a >> 16), h2f(b & 0xffff), h2f(b >> 16));
+    }
+    return h4(base + i);
+}
+// KV の行の要素 i から 8 個を f16 x 8 で
+__device__ __forceinline__ uint4 kv8(const half_t* base, size_t i, int ring) {
+    if (KVQ == 1 && !ring) {
+        uint2 u = *(const uint2*)((const u8*)base + i);
+        return make_uint4(e4m3x2_h2(u.x & 0xffffu), e4m3x2_h2(u.x >> 16), e4m3x2_h2(u.y & 0xffffu), e4m3x2_h2(u.y >> 16));
+    }
+    return *(const uint4*)(base + i);
+}
+
 // E2M1 と E4M3 は、ビットを f32 の指数部と仮数部の位置へずらすと 2^-126 倍、2^-120 倍の値になる (非正規化数も同じ式で合う)
 __device__ __forceinline__ float e2m1(unsigned n) { return __uint_as_float(((n & 7u) << 22) | ((n & 8u) << 28)) * 0x1p126f; }
 __device__ __forceinline__ float e4m3(unsigned b) { return __uint_as_float(((b & 0x7fu) << 20) | ((b & 0x80u) << 24)) * 0x1p120f; }
@@ -717,8 +755,6 @@ extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp,
     const float* v = vp + (size_t)blockIdx.y * 1024;
     float tau = ring ? 1.f : 1.f + 0.1f * logf(fmaxf(1.f, (pos + 1.f) / 8192.f));
     size_t row = (size_t)(ring ? pos % ring : pos) * 1024;
-    kc += row;
-    vc += row;
     if (b < 24) {
         float x = q[b * HD + t] * qclip[b * HD + t];
         x *= clip_scale(x, 22.627416997969522f);
@@ -731,11 +767,11 @@ extern "C" __global__ void qkv_post(float* qx, const float* kp, const float* vp,
     } else if (b < 56) {
         int h = b - 48;
         float x = k[h * HD + t];
-        kc[h * HD + t] = f2h(x * clip_scale(x, 22.627416997969522f));
+        kv_put(kc, row + h * HD + t, x * clip_scale(x, 22.627416997969522f), ring);
     } else {
         int h = b - 56;
         float x = v[h * HD + t];
-        vc[h * HD + t] = f2h(x * rsqrtf(block_sum(x * x) / HD + 1e-6f));
+        kv_put(vc, row + h * HD + t, x * rsqrtf(block_sum(x * x) / HD + 1e-6f), ring);
     }
 }
 
@@ -789,7 +825,7 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
         // スコア: ワープがキーを 1 つずつ受け持つ。q.k / sqrt(HD) と相対位置バイアスを、ワープの和で一度に求める
         #pragma unroll 4
         for (int j = s0 + warp; j < s1; j += 4) {
-            float4 k = h4(kc + kv_row(j, ring) + kvh * HD + lane * 4);
+            float4 k = kv4(kc, kv_row(j, ring) + kvh * HD + lane * 4, ring);
             int d = pos - j;
             float rp = lane < NREL && d < EXTENT ? rel_proj[lane * EXTENT + d] : 0.f;
             #pragma unroll
@@ -813,7 +849,7 @@ extern "C" __global__ void attn_part(const float* qx, const half_t* kc, const ha
         // 値: ワープがキーを分け、レーンが 4 次元ずつ積和する
         #pragma unroll 8
         for (int i = warp; i < s1 - s0; i += 4) {
-            float4 v = h4(vc + kv_row(s0 + i, ring) + kvh * HD + lane * 4);
+            float4 v = kv4(vc, kv_row(s0 + i, ring) + kvh * HD + lane * 4, ring);
             #pragma unroll
             for (int h = 0; h < 3; h++) {
                 float p = sc[h][i];
@@ -1044,8 +1080,8 @@ extern "C" __global__ void attn_fa(const float* qx, const half_t* kc, const half
             int i = tid + 192 * q, k = i / (HD / 8), c = i % (HD / 8) * 8, j = j0 + k;
             kr[q] = vr[q] = make_uint4(0, 0, 0, 0);
             if (i < FK * HD / 8 && j <= jmax) {
-                kr[q] = *(const uint4*)(kc + kv_row(j, ring) + kvh * HD + c);
-                vr[q] = *(const uint4*)(vc + kv_row(j, ring) + kvh * HD + c);
+                kr[q] = kv8(kc, kv_row(j, ring) + kvh * HD + c, ring);
+                vr[q] = kv8(vc, kv_row(j, ring) + kvh * HD + c, ring);
             }
         }
     };
@@ -1969,12 +2005,6 @@ extern "C" __global__ void argmax_rows(const float* x, int stride, int n, int* o
 #define DRAFT_CTX 8192 // 下書きモデルが扱う文脈の長さ (global 層の KV を VRAM に置く)
 #define DQKV(G) ((G) * 8 * HD + 2048)
 
-__device__ __forceinline__ unsigned char f2e4m3(float x) {
-    unsigned short r;
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(0.f), "f"(x));
-    return (unsigned char)(r & 0xff);
-}
-
 // BF16 の行を、行の最大の絶対値が 448 になるスケールで FP8 にする。ブロックは行ごと、256スレッド
 extern "C" __global__ void quant_rows_bf16(const bf16* src, int cols, u8* dst, float* scale) {
     PDL();
@@ -2855,8 +2885,8 @@ extern "C" __global__ void qkv_conv_post(float* qx, const float* kx, const float
     hist[c * 3 + 1] = h2;
     hist[c * 3 + 2] = x;
     // qkv_post
-    if (isk) kc[row + c] = f2h(y * clip_scale(y, 22.627416997969522f));
-    else vc[row + c] = f2h(y * rsqrtf(block_sum(y * y) / HD + 1e-6f));
+    if (isk) kv_put(kc, row + c, y * clip_scale(y, 22.627416997969522f), ring);
+    else kv_put(vc, row + c, y * rsqrtf(block_sum(y * y) / HD + 1e-6f), ring);
     // KV が主記憶にあれば、CPU が読む前に書き終える
     if (host) __threadfence_system();
 }
