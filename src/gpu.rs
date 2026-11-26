@@ -380,11 +380,12 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 81] = [
+const KERNELS: [&str; 82] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
     "mix",
+    "mix_p",
     "norm2",
     "control",
     "conv",
@@ -749,7 +750,11 @@ impl Gpu {
     fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>, rms: P) {
         assert!(nb < 5, "mix は状態 5 個まで (MIX_NS)");
         let (nw, nws) = norm.unwrap_or((0, 0));
-        k!(self, "mix", (nq, t), 768, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        if t <= SPEC_T {
+            k!(self, "mix", (nq, t), 768, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        } else {
+            k!(self, "mix_p", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        }
     }
 
     /// control cs[j] (j < 3) を、入力 j に メッセージ msg + slab(j) でかけて out + slab(j) に書く。並びは [j][T][D]。

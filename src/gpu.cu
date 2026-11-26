@@ -557,9 +557,8 @@ extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y, int
 // 各スレッドは要素 threadIdx.x + 256j を受け持ち、全状態の値を先にまとめて読む (読み込みを1つずつ待つと L2 の待ちが積み重なる)。
 // 足す順は、状態ごとに block_sum で足していたときと同じ
 #define MIX_NS 5
-#define MIX_TH 768 // スレッド数 (D の約数で 32 の倍数)
-extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
-    PDL();
+// MIX_TH はスレッド数 (D の約数で 32 の倍数)
+template <int MIX_TH> __device__ __forceinline__ void mix_t(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
     int t = blockIdx.y, ns = nb + 1;
     const float* q = queries + blockIdx.x * D;
     float v[D / MIX_TH][MIX_NS], qv[D / MIX_TH];
@@ -620,6 +619,15 @@ extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, co
         int i = threadIdx.x + j * MIX_TH;
         out[((size_t)blockIdx.x * T + t) * D + i] = nw ? o[j] * k * nw[i] : o[j];
     }
+}
+// 生成と検証 (T <= 8) はブロックあたり 768 スレッド。prefill は 256 スレッドにして、SM に載るブロックを増やす (768 では SM に 2 つしか載らず、トークンの数だけ待ちが積み重なる)
+extern "C" __global__ void mix(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
+    PDL();
+    mix_t<768>(blocks, nb, cur, queries, out, T, nw, nws, rms);
+}
+extern "C" __global__ void mix_p(const float* blocks, int nb, const float* cur, const float* queries, float* out, int T, const float* nw, int nws, float* rms) {
+    PDL();
+    mix_t<256>(blocks, nb, cur, queries, out, T, nw, nws, rms);
 }
 
 // control の前半: トークンごとに [rmsnorm(cur), rmsnorm(msg)] を out [T][2D] に並べる。ブロックは (2, T)
