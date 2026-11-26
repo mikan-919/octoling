@@ -1,5 +1,7 @@
 # octoling
 
+日本語 | [English](README.en.md)
+
 Thinking Machines Lab の言語モデル [Inkling-2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) の文章の部分を、NVIDIA の GPU 1枚で動かす推論エンジンです。Rust と CUDA で書いています。OpenAI 互換の HTTP API、ターミナルでの1回の質問、速さの測定の3つの使い方があります。
 
 重みは2つの形式を読めます。1つは公式の safetensors（NVFP4 と MXFP8）、もう1つは [Strata](https://github.com/Niko1221/Strata) が配布する量子化済みの SQ-10（`.strata`、約 10.5 GB）です。16 GB の GPU では SQ-10 を使うと全体が VRAM に載ります。生成には、公式の下書きモデル（`mtp.safetensors`）による投機的デコード（小さなモデルが数トークン先を予想し、本体がそれを1回の計算でまとめて確かめる方法。採用するのは本体が確かめたトークンだけ）を使います。
