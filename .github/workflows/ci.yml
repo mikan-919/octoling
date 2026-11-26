@@ -21,5 +21,6 @@ jobs:
             nix develop -c cargo test --release
           else
             echo "::warning::runner の CPU に AVX-512 が無いので、テストは実行せず組み立てだけ確かめる"
-            RUSTFLAGS="-C target-cpu=x86-64-v4" nix develop -c cargo test --release --no-run
+            # --target を付けると RUSTFLAGS がビルドスクリプトにかからない (かかると runner で SIGILL になる)
+            RUSTFLAGS="-C target-cpu=x86-64-v4" nix develop -c cargo test --release --no-run --target x86_64-unknown-linux-gnu
           fi
