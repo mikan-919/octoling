@@ -14,8 +14,8 @@ This English README covers performance, requirements, building, and usage. Envir
 
 ````console
 $ octoling chat models/sq10 "Rustでフィボナッチ数列の10項目を求める関数を書いて" low
-GPU に 12.38 GB 載せた (expert の枠 116 個)。残り 2.25 GB
-下書きモデルに 0.50 GB 載せた。残り 1.72 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
+下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 The user asks in Japanese: write a function in Rust to compute 10 items of Fibonacci sequence. ...（reasoning, shown in gray in the terminal）
 Rustでフィボナッチ数列の最初の10項目（0,1,1,2,3,...）を返す関数例：
 
@@ -90,6 +90,28 @@ On the same GPU, `octoling bench` (commit cd7fe40) and Strata's `--bench --draft
 | 3,203 tokens | 1,790 / 1,763 | 1,428 / 1,429 |
 | 8,000 tokens | 4,641 / 4,644 | 3,526 / 3,525 |
 
+### Long context (FP8 KV)
+
+When the context limit (`OCTO_CTX`) is above 8,192, the KV cache of the global layers is kept in FP8 (E4M3). `OCTO_KV=f16` or `OCTO_KV=fp8` overrides this; with the official weights, KV kept in RAM is always f16. The KV per token goes from 32 KB to 16 KB, and a 131,072-token context fits on a 16 GB GPU together with the draft model.
+
+Setup: RTX 5060 Ti 16 GB, WSL2, SQ-10, DFlash2, greedy decoding, 256 tokens generated after each input. The input is English text joined from the WikiText-103 validation set. Unit: tokens/s.
+
+| Input length | KV | Greedy | Speculative |
+|---|---|---|---|
+| 30,000 tokens | f16 | 75.9 | 87.2 |
+| 30,000 tokens | FP8 | 81.8 | 97.9 |
+| 130,000 tokens | FP8 | 56.7 | 60.2 |
+
+At 130,000 tokens, VRAM use was 13.35 GB for the main model and 0.65 GB for DFlash2, with 0.59 GB left. Prefilling 30,000 tokens took 14.1 s with f16 and 14.5 s with FP8.
+
+Output was compared with f16 at the 256 positions after 30,000 tokens. The mean KL divergence (difference between two probability distributions; 0 means identical) was 0.0021, the top-1 token matched at 98.0% of positions, and the negative log-likelihood of the correct token was 1.633 for f16 and 1.627 for FP8. The KL divergence between SQ-10 and the official weights is about 0.05 (Strata's published figure). NVFP4 (an E4M3 scale per 16 elements) gave a KL divergence of 0.0051 and a top-1 match of 95.3%.
+
+```sh
+OCTO_KV=f16 nix develop -c target/release/examples/kv_quality models/sq10 @ids.txt 30000 256 f16.bin
+OCTO_KV=fp8 nix develop -c target/release/examples/kv_quality models/sq10 @ids.txt 30000 256 fp8.bin
+python examples/kv_compare.py f16.bin fp8.bin @ids.txt 30000
+```
+
 ### Official weights
 
 The official safetensors (19.5 GB) do not fit in 16 GB of VRAM, so some experts (the small MLPs in the mixture-of-experts model, selected per token) stay in RAM. Generation without the draft model ran at about 60 tokens/s.
@@ -99,7 +121,7 @@ The official safetensors (19.5 GB) do not fit in 16 GB of VRAM, so some experts 
 | Item | Requirement |
 |---|---|
 | GPU | NVIDIA, compute capability 12.0 (GeForce RTX 50 series). Kernels are compiled for `sm_120` at runtime |
-| VRAM | About 13 GB with SQ-10 (8,192-token context, including the draft model). With the official weights, expert placement follows the free VRAM |
+| VRAM | About 12 GB with SQ-10 (8,192-token context, including the draft model), about 14 GB with a 131,072-token context. With the official weights, expert placement follows the free VRAM |
 | CPU | x86-64 with AVX-512. The build fails without it |
 | RAM | Weight files are mmapped: 19.5 GB for the official weights, 10.5 GB for SQ-10. Up to 4 GB more by default for contexts kept in RAM by `serve` |
 | OS | Linux. Only WSL2 has been tested |
