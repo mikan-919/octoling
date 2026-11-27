@@ -486,6 +486,7 @@ impl Gpu {
             (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
         }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
+        assert!(cpu.layers[0].experts.tq.is_none(), "OCTO_TQ のトレリスの expert は CPU の順伝播 (OCTO_CPU) でだけ使える");
         // SQ 形式は VRAM に余裕があるので、長い文脈の KV も VRAM に置く
         let host_kv = n_ctx > VRAM_CTX && cpu.layers.iter().any(|l| l.experts.mx);
         let kvq = kv_format(n_ctx, host_kv);

@@ -227,7 +227,7 @@ impl Pack {
                 SkBody { gu, dn, body: &self.sec4[off..off + len], dn_off }
             })
             .collect();
-        Experts { mx: false, w13: &[], s13: &[], a13: &[], w2: &[], s2: &[], a2: &[], sk: Some(SkLayer { bodies }) }
+        Experts { mx: false, w13: &[], s13: &[], a13: &[], w2: &[], s2: &[], a2: &[], sk: Some(SkLayer { bodies }), tq: None }
     }
 }
 
