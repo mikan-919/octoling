@@ -160,14 +160,16 @@ impl DSpark {
         let hot: Vec<f32> = (0..R).flat_map(|k| (0..D).map(move |d| (k, d))).map(|(k, d)| ho[d * R + k]).collect();
         up.to(g.staging[1], as_bytes(&hot));
         let fold = Fp8 { w: up.zeros(201024 * R), s: up.zeros(201024 * 4), rows: 201024, cols: R };
-        for v0 in (0..201024).step_by(16384) {
-            let rows = 16384.min(201024 - v0);
-            g.gemm(g.unembed + (v0 * D * 2) as u64, g.staging[1], g.staging[0], rows, D, R);
+        // SQ 形式は出力層を BF16 で持たないので、8192 行ずつ staging[1] の hot の後ろに広げてから掛ける
+        let tmp = g.staging[1] + (R * D * 4).next_multiple_of(256) as u64;
+        for v0 in (0..201024).step_by(8192) {
+            let rows = 8192.min(201024 - v0);
+            g.gemm(g.unembed_bf16(v0, rows, tmp), g.staging[1], g.staging[0], rows, D, R);
             k!(g, "quant_cols_f32", rows, 256, 0; g.staging[0], rows as i32, R as i32, fold.w + (v0 * R) as u64, fold.s + f4(v0));
         }
         let hb = up.bytes(as_bytes(&bfv("markov_head.hidden_out.bias", &[D])));
         let fold_b = up.zeros(201024 * 4);
-        g.gemm(g.unembed, hb, fold_b, 201024, D, 1);
+        g.logits(hb, fold_b, 1);
         g.stream.synchronize().unwrap();
 
         let rnn = get("markov_head.rnn_proj.weight", &[768, 5120]);

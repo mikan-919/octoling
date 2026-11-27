@@ -12,8 +12,8 @@ Thinking Machines Lab の言語モデル [Inkling-2 Mini](https://huggingface.co
 
 ````console
 $ octoling chat models/sq10 "Rustでフィボナッチ数列の10項目を求める関数を書いて" low
-GPU に 12.38 GB 載せた (expert の枠 116 個)。残り 2.25 GB
-下書きモデルに 0.50 GB 載せた。残り 1.72 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
+下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 The user asks in Japanese: write a function in Rust to compute 10 items of Fibonacci sequence. ...（思考。端末では灰色）
 Rustでフィボナッチ数列の最初の10項目（0,1,1,2,3,...）を返す関数例：
 
@@ -93,6 +93,28 @@ prefill の expert の計算を int8 にした commit cd7fe40 では、prefill �
 | 3,203 トークン | 1,790 / 1,763 | 1,428 / 1,429 |
 | 8,000 トークン | 4,641 / 4,644 | 3,526 / 3,525 |
 
+### 長い文脈（FP8 の KV）
+
+文脈長の上限（`OCTO_CTX`）が 8,192 を超えると、global 層の KV キャッシュを FP8（E4M3）で持ちます（`OCTO_KV`）。1 トークンの KV は 32 KB から 16 KB になり、16 GB の GPU で文脈 131,072 トークンが下書きモデルと一緒に入ります。
+
+条件：RTX 5060 Ti 16 GB・WSL2・SQ-10・DFlash2・貪欲法・各入力の後に 256 トークンを生成。入力は WikiText-103 の検証データをつないだ英語の文章です。単位は tokens/s です。
+
+| 入力の長さ | KV | 貪欲法 | 投機的デコード |
+|---|---|---|---|
+| 30,000 トークン | f16 | 75.9 | 87.2 |
+| 30,000 トークン | FP8 | 81.8 | 97.9 |
+| 130,000 トークン | FP8 | 56.7 | 60.2 |
+
+130,000 トークンの時の VRAM は、本体が 13.35 GB、DFlash2 が 0.65 GB で、残りは 0.59 GB でした。30,000 トークンの prefill は、f16 で 14.1 秒、FP8 で 14.5 秒です。
+
+出力の違いは、30,000 トークンの後ろの 256 位置で f16 と比べました。KL ダイバージェンス（2 つの確率分布の違い。0 なら同じ）は平均 0.0021、第1候補の一致は 98.0%、正解のトークンの負の対数尤度は f16 が 1.633、FP8 が 1.627 でした。SQ-10 と公式の重みの KL ダイバージェンスは 0.05 前後です（Strata の公表値）。NVFP4（16 要素ごとに E4M3 のスケール）でも試すと、KL ダイバージェンスは 0.0051、第1候補の一致は 95.3% でした。
+
+```sh
+OCTO_KV=f16 nix develop -c target/release/examples/kv_quality models/sq10 @ids.txt 30000 256 f16.bin
+OCTO_KV=fp8 nix develop -c target/release/examples/kv_quality models/sq10 @ids.txt 30000 256 fp8.bin
+python examples/kv_compare.py f16.bin fp8.bin @ids.txt 30000
+```
+
 ### 公式の重み
 
 公式の safetensors（19.5 GB）は 16 GB の VRAM に入らないので、一部の expert（混合専門家モデルで、トークンごとに選ばれる小さな MLP）を主記憶に置きます。下書きなしの生成は約 60 tokens/s でした。
@@ -102,7 +124,7 @@ prefill の expert の計算を int8 にした commit cd7fe40 では、prefill �
 | 項目 | 条件 |
 |---|---|
 | GPU | NVIDIA の計算能力 12.0 のカード（GeForce RTX 50 シリーズ）。カーネルは実行時に `sm_120` 向けに翻訳する |
-| VRAM | SQ-10 で約 13 GB（文脈 8,192 トークン、下書きモデルを含む）。公式の重みは VRAM の空きに合わせて expert の置き場を決める |
+| VRAM | SQ-10 で約 12 GB（文脈 8,192 トークン、下書きモデルを含む）。文脈 131,072 トークンで約 14 GB。公式の重みは VRAM の空きに合わせて expert の置き場を決める |
 | CPU | x86-64 で AVX-512 があるもの。無いと組み立てでエラーになる |
 | 主記憶 | 重みのファイルを mmap する。公式の重みは 19.5 GB、SQ-10 は 10.5 GB。文脈を主記憶に残す分が既定で最大 4 GB |
 | OS | Linux。確かめたのは WSL2 だけ |
@@ -182,8 +204,8 @@ octoling bench <重みのディレクトリ> <トークンID,トークンID,...>
 ```
 
 ```text
-GPU に 12.38 GB 載せた (expert の枠 116 個)。残り 2.25 GB
-下書きモデルに 0.50 GB 載せた。残り 1.71 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
+下書きモデル (DFlash2) に 0.65 GB 載せた。残り 2.95 GB
 http://127.0.0.1:8080/v1 で待ち受け中 (POST /v1/chat/completions, GET /v1/models)
 ```
 
@@ -248,7 +270,7 @@ nix develop -c cargo run --release --example prompt_ids -- models/sq10/tokenizer
 ```
 
 ```text
-GPU に 12.38 GB 載せた (expert の枠 116 個)。残り 2.44 GB
+GPU に 11.47 GB 載せた (expert の枠 118 個、global 層の KV は f16)。残り 4.15 GB
 prefill 19 tokens: 66 ms, 286.0 tok/s
 tok 200010 -> 200001:27.942 9850:8.904 2986:7.256 20698:7.141 18057:7.123 (66 ms, first [-2.0983 -4.4991 -1.8066] sum -2325645.5000)
 generated 128 tokens: 98.3 tok/s
@@ -261,7 +283,8 @@ generated 128 tokens: 98.3 tok/s
 
 | 変数 | 意味 | 既定 |
 |---|---|---|
-| `OCTO_CTX` | 文脈長の上限（トークン）。公式の重みでは 8,192 を超えると、global 層（文脈の全体を見る注意の層）の KV を主記憶に置き、注意を CPU で計算する（1 トークンに 32 KB）。この時は下書きモデルを使わない。SQ-10 では KV を VRAM に置き、16 GB の GPU で 65,536 まで入ることを確かめた | 8192 |
+| `OCTO_CTX` | 文脈長の上限（トークン）。公式の重みでは 8,192 を超えると、global 層（文脈の全体を見る注意の層）の KV を主記憶に置き、注意を CPU で計算する（1 トークンに 32 KB）。この時は下書きモデルを使わない。SQ-10 では KV を VRAM に置く。8,192 を超えると global 層の KV を FP8 にし（`OCTO_KV`）、16 GB の GPU で 131,072 まで下書きモデルと一緒に入ることを確かめた | 8192 |
+| `OCTO_KV` | global 層の KV キャッシュの形式。`f16` か `fp8`（E4M3。1 トークンに 16 KB で、f16 の半分）。公式の重みで KV を主記憶に置くときは常に f16 | `OCTO_CTX` が 8,192 を超えると `fp8`、それ以外は `f16` |
 | `OCTO_DRAFT` | `0` で下書きモデルを使わない。`dspark` で、`dflash2.safetensors` があっても DSpark を使う。公式の重みでは `1` の時だけ使う（確かめる計算が遅く、下書きの分を取り返せないことが多いため） | SQ-10 は使う |
 | `OCTO_TAU` | 下書きを止めるしきい値。下書きの第1候補の確率の積がこれを下回ったら、そこで下書きを止める。実際のしきい値は、それまでの当たり方で 0.5〜2 倍に補正する | 0.35 |
 | `OCTO_KV_GB` | serve が主記憶に残す文脈の合計の上限（GB） | 4 |
@@ -345,6 +368,7 @@ nix develop -c cargo test --release
 | `spec_test <重み> <トークン ID のファイル>` | 投機的デコードの部品（確かめる計算と巻き戻し、KV）が1トークンずつの計算と一致するかを確かめる。`MATCH` と `kv MATCH` が出れば一致 |
 | `spec_bench <重み> <入力;入力...> <トークン数>` | 下書きなしの貪欲法と投機的デコードの速さ、1ステップの内訳（下書き・確かめ・後処理の時間）、確定したトークン数の分布を出す。`OCTO_FORCE=ファイル` で生成する文を固定し、同じ文で速さを比べられる |
 | `prompt_ids <tokenizer.json> <reasoning_effort> <本文>` | serve と同じ形のプロンプトのトークン ID を出す |
+| `kv_quality <重み> <@トークン ID のファイル> <prefill するトークン数> <1つずつ入れるトークン数> <出力ファイル>` | 長い入力の後ろの位置の logits を書き出す。KV の形式（`OCTO_KV`）を変えた 2 つの出力を `examples/kv_compare.py` で比べ、KL ダイバージェンスと第1候補の一致率を出す（numpy が要る） |
 
 ```sh
 nix develop -c cargo build --release --examples
@@ -358,6 +382,7 @@ nix develop -c target/release/examples/spec_bench models/sq10 @prompt.txt 256
 | `OCTO_STAMP` | 生成の CUDA Graph のカーネルごとに GPU の時刻を記録し、カーネルの種類別の時間を出す |
 | `OCTO_PROF` | 層や区切りごとに GPU と CPU の時間を出す |
 | `OCTO_TRACE` | CPU 版の各層の出力を、llama.cpp の `l_out-N` と比べられる形で出す |
+| `OCTO_DUMP` | CPU 版（`OCTO_CPU`）で、MoE の入力とルーターが選んだ expert と重みを、指定したファイルに1件ずつ書き出す（層 u32、入力 f32 × 2304、expert u32 × 8、重み f32 × 8）。量子化の誤差を実際の活性で測るのに使う |
 | `OCTO_FORCE` | spec_bench で、本体が選んだトークンをファイルのトークン ID の列に置き換える |
 
 ## 参考にしたもの

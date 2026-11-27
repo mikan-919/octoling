@@ -418,6 +418,10 @@ impl Model {
             h = control(&h, &m[3], &l.ctrl.as_ref().unwrap()[3]);
         }
         rmsnorm(&mut h, Some(l.mlp_norm));
+        if DUMP.is_some() {
+            let (sel, wts) = self.route(l, &h);
+            dump(il, &h, &sel, &wts);
+        }
         let m = convolve(&self.moe(l, &h), &l.mlp_conv, None, &mut slot.hist[3]);
         add(&cur, &m)
     }
@@ -777,6 +781,23 @@ pub(crate) fn trace(slot: usize, x: &[f32]) {
     if *TRACE {
         eprintln!("l_out-{slot} [{:.4} {:.4} {:.4}] sum {:.6}", x[0], x[1], x[2], x.iter().sum::<f32>());
     }
+}
+
+static DUMP: std::sync::LazyLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> = std::sync::LazyLock::new(|| {
+    std::env::var_os("OCTO_DUMP").map(|p| std::sync::Mutex::new(std::io::BufWriter::new(std::fs::File::create(p).expect("OCTO_DUMP のファイルを作れない"))))
+});
+
+/// OCTO_DUMP を設定すると (CPU の順伝播で)、MoE の入力を1件ずつ書き出す: 層 (u32)、入力 [D] (f32)、expert [8] (u32)、重み [8] (f32)。
+/// ループ部分の層は3回出る。量子化の誤差を実際の活性で測るのに使う
+fn dump(il: usize, h: &[f32], sel: &[usize], wts: &[f32]) {
+    use std::io::Write;
+    let mut f = DUMP.as_ref().unwrap().lock().unwrap();
+    let mut b = (il as u32).to_le_bytes().to_vec();
+    h.iter().for_each(|x| b.extend(x.to_le_bytes()));
+    sel.iter().for_each(|&e| b.extend((e as u32).to_le_bytes()));
+    wts.iter().for_each(|x| b.extend(x.to_le_bytes()));
+    f.write_all(&b).unwrap();
+    f.flush().unwrap();
 }
 
 pub(crate) fn tracing() -> bool {
