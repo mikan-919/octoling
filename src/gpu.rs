@@ -381,16 +381,18 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 81] = [
+const KERNELS: [&str; 85] = [
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
     "mix",
+    "mix_p",
     "norm2",
     "control",
     "conv",
     "qkv_post",
     "attn_part",
+    "attn_tc",
     "attn_fa",
     "rel_table",
     "add",
@@ -437,6 +439,7 @@ const KERNELS: [&str; 81] = [
     "ctrl_down_t",
     "ctrl_up_t",
     "mv3_bf16",
+    "mv3_bf16_t",
     "qkv_conv_post",
     "router_topk",
     "router_topk_t",
@@ -460,6 +463,7 @@ const KERNELS: [&str; 81] = [
     "mv3_q8_t",
     "quant_q8",
     "gemm_q8i",
+    "gemm_q8i2",
     "mv_s6",
     "s6_to_bf16",
     "gemm_sk_i8",
@@ -718,7 +722,8 @@ impl Gpu {
         if t == 1 {
             k!(self, "mv_bf16", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32);
         } else if t <= SPEC_T {
-            k!(self, "mv_bf16_t", (rows * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
+            // 1ワープが 4 行 (gpu.cu の BF_R)
+            k!(self, "mv_bf16_t", (rows.div_ceil(4) * 32).div_ceil(256), 256, 0; w, x, y, rows as i32, cols as i32, t as i32);
         } else {
             debug_assert!(cols.is_multiple_of(64));
             k!(self, "gemm_bf16", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; w, x, y, rows as i32, cols as i32, t as i32);
@@ -758,7 +763,11 @@ impl Gpu {
             let b = &self.big;
             let (xq, xs) = (b.q8, b.q8 + (t * cols) as u64);
             k!(self, "quant_q8", (t, (cols / 64).div_ceil(8)), 256, 0; x, cols as i32, xq, xs, 0i32);
-            k!(self, "gemm_q8i", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            if t >= 64 {
+                k!(self, "gemm_q8i2", (rows.div_ceil(128), t.div_ceil(64)), 256, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            } else {
+                k!(self, "gemm_q8i", (rows.div_ceil(64), t.div_ceil(32)), 128, 0; m.p, xq, xs, y, rows as i32, cols as i32, t as i32);
+            }
         }
     }
 
@@ -768,7 +777,11 @@ impl Gpu {
     fn mix(&self, blocks: P, nb: usize, cur: P, queries: P, nq: usize, out: P, t: usize, norm: Option<(P, usize)>, rms: P) {
         assert!(nb < 5, "mix は状態 5 個まで (MIX_NS)");
         let (nw, nws) = norm.unwrap_or((0, 0));
-        k!(self, "mix", (nq, t), 768, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        if t <= SPEC_T {
+            k!(self, "mix", (nq, t), 768, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        } else {
+            k!(self, "mix_p", (nq, t), 256, 0; blocks, nb as i32, cur, queries, out, t as i32, nw, nws as i32, rms);
+        }
     }
 
     /// control cs[j] (j < 3) を、入力 j に メッセージ msg + slab(j) でかけて out + slab(j) に書く。並びは [j][T][D]。
@@ -814,7 +827,8 @@ impl Gpu {
     fn conv(&self, cur: P, cs: usize, w: P, dyn_: Option<usize>, hist: P, out: P, os: usize, ch: usize, cph: usize, t: usize, seq: P, res: P) {
         let d = dyn_.map_or(-1, |d| d as i32);
         assert!(t <= 16 || cur != out, "conv: T > CONV_T なら out と cur は別の場所");
-        k!(self, "conv", (ch.div_ceil(256), t.div_ceil(16)), 256, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
+        // 64 スレッドのブロックにして、ch = 1024 でも 16 個の SM に配る (256 では 4 個)
+        k!(self, "conv", (ch.div_ceil(64), t.div_ceil(16)), 64, 0; cur, cs as i32, w, d, hist, out, os as i32, ch as i32, cph as i32, t as i32, seq, res);
     }
 
     /// トークンの埋め込みと先頭の位置を GPU に送る
@@ -1586,6 +1600,9 @@ impl Gpu {
         } else if t == 1 && !l.wq.q8 && !l.wk.q8 && !l.wv.q8 {
             k!(self, "mv3_bf16", ((QX + 2 * nk) * 32).div_ceil(256), 256, 0;
                 l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32);
+        } else if t <= SPEC_T && !l.wq.q8 && !l.wk.q8 && !l.wv.q8 {
+            k!(self, "mv3_bf16_t", ((QX.div_ceil(4) + 2 * nk.div_ceil(4)) * 32).div_ceil(256), 256, 0;
+                l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32, ti);
         } else if t <= SPEC_T && l.wq.q8 && l.wk.q8 && l.wv.q8 {
             k!(self, "mv3_q8_t", QX.div_ceil(32) + 2 * nk.div_ceil(32), 256, 0;
                 l.wq.p, xq, b.qx, QX as i32, l.wk.p, xk, b.kx, nk as i32, l.wv.p, xv, b.vx, nk as i32, ti);
@@ -1613,6 +1630,9 @@ impl Gpu {
             k!(self, "attn_to_host", 1, 256, 0; b.qx, at(HA_Q), at(HA_FQ));
             k!(self, "wait_host", 1, 32, 0; at(HA_FO), 0u64, 0u64, 0i32);
             k!(self, "attn_from_host", 12, 256, 0; b.qx, at(HA_O), b.o);
+        } else if t > 1 && t <= SPEC_T && s.host.is_none() {
+            // 検証は、T トークン x 3 ヘッドの行をまとめてテンソルコアで計算する (KV を1回だけ読む)
+            k!(self, "attn_tc", (8, NSPLIT), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done, ti);
         } else if t <= SPEC_T {
             k!(self, "attn_part", (8, NSPLIT * t), 128, 0; b.qx, s.kc, s.vc, l.rel_proj, b.part, b.pos, ring, b.o, b.done);
         } else if let Some(host) = s.host {

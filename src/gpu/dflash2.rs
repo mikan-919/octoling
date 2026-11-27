@@ -64,7 +64,9 @@ pub struct DFlash2 {
     hproj: Fp8,
     pred: P, // [LV][R] BF16
     succ: P,
-    mask: Vec<f32>,
+    mask: P,                  // 行 1..B のマスクトークンの埋め込み [B - 1][D]
+    inp: P,                   // 毎回送る入力: 行 0 の埋め込み [D] と、整数の [位置 p, 文脈の先頭 lo, next]
+    graph: Option<CudaGraph>, // draft の GPU の処理を記録したもの (2回目から再生する)
     pub(super) ctx_end: usize,
     // 確信度の補正 (DSpark と同じ): (送った下書きの確率の積の和, 実際に当たった数) の指数移動平均
     cal: (f32, f32),
@@ -138,6 +140,7 @@ impl DFlash2 {
             .collect();
         let mut mask = model::bf_row(g.cpu.embed, MASK, D);
         model::rmsnorm(&mut mask, Some(g.cpu.embed_norm));
+        let mask = up.bytes(as_bytes(&mask.repeat(B - 1)));
         let fz = |n: usize, up: &mut Uploader| up.zeros(n * 4);
         let d = Self {
             layers,
@@ -148,6 +151,8 @@ impl DFlash2 {
             pred: up.bytes(as_bytes(get("candidate_selector.predecessor_codebook", &[LV, R]))),
             succ: up.bytes(as_bytes(get("candidate_selector.successor_codebook", &[LV, R]))),
             mask,
+            inp: up.zeros((D + 3) * 4),
+            graph: None,
             ctx_end: 0,
             cal: (1.0, 1.0),
             sent: None,
@@ -233,21 +238,50 @@ impl DFlash2 {
         }
         let tau = tau() * (self.cal.0 / self.cal.1.max(1e-3)).clamp(0.5, 2.0);
         let p = self.ctx_end;
-        let mut xb = model::bf_row(g.cpu.embed, next as usize, D);
-        model::rmsnorm(&mut xb, Some(g.cpu.embed_norm));
-        for _ in 1..B {
-            xb.extend_from_slice(&self.mask);
+        let mut inp = model::bf_row(g.cpu.embed, next as usize, D);
+        model::rmsnorm(&mut inp, Some(g.cpu.embed_norm));
+        inp.extend([p, p.saturating_sub(WIN - 1), next as usize].map(|v| f32::from_bits(v as u32)));
+        g.htod(self.inp, &inp);
+        // カーネルの引数は毎回同じなので、1回目に記録して2回目から再生する (WSL2 では起動1回に約 11 µs かかる)
+        match &self.graph {
+            Some(gr) => gr.launch().unwrap(),
+            None => {
+                g.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+                self.record(g);
+                let gr = g.stream.end_capture(sys::CUgraphInstantiate_flags(0)).unwrap().expect("空のグラフ");
+                gr.launch().unwrap();
+                self.graph = Some(gr);
+            }
         }
-        g.htod(self.x, &xb);
-        let lo = p.saturating_sub(WIN - 1);
-        let ns = (p - lo + B).div_ceil(DR_SPLIT);
+        let r: Vec<u32> = g.dtoh(self.res, 2 * (B - 1));
+        let (mut cum, mut ps) = (1f32, 0f32);
+        let mut out = vec![];
+        for i in 0..B - 1 {
+            cum *= f32::from_bits(r[2 * i + 1]);
+            if cum < tau || out.len() == max {
+                break;
+            }
+            out.push(r[2 * i]);
+            ps += cum;
+        }
+        self.sent = Some((ps, out.len()));
+        out
+    }
+
+    /// draft の GPU の処理。位置などの毎回変わる値は inp から読む
+    fn record(&self, g: &Gpu) {
+        let st = self.inp + f4(D); // [p, lo, next]
+        g.copy(self.x, self.inp, D);
+        g.copy(self.x + f4(D), self.mask, (B - 1) * D);
+        // 注意の分割は、文脈が最も長いときの数で固定する (キーの無い分割は空の部分結果を書く)
+        let ns = (WIN - 1 + B).div_ceil(DR_SPLIT);
         for l in &self.layers {
             Self::rms(g, self.x, l.in_ln, self.h, B);
             Self::mv(g, &l.kp_attn, self.h, self.dynk, B);
             Self::conv(g, self.h, self.dynk, l.base_attn, 0, self.hc);
             Self::mv(g, &l.qkv, self.hc, self.qkv, B);
-            k!(g, "dr_qk", (NQ + 8, B), 128, 0; self.qkv, l.qn, l.kn, p as i32, G as i32, THETA);
-            k!(g, "dr_attn2", (8, ns * 2), 128, 0; self.qkv, l.kc, l.vc, WIN as i32, lo as i32, p as i32, self.part, G as i32, WIN as i32);
+            k!(g, "dr_qk", (NQ + 8, B), 128, 0; self.qkv, l.qn, l.kn, 0i32, G as i32, THETA, st);
+            k!(g, "dr_attn2", (8, ns * 2), 128, 0; self.qkv, l.kc, l.vc, WIN as i32, st, self.part, G as i32, WIN as i32);
             k!(g, "dr_fin", (NQ, B), 128, 0; self.part, ns as i32, self.att, G as i32);
             Self::mv(g, &l.wo, self.att, self.o, B);
             Self::conv(g, self.o, self.dynk, l.base_attn, 1, self.oc);
@@ -268,19 +302,6 @@ impl DFlash2 {
         Self::mv(g, &self.hproj, h1, self.hp, B - 1);
         k!(g, "sel_top1", (NB, B - 1), 256, 0; self.logits, LV as i32, VOCAB as i32, self.pv, self.pi, self.pz);
         k!(g, "sel_top2", B - 1, 256, 0; self.pv, self.pi, self.pz, NB as i32, self.cv, self.ci, self.zr);
-        k!(g, "sel_walk", 1, 256, 0; self.cv, self.ci, self.zr, self.hp, self.pred, self.succ, next as i32, (B - 1) as i32, self.res);
-        let r: Vec<u32> = g.dtoh(self.res, 2 * (B - 1));
-        let (mut cum, mut ps) = (1f32, 0f32);
-        let mut out = vec![];
-        for i in 0..B - 1 {
-            cum *= f32::from_bits(r[2 * i + 1]);
-            if cum < tau || out.len() == max {
-                break;
-            }
-            out.push(r[2 * i]);
-            ps += cum;
-        }
-        self.sent = Some((ps, out.len()));
-        out
+        k!(g, "sel_walk", 1, 256, 0; self.cv, self.ci, self.zr, self.hp, self.pred, self.succ, st + 8, (B - 1) as i32, self.res);
     }
 }
