@@ -168,7 +168,7 @@ To skip DFlash2, leave out the last two lines.
 
 octoling reads only `.strata` v1.1 with SQ-10 experts (S2_K, S3_K, SF4). Other combinations such as SQ-15 are not supported.
 
-(Experimental) If the directory also holds `experts.tq`, the experts it contains are computed from trellis-quantized weights (each weight is computed from a short window of a bit string, with no value table) instead of SQ-10's S2_K/S3_K, and the `.strata` may leave those experts out. An `experts.tq` at about 2.1 bits per expert weight (6.50 GB) plus a `.strata` without those experts and without the unused DSpark weights (1.66 GB) comes to 8.17 GB, with a lower KL divergence from the official weights than SQ-10 on English, code and Japanese text. Generation runs at about 90% of SQ-10's speed. The tools that build `experts.tq` are not in the repository yet.
+(Experimental) If the directory also holds `experts.tq`, the experts it contains are computed from trellis-quantized weights (each weight is computed from a short window of a bit string, with no value table) instead of SQ-10's S2_K/S3_K, and the `.strata` may leave those experts out. An `experts.tq` at about 2.1 bits per expert weight (6.41 GB) plus a `.strata` without those experts and without the unused DSpark weights (1.66 GB) comes to 8.07 GB, with a lower KL divergence from the official weights than SQ-10 on English, code and Japanese text. Generation runs at about 90% of SQ-10's speed. The tools that build `experts.tq` are not in the repository yet.
 
 ### Official weights
 
