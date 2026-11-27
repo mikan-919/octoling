@@ -162,7 +162,7 @@ fn q8_mat(parts: &[(Option<&'static [u8]>, W)], cols: usize) -> Option<Vec<u8>> 
 #[derive(Clone, Copy)]
 enum GExperts {
     Fp4([P; 6]),           // w13, s13, a13, w2, s2, a2
-    Sk { tab: P, ixd: P }, // SQ 形式。tab は行列ごとの SkMat、ixd は活性の逆スケール [128][FF]
+    Sk { tab: P, ixd: P, tq: bool }, // SQ 形式。tab は行列ごとの SkMat、ixd は活性の逆スケール [128][FF]。tq ならトレリスの expert がある
     Host,                  // MXFP8。CPU と分担する
 }
 
@@ -289,6 +289,7 @@ pub struct Gpu {
     norm: P,
     output_query: P,
     msg_queries: P, // ループの 12 層の msg_query を並べたもの [12][4][D]
+    rot: [P; 4],    // トレリスの expert の入力側の回転 (D の符号, D の q, FF の符号, FF の q)。tq.rs の Rot
     small: Bufs,
     big: Bufs, // expert の枠と同じ場所
     pos: usize,
@@ -381,7 +382,9 @@ struct XCache {
 const GPU_PER_GROUP: f64 = 4.6e-3;
 const CPU_PER_ASSIGN: f64 = 32e-6;
 
-const KERNELS: [&str; 81] = [
+const KERNELS: [&str; 83] = [
+    "moe_tqb",
+    "rot_tq",
     "mv_bf16",
     "gemm_bf16",
     "rmsnorm",
@@ -486,7 +489,6 @@ impl Gpu {
             (e.w13, e.s13, e.w2, e.s2) = (pin(e.w13), pin(e.s13), pin(e.w2), pin(e.s2));
         }
         let cpu: &'static Model = Box::leak(Box::new(cpu));
-        assert!(cpu.layers[0].experts.tq.is_none(), "OCTO_TQ のトレリスの expert は CPU の順伝播 (OCTO_CPU) でだけ使える");
         // SQ 形式は VRAM に余裕があるので、長い文脈の KV も VRAM に置く
         let host_kv = n_ctx > VRAM_CTX && cpu.layers.iter().any(|l| l.experts.mx);
         let kvq = kv_format(n_ctx, host_kv);
@@ -535,10 +537,25 @@ impl Gpu {
                     router_bias: f32s(l.router_bias, &mut up),
                     ctrl: l.ctrl.iter().flatten().map(|c| GCtrl { down: up.bytes(as_bytes(c.down)), gf: bfs(&[c.gain, c.forget], &mut up) }).collect(),
                     experts: if let Some(sk) = &e.sk {
-                        let im = sk.image();
+                        let mats = |ex: usize| e.tq.and_then(|(t, il)| Some([t.mat(il, ex, 0)?, t.mat(il, ex, 1)?]));
+                        let trellis: Vec<bool> = (0..N_EXP).map(|ex| mats(ex).is_some()).collect();
+                        let mut im = sk.image(&trellis);
+                        // トレリスの expert のビット列とスケールを image の後ろに足す
+                        for ex in (0..N_EXP).filter(|&ex| trellis[ex]) {
+                            for (m, mat) in mats(ex).unwrap().into_iter().enumerate() {
+                                let (code, bits, scale) = mat.gpu();
+                                let mut put = |b: &[u8]| {
+                                    im.bytes.resize(im.bytes.len().next_multiple_of(16), 0);
+                                    im.bytes.extend_from_slice(b);
+                                    (im.bytes.len() - b.len()) as u64
+                                };
+                                let (bo, so) = (put(as_bytes(bits)), put(as_bytes(scale)));
+                                im.tab[ex * 2 + m] = [bo, so, code as u64 | (1f32.to_bits() as u64) << 32];
+                            }
+                        }
                         let base = up.bytes(&im.bytes);
                         let tab: Vec<[u64; 3]> = im.tab.iter().map(|m| [base + m[0], base + m[1], m[2]]).collect();
-                        GExperts::Sk { tab: up.bytes(as_bytes(&tab)), ixd: f32s(&im.ixd, &mut up) }
+                        GExperts::Sk { tab: up.bytes(as_bytes(&tab)), ixd: f32s(&im.ixd, &mut up), tq: trellis.contains(&true) }
                     } else if e.mx {
                         GExperts::Host
                     } else {
@@ -574,6 +591,10 @@ impl Gpu {
         let output_query = f32s(cpu.output_query, &mut up);
         let mq: Vec<f32> = cpu.layers[CORE.0..CORE.1].iter().flat_map(|l| l.msg_query.as_ref().unwrap().iter().copied()).collect();
         let msg_queries = f32s(&mq, &mut up);
+        let rot = match cpu.layers[0].experts.tq {
+            Some((t, _)) => [&t.rot_d.sg, &t.rot_d.q, &t.rot_ff.sg, &t.rot_ff.q].map(|v| f32s(v, &mut up)),
+            None => [0; 4],
+        };
         // 残りの VRAM で expert の枠をとる。OCTO_EXPERT_SLOTS で数を決められる。
         // 先頭の枠は prefill の置き場 (staging、2 * GROUP 枠) と prefill 用の作業領域を兼ねる
         let align = |n: usize| n.div_ceil(256) * 256;
@@ -643,6 +664,7 @@ impl Gpu {
             norm,
             output_query,
             msg_queries,
+            rot,
             small,
             big,
             pos: 0,
@@ -1652,15 +1674,33 @@ impl Gpu {
             }
         }
         match l.experts {
-            GExperts::Sk { tab, ixd } => {
-                // 活性は f16 にして並べ替えておく (置き場は、この後の down が書く yd)
+            GExperts::Sk { tab, ixd, tq } => {
+                // 活性は f16 にして並べ替えておく (置き場は、この後の down が書く yd)。トレリスの expert には回転した活性 hr も作る
                 let hh = b.yd;
+                let hr = if tq { b.yd + (t * D * 2) as u64 } else { hh };
                 let n = (t * TOP_K) as i32;
+                let [sg_d, q_d, sg_ff, q_ff] = self.rot;
                 k!(self, "f16_perm", (t * D).div_ceil(256), 256, 0; b.h, hh, (t * D) as i32);
+                if tq {
+                    k!(self, "rot_tq", t, 256, 0; hh, hr, D as i32, sg_d, q_d, 0u64, 0u64);
+                }
+                // down の入力 act のうち、トレリスの expert の行を回す
+                let rot_act = |s: &Self| {
+                    if tq {
+                        k!(s, "rot_tq", t * TOP_K, 256, 0; b.act, b.act, FF as i32, sg_ff, q_ff, tab, b.ids);
+                    }
+                };
                 if t <= SPEC_T {
                     k!(self, "moe_skb", (t * TOP_K, 2 * FF / 128), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, b.ids, ti, b.gu);
+                    if tq {
+                        k!(self, "moe_tqb", (t * TOP_K, 2 * FF / 128), 256, 0; tab, 0i32, (2 * FF) as i32, D as i32, hr, b.ids, ti, b.gu);
+                    }
                     k!(self, "situ_sk", (t * TOP_K * FF).div_ceil(256), 256, 0; b.gu, b.act, b.ids, ixd, n);
+                    rot_act(self);
                     k!(self, "moe_skb", (t * TOP_K, D / 128), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, b.ids, ti, b.yd);
+                    if tq {
+                        k!(self, "moe_tqb", (t * TOP_K, D / 128), 256, 0; tab, 1i32, D as i32, FF as i32, b.act, b.ids, ti, b.yd);
+                    }
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 } else {
                     k!(self, "moe_sort", 1, 1024, 0; b.ids, n, b.order, b.off);
@@ -1668,9 +1708,10 @@ impl Gpu {
                     let (xq, xs) = (b.q8, b.q8 + (t * D) as u64);
                     let (aq, as_) = (b.aq, b.aq + (t * TOP_K * FF) as u64);
                     k!(self, "quant_q8", (t, (D / 64).div_ceil(8)), 256, 0; b.h, D as i32, xq, xs, 1i32);
-                    k!(self, "gemm_sk_grouped", (2 * FF / 64, 128 * SKP), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, TOP_K as i32, b.order, b.off, b.gu, b.act, ixd);
+                    k!(self, "gemm_sk_grouped", (2 * FF / 64, 128 * SKP), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, hh, hr, TOP_K as i32, b.order, b.off, b.gu, b.act, ixd);
                     k!(self, "gemm_sk_i8", (2 * FF / 64, 128 * SKI), 128, 0; tab, 0i32, (2 * FF) as i32, D as i32, xq, xs, TOP_K as i32, b.order, b.off, b.gu, aq, as_, ixd);
-                    k!(self, "gemm_sk_grouped", (D / 64, 128 * SKP), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, 1i32, b.order, b.off, b.yd, b.act, ixd);
+                    rot_act(self);
+                    k!(self, "gemm_sk_grouped", (D / 64, 128 * SKP), 128, 0; tab, 1i32, D as i32, FF as i32, b.act, b.act, 1i32, b.order, b.off, b.yd, b.act, ixd);
                     k!(self, "gemm_sk_i8", (D / 64, 128 * SKI), 128, 0; tab, 1i32, D as i32, FF as i32, aq, as_, 1i32, b.order, b.off, b.yd, aq, as_, ixd);
                     k!(self, "moe_sum", (t * D).div_ceil(256), 256, 0; b.yd, b.wts, b.y, ti);
                 }

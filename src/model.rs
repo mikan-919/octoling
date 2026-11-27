@@ -185,9 +185,17 @@ impl Model {
         let pack = crate::strata::Pack::open(&pack).unwrap_or_else(|e| panic!("{e}"));
         let pack: &'static crate::strata::Pack = Box::leak(Box::new(pack));
         let mut m = Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i), &|name| pack.q8(name), pack.s6("model.llm.unembed.weight"));
-        if let Some(p) = std::env::var_os("OCTO_TQ") {
-            let tq: &'static crate::tq::Tq = Box::leak(Box::new(crate::tq::Tq::open(p.as_ref()).unwrap_or_else(|e| panic!("{e}"))));
-            m.layers.iter_mut().enumerate().for_each(|(il, l)| l.experts.tq = Some((tq, il)));
+        // 同じディレクトリに experts.tq があれば、そこにある expert はトレリスの重みで計算する
+        let tq_path = dir.join("experts.tq");
+        let tq = tq_path.exists().then(|| &*Box::leak(Box::new(crate::tq::Tq::open(&tq_path).unwrap_or_else(|e| panic!("{e}")))));
+        for (il, l) in m.layers.iter_mut().enumerate() {
+            l.experts.tq = tq.map(|t| (t, il));
+            let sk = l.experts.sk.as_ref().unwrap();
+            for ex in 0..N_EXP {
+                let has = [0, 1].map(|w| tq.is_some_and(|t| t.mat(il, ex, w).is_some()));
+                assert!(has[0] == has[1], "experts.tq の層 {il} expert {ex} が gate/up と down の片方だけ");
+                assert!(has[0] || sk.has_body(ex), "層 {il} expert {ex} の重みが .strata にも experts.tq にもない");
+            }
         }
         m
     }

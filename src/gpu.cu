@@ -1617,12 +1617,14 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
     for (int i = 0; i < a; i++)
         if (ids[i] == e) return;
     const SkMat m = tab[e * 2 + which];
+    if (m.code >= 16) return; // トレリスは moe_tqb
     if (m.code == 15) skb<15>(m, e, which, rows, cols, x, ids, T, y);
     else if (m.code == 3) skb<3>(m, e, which, rows, cols, x, ids, T, y);
     else skb<2>(m, e, which, rows, cols, x, ids, T, y);
 }
 
-// (prefill 用) SQ 形式の SF4 の expert の行列積 (S_K は gemm_sk_i8)。y[a] = W_e x[a / xdiv] (x は f16_perm で並べ替えた f16) を、expert e に割り当てた a (order[off[e]..off[e+1]]) について求める。
+// (prefill 用) SQ 形式の SF4 とトレリスの expert の行列積 (S_K は gemm_sk_i8)。y[a] = W_e x[a / xdiv] (x は f16_perm で並べ替えた f16) を、expert e に割り当てた a (order[off[e]..off[e+1]]) について求める。
+// トレリスの expert は回転した入力 xr を読み、重みは共有メモリに載せるときに状態から計算する
 // グリッドは (rows/64, 128 * SKP)、128スレッド。ブロックは 64行 x 割り当て 32 個ずつを受け持ち (expert の割り当ての 32 個の組を SKP 個のブロックで分ける)、K は 64 ずつ共有メモリに載せる。
 // テンソルコアは f16 入力、f32 累積。16要素のブロックの中の並びを、重みと活性の両方で (0, 8, 1, 9, ...) に入れ替えてある (積和は変わらない)。
 // 次の K の分は、今の分の積和の前にレジスタへ読んでおく
@@ -1630,8 +1632,225 @@ extern "C" __global__ void moe_skb(const SkMat* tab, int which, int rows, int co
 // 16要素のブロックの中の並び (0, 8, 1, 9, ...) で、要素 j の位置
 __device__ __forceinline__ int perm16(int j) { int n = j & 15; return (j & ~15) + (n < 8 ? 2 * n : 2 * n - 15); }
 
+// ---- トレリスの expert (tq.rs) ----
+// SkMat の code = 16 | K << 8 | V << 12 | 語数 << 16、lo はビット列 [行][語数]、sc は行のスケール [行] (f32、/ 147.8 の前)。状態は 12 ビット。
+// 状態 i はビット列の [K i, K i + 12) の窓で、行の終わりを越えたら行の先頭に戻る。値 = 4 バイトの和 (A_q 状態 + B_q mod 2^32) - 510
+__device__ __forceinline__ unsigned tq_state(const unsigned* w, int ws, int pos) {
+    int wi = pos >> 5, wn = wi + 1 == ws ? 0 : wi + 1;
+    return (unsigned)(((unsigned long long)__ldg(w + wn) << 32 | __ldg(w + wi)) >> (pos & 31)) & 4095u;
+}
+__device__ __forceinline__ float tq_code(unsigned s, int q) {
+    unsigned h = (q == 0 ? 34038481u : q == 1 ? 2654435761u : 3266489917u) * s + (q == 0 ? 76625530u : q == 1 ? 40503u : 668265263u);
+    return (float)((int)__dp4a(h, 0x01010101u, 0u) - 510);
+}
+// 行の要素 j の値 (スケールを掛ける前)
+__device__ __forceinline__ float tq_w(const unsigned* w, int ws, int K, int V, int j) {
+    int i = j / V;
+    return tq_code(tq_state(w, ws, K * i), j - i * V);
+}
+
+// 状態 s の値 q の 4 バイト (和が値 + 510) と、int8 を 4 つ並べた x の積和 (dp4a。a は符号なし、b は符号付き)
+__device__ __forceinline__ int tq_dot(unsigned s, int q, unsigned x4, int acc) {
+    unsigned h = (q == 0 ? 34038481u : q == 1 ? 2654435761u : 3266489917u) * s + (q == 0 ? 76625530u : q == 1 ? 40503u : 668265263u);
+    int d;
+    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(h), "r"(x4), "r"(acc));
+    return d;
+}
+
+// 行の要素 [j0, j0 + 32) (j0 は 32 の倍数) を out に展開する (スケール f を掛ける)。V が 32 を割り切れば、読む語をレジスタに置き、
+// 状態の位置を定数にして読む。それ以外は 1 要素ずつ読む
+template <int K, int V> __device__ __forceinline__ void tq_dec32(const unsigned* w, int ws, int j0, float f, float* out) {
+    constexpr int NS = 32 / V, NW = (K * (NS - 1) + 12 + 31) / 32 + 1;
+    int P = K * (j0 / V), wi = P >> 5, off = P & 31;
+    unsigned wr[NW + 1];
+    #pragma unroll
+    for (int u = 0; u <= NW; u++) {
+        int i = wi + u;
+        wr[u] = __ldg(w + (i >= ws ? i - ws : i));
+    }
+    #pragma unroll
+    for (int u = 0; u < NW; u++) wr[u] = __funnelshift_r(wr[u], wr[u + 1], off);
+    #pragma unroll
+    for (int t = 0; t < NS; t++) {
+        unsigned s = __funnelshift_r(wr[K * t >> 5], wr[(K * t >> 5) + 1], K * t & 31) & 4095u;
+        #pragma unroll
+        for (int q = 0; q < V; q++) out[t * V + q] = tq_code(s, q) * f;
+    }
+}
+__device__ __forceinline__ void tq_dec(int K, int V, const unsigned* w, int ws, int j0, float f, float* out) {
+#define TQ_DEC(k, v) \
+    if (K == k && V == v) { \
+        tq_dec32<k, v>(w, ws, j0, f, out); \
+        return; \
+    }
+    TQ_DEC(2, 1) TQ_DEC(3, 1) TQ_DEC(4, 1) TQ_DEC(5, 1) TQ_DEC(2, 2) TQ_DEC(3, 2) TQ_DEC(4, 2) TQ_DEC(5, 2)
+#undef TQ_DEC
+    #pragma unroll
+    for (int n = 0; n < 32; n++) out[n] = tq_w(w, ws, K, V, j0 + n) * f;
+}
+
+// (T <= 8 用) moe_skb のトレリスの expert の分。グリッドと x, y の意味は moe_skb と同じで、x はトレリスなら回転した入力 (rot_tq)。
+// ブロック (256 スレッド) はこの expert を選んだ割り当ての入力を共有メモリに置き、ワープが 1 行ずつ計算する。
+// レーン l は行の段 [l N, (l+1) N) (N = 段の数 / 32) を受け持つ。受け持ちのビット列 (K (N-1) + 12 ビット) をレジスタに読み、
+// 先頭のずれを funnel shift で除くと、各段の状態の位置は定数になる (K, V, 列の数ごとに展開する)。次の行の分は計算の前に読んでおく。
+// 受け持ちの要素は [l cols/32, (l+1) cols/32) で、入力はレーンの受け持ちごとに int8 にし、同じ値を 4 バイトに並べて [受け持ちの中の位置 t][レーン] に置く。
+// 値の 4 バイトとの dp4a 1 回で (値 + 510) x を整数で足せる。510 の分は、受け持ちの入力の和から引く。
+// 割り当ては NT 個 (1, 2) ずつまとめて掛け、3 個以上なら重みを読み直す
+#define TQT 2
+struct TqSmem {
+    unsigned xs[TQT][D];
+    float xsc[TQT][32]; // レーンの受け持ちの int8 のスケール
+    int xo[TQT][32];    // 510 * 受け持ちの int8 の和
+    float red[TQT][8][32];
+    int as[8], na;
+};
+template <int K, int V, int COLS, int NT> __device__ __forceinline__ void tqb_rows(TqSmem& sm, const SkMat& m, int g0, int rows, float* y) {
+    constexpr int N = COLS / V / 32, NW = (K * (N - 1) + 12 + 31) / 32 + 1;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int ws = m.code >> 16, P = K * lane * N, wi = P >> 5, off = P & 31, r1 = blockIdx.y * 128 + 128;
+    const unsigned* bits = (const unsigned*)m.lo;
+    auto load = [&](int r, unsigned* wr) {
+        #pragma unroll
+        for (int u = 0; u <= NW; u++) {
+            int i = wi + u;
+            wr[u] = __ldg(bits + (size_t)r * ws + (i >= ws ? i - ws : i));
+        }
+    };
+    unsigned nx[NW + 1];
+    load(blockIdx.y * 128 + warp, nx);
+    for (int r = blockIdx.y * 128 + warp; r < r1; r += 8) {
+        unsigned wr[NW];
+        #pragma unroll
+        for (int u = 0; u < NW; u++) wr[u] = __funnelshift_r(nx[u], nx[u + 1], off);
+        if (r + 8 < r1) load(r + 8, nx);
+        int acc[NT];
+        #pragma unroll
+        for (int k = 0; k < NT; k++) acc[k] = -sm.xo[k][lane];
+        #pragma unroll
+        for (int t = 0; t < N; t++) {
+            unsigned s = ((K * t & 31) + 12 <= 32 ? wr[K * t >> 5] >> (K * t & 31) : __funnelshift_r(wr[K * t >> 5], wr[(K * t >> 5) + 1], K * t & 31)) & 4095u;
+            #pragma unroll
+            for (int q = 0; q < V; q++)
+                #pragma unroll
+                for (int k = 0; k < NT; k++) acc[k] = tq_dot(s, q, sm.xs[k][(t * V + q) * 32 + lane], acc[k]);
+        }
+        float f = ((const float*)m.sc)[r] * (1.f / 147.8f);
+        #pragma unroll
+        for (int k = 0; k < NT; k++) {
+            float v = warp_sum((float)acc[k] * sm.xsc[k][lane]);
+            if (lane == 0 && g0 + k < sm.na) y[(size_t)sm.as[g0 + k] * rows + r] = v * f;
+        }
+    }
+}
+template <int NT> __device__ __forceinline__ void tqb_dispatch(TqSmem& sm, const SkMat& m, int g0, int rows, int cols, float* y) {
+    const int K = m.code >> 8 & 15, V = m.code >> 12 & 15;
+#define TQ_ROWS(k, v) \
+    if (K == k && V == v) { \
+        if (cols == D) tqb_rows<k, v, D, NT>(sm, m, g0, rows, y); \
+        else tqb_rows<k, v, FF, NT>(sm, m, g0, rows, y); \
+        return; \
+    }
+    TQ_ROWS(2, 1) TQ_ROWS(3, 1) TQ_ROWS(4, 1) TQ_ROWS(5, 1) TQ_ROWS(2, 2) TQ_ROWS(3, 2) TQ_ROWS(4, 2) TQ_ROWS(5, 2) TQ_ROWS(3, 3) TQ_ROWS(4, 3) TQ_ROWS(5, 3)
+#undef TQ_ROWS
+}
+// 1 SM に 4 ブロック入るようレジスタを抑える (展開した段の読み込みを先に出しすぎると 255 本使い、1 ブロックしか入らない)
+extern "C" __global__ void __launch_bounds__(256, 4) moe_tqb(const SkMat* tab, int which, int rows, int cols, const half_t* __restrict__ x, const int* ids, int T, float* y) {
+    PDL();
+    int a = blockIdx.x, e = ids[a];
+    for (int i = 0; i < a; i++)
+        if (ids[i] == e) return;
+    const SkMat m = tab[e * 2 + which];
+    if (m.code < 16) return;
+    __shared__ TqSmem sm;
+    int tid = threadIdx.x, l = tid & 31, w8 = tid >> 5;
+    if (tid == 0) {
+        int c = 0;
+        for (int n = 0; n < T; n++)
+            for (int k = 0; k < TOPK; k++)
+                if (ids[n * TOPK + k] == e) sm.as[c++] = n * TOPK + k;
+        sm.na = c;
+    }
+    __syncthreads();
+    const int seg = cols / 32;
+    for (int g0 = 0; g0 < sm.na; g0 += TQT) {
+        int nt = min(sm.na - g0, TQT);
+        // スレッド (w8, l) は、レーン l の受け持ちの位置 t = w8 + 8u (要素 l cols/32 + t) を読む
+        float v[TQT][D / 256];
+        #pragma unroll
+        for (int k = 0; k < TQT; k++) {
+            const half_t* xr = x + (size_t)(k < nt ? (which ? sm.as[g0 + k] : sm.as[g0 + k] / TOPK) : 0) * cols;
+            float mx = 0.f;
+            #pragma unroll
+            for (int u = 0; u < D / 256; u++) {
+                int t = w8 + 8 * u;
+                v[k][u] = k < nt && t < seg ? h2f(xr[perm16(l * seg + t)]) : 0.f;
+                mx = fmaxf(mx, fabsf(v[k][u]));
+            }
+            sm.red[k][w8][l] = mx;
+        }
+        __syncthreads();
+        if (tid < TQT * 32) {
+            float mx = 0.f;
+            for (int i = 0; i < 8; i++) mx = fmaxf(mx, sm.red[tid >> 5][i][tid & 31]);
+            sm.xsc[tid >> 5][tid & 31] = mx > 0.f ? mx / 127.f : 1.f;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < TQT; k++) {
+            float inv = 1.f / sm.xsc[k][l];
+            int sum = 0;
+            #pragma unroll
+            for (int u = 0; u < D / 256; u++) {
+                int t = w8 + 8 * u;
+                if (t >= seg) continue;
+                int qv = __float2int_rn(v[k][u] * inv);
+                sum += qv;
+                sm.xs[k][t * 32 + l] = (unsigned)(qv & 255) * 0x01010101u;
+            }
+            sm.red[k][w8][l] = __int_as_float(sum);
+        }
+        __syncthreads();
+        if (tid < TQT * 32) {
+            int sum = 0;
+            for (int i = 0; i < 8; i++) sum += __float_as_int(sm.red[tid >> 5][i][tid & 31]);
+            sm.xo[tid >> 5][tid & 31] = 510 * sum;
+        }
+        __syncthreads();
+        if (nt == 1) tqb_dispatch<1>(sm, m, g0, rows, cols, y);
+        else tqb_dispatch<2>(sm, m, g0, rows, cols, y);
+        __syncthreads();
+    }
+}
+
+// トレリスの expert の入力側の回転 y = R^T x (tq.rs の Rot: R = diag(sg) (q ⊗ H128))。x, y は f16_perm の並びの f16 [行][c] で、同じ場所でもよい。
+// tab があれば、割り当て a (行) の expert の down がトレリスの行だけ回す (down の入力 act)。グリッドは行の数、256 スレッド
+extern "C" __global__ void rot_tq(const half_t* x, half_t* y, int c, const float* __restrict__ sg, const float* __restrict__ q, const SkMat* tab, const int* ids) {
+    PDL();
+    int a = blockIdx.x, tid = threadIdx.x;
+    if (tab && tab[ids[a] * 2 + 1].code < 16) return;
+    __shared__ float z[D];
+    for (int j = tid; j < c; j += blockDim.x) z[j] = h2f(x[(size_t)a * c + perm16(j)]) * sg[j];
+    __syncthreads();
+    // 128 ごとの高速アダマール変換
+    for (int h = 1; h < 128; h <<= 1) {
+        for (int p = tid; p < c / 2; p += blockDim.x) {
+            int i = p & 63, at = (p >> 6) * 128 + (i / h) * 2 * h + i % h;
+            float u = z[at], v = z[at + h];
+            z[at] = u + v, z[at + h] = u - v;
+        }
+        __syncthreads();
+    }
+    int nb = c / 128;
+    for (int j = tid; j < c; j += blockDim.x) {
+        float s = 0.f;
+        for (int b = 0; b < nb; b++) s += q[b * nb + j / 128] * z[b * 128 + j % 128];
+        y[(size_t)a * c + perm16(j)] = f2h(s * 0.08838834764831845f);
+    }
+}
+
+
 // which = 0 (gate/up) では、出力にそのまま SITU と ixd をかけ、down の入力 act [割り当て][FF] (f16_perm の並びの f16) に書く (situ_sk と同じ値)
-extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows, int cols, const uint4* __restrict__ x, int xdiv, const int* order, const int* off, float* y, half_t* act, const float* ixd) {
+extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows, int cols, const uint4* __restrict__ x, const uint4* __restrict__ xr_, int xdiv, const int* order, const int* off, float* y, half_t* act, const float* ixd) {
     PDL();
     __shared__ __align__(16) unsigned Ws[64 * WST / 2], Xs[32 * WST / 2];
     __shared__ int as[32];
@@ -1640,7 +1859,10 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
     int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     int r0 = blockIdx.x * 64, nrec = which ? D / 2 : 2 * FF;
     const SkMat m = tab[e * 2 + which];
-    if (m.code != 15) return; // S_K は gemm_sk_i8
+    const bool tq = m.code >= 16;
+    if (m.code != 15 && !tq) return; // S_K は gemm_sk_i8
+    if (tq) x = xr_;
+    const int tk = m.code >> 8 & 15, tv = m.code >> 12 & 15, tws = m.code >> 16;
     // 重みはスレッドあたり 16要素のブロック2つ (行 tid/2、ブロック (tid%2)*2 + i)、活性は割り当て tid/4 の 16要素 (ブロック tid%4)
     int wr = tid / 2, xj = tid / 4, xb = tid % 4;
     int rrow = r0 + wr, rec = rrow >> which, blk0 = (rrow & which) * (cols / 16);
@@ -1657,6 +1879,7 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
         auto fetch = [&](int k0) {
             #pragma unroll
             for (int i = 0; i < 2; i++) {
+                if (tq) break;
                 int blk = blk0 + k0 / 16 + (tid % 2) * 2 + i;
                 wl[i] = ((const uint2*)m.lo)[sk_blk(nrec, rec, blk)];
                 wh[i] = ((const u8*)m.sc)[sk_blk(nrec, rec, blk)];
@@ -1667,12 +1890,20 @@ extern "C" __global__ void gemm_sk_grouped(const SkMat* tab, int which, int rows
         fetch(0);
         for (int k0 = 0; k0 < cols; k0 += 64) {
             __syncthreads();
+            float tvals[32];
+            if (tq) tq_dec(tk, tv, (const unsigned*)m.lo + (size_t)rrow * tws, tws, k0 + (tid % 2) * 32, ((const float*)m.sc)[rrow] * (1.f / 147.8f), tvals);
             #pragma unroll
             for (int i = 0; i < 2; i++) {
                 unsigned v[8];
+                if (tq) {
+                    // 16 要素のブロックの要素 n と n+8 を組にする (SF4 の並びと同じ)
+                    #pragma unroll
+                    for (int n = 0; n < 8; n++) v[n] = h2pack(tvals[i * 16 + n], tvals[i * 16 + n + 8]);
+                } else {
                 float sc = e4m3(wh[i]);
                 #pragma unroll
                 for (int n = 0; n < 8; n++) v[n] = h2pack(e2m1(wl[i].x >> (4 * n)) * sc, e2m1(wl[i].y >> (4 * n)) * sc);
+                }
                 unsigned* dst = Ws + wr * (WST / 2) + ((tid % 2) * 2 + i) * 8;
                 *(uint4*)dst = make_uint4(v[0], v[1], v[2], v[3]);
                 *(uint4*)(dst + 4) = make_uint4(v[4], v[5], v[6], v[7]);
@@ -1903,7 +2134,7 @@ extern "C" __global__ void gemm_sk_i8(const SkMat* tab, int which, int rows, int
     int e = blockIdx.y / SKI;
     if (off[e] + blockIdx.y % SKI * SKN >= off[e + 1]) return;
     const SkMat m = tab[e * 2 + which];
-    if (m.code == 15) return;
+    if (m.code == 15 || m.code >= 16) return;
     __shared__ __align__(16) SkI8Smem sm;
     if (which) sk_i8_body<true>(sm, m, e, rows, cols, xq, xs, xdiv, order, off, y, aq, as_, ixd);
     else sk_i8_body<false>(sm, m, e, rows, cols, xq, xs, xdiv, order, off, y, aq, as_, ixd);

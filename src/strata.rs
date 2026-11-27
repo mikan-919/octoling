@@ -126,10 +126,11 @@ impl Pack {
             let u32_at = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap()) as usize;
             let off = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
             let (gu, dn, len, dn_off) = (e[2], e[3], u32_at(16), u32_at(20));
-            let ok = id < N_EXP && matches!((gu, dn), (2 | 3, 2 | 3) | (SF4, SF4)) && off + len <= sec4.len() && {
+            // 長さ 0 は本体が experts.tq にある expert (Model::open が確かめる)
+            let ok = id < N_EXP && matches!((gu, dn), (2 | 3, 2 | 3) | (SF4, SF4)) && off + len <= sec4.len() && (len == 0 || {
                 let need = if gu == SF4 { dn_off + D * FF / 2 + D * FF / 16 } else { dn_off + DN_RECS * SB_REC * sb_bytes(dn) };
                 need <= len
-            };
+            });
             if !ok {
                 return Err(bad(&format!("expert {i} の形式 ({gu}, {dn}) を読めない")));
             }
@@ -309,6 +310,11 @@ fn split_sf4(raw: &[u8], recs: usize, out: &mut [u8]) {
 }
 
 impl SkLayer {
+    /// expert ex の本体が .strata にあるか
+    pub(crate) fn has_body(&self, ex: usize) -> bool {
+        !self.bodies[ex].body.is_empty()
+    }
+
     /// 行 r (gate と up が交互) と x の内積
     pub(crate) fn up(&self, ex: usize, r: usize, x: &[f32]) -> f32 {
         let b = &self.bodies[ex];
@@ -339,12 +345,17 @@ impl SkLayer {
         pair[r % 2 * FF..][..FF].iter().zip(act).zip(b.body.as_chunks::<2>().0).map(|((w, x), s)| w * x / f16(u16::from_le_bytes([s[0], s[1]]))).sum()
     }
 
-    pub(crate) fn image(&self) -> SkImage {
+    /// trellis[e] の expert は experts.tq で計算するので、平面を作らない (tab は 0、ixd は 1 のまま)
+    pub(crate) fn image(&self, trellis: &[bool]) -> SkImage {
         let mut at = 0;
         let mut tab = vec![[0u64; 3]; 2 * N_EXP];
         let mut places = Vec::with_capacity(N_EXP);
         for (e, b) in self.bodies.iter().enumerate() {
             let start = at;
+            if trellis[e] {
+                places.push((start, 0));
+                continue;
+            }
             let g = if b.gu == SF4 { b.outer() } else { [1.0; 2] };
             for (m, (code, recs)) in [(b.gu, GU_RECS), (b.dn, DN_RECS)].into_iter().enumerate() {
                 let [lo, hi, sc] = planes(code, recs);
@@ -357,6 +368,9 @@ impl SkLayer {
         let base = bytes.as_mut_ptr() as usize;
         crate::pool::run(N_EXP, &|e| {
             let (b, (start, n)) = (&self.bodies[e], places[e]);
+            if n == 0 {
+                return;
+            }
             // SAFETY: expert ごとの範囲は重ならず、bytes は run が返るまで生きている
             let out = unsafe { std::slice::from_raw_parts_mut((base + start) as *mut u8, n) };
             let g = planes(b.gu, GU_RECS).iter().sum::<usize>().next_multiple_of(16);
@@ -370,8 +384,8 @@ impl SkLayer {
             }
         });
         let mut ixd = vec![1.0; N_EXP * FF];
-        for (b, o) in self.bodies.iter().zip(ixd.chunks_mut(FF)) {
-            if b.dn != SF4 {
+        for ((b, o), &t) in self.bodies.iter().zip(ixd.chunks_mut(FF)).zip(trellis) {
+            if b.dn != SF4 && !t {
                 o.iter_mut().zip(b.body.as_chunks::<2>().0).for_each(|(o, s)| *o = 1.0 / f16(u16::from_le_bytes([s[0], s[1]])));
             }
         }
