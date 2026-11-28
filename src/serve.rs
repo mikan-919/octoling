@@ -27,6 +27,32 @@ pub struct Params {
     pub top_p: f32,
     pub top_k: usize,
     pub seed: u64,
+    /// 最初のトークンをこの中から選ぶ。tool_choice の required で、本文ではなく関数名から書き始めさせる
+    pub first_tokens: Option<Vec<u32>>,
+}
+
+/// tool_choice の指定
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Named(String),
+}
+
+fn parse_tool_choice(v: &Value) -> Result<ToolChoice, String> {
+    match v {
+        Value::Null => Ok(ToolChoice::Auto),
+        Value::String(s) => match s.as_str() {
+            "auto" => Ok(ToolChoice::Auto),
+            "none" => Ok(ToolChoice::None),
+            "required" => Ok(ToolChoice::Required),
+            _ => Err(format!("tool_choice {s} は使えない")),
+        },
+        v => match v["function"]["name"].as_str() {
+            Some(name) if !name.is_empty() => Ok(ToolChoice::Named(name.to_string())),
+            _ => Err("tool_choice は auto・none・required・関数の指定".into()),
+        },
+    }
 }
 
 /// 生成した文章の断片。思考 (reasoning_content) と本文 (content) を分けて返す
@@ -165,6 +191,25 @@ impl Engine {
         Ok(out)
     }
 
+    /// tool_choice の強制。プロンプトの末尾に、モデルが tool 呼び出しを書き始めた所までを足す。
+    /// name が None なら関数名はモデルに選ばせ、返り値で最初のトークンを関数名の先頭に絞る
+    pub fn force_tool_call(&self, prompt: &mut Vec<u32>, tools: &[Value], name: Option<&str>) -> Option<Vec<u32>> {
+        prompt.push(self.sp.model);
+        if let Some(name) = name {
+            prompt.extend(self.encode(name));
+            prompt.push(self.sp.invoke_tool);
+            return None;
+        }
+        let first: Vec<u32> = tools
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function").unwrap_or(t);
+                self.encode(f["name"].as_str()?).first().copied()
+            })
+            .collect();
+        (!first.is_empty()).then_some(first)
+    }
+
     /// プロンプトの続きを生成し、断片ができるたびに on に渡す。on が false を返したら止める。
     /// 返り値は (終わった理由 "stop" か "length", 生成したトークン数)
     pub fn generate(&mut self, prompt: &[u32], p: &Params, mut on: impl FnMut(Piece) -> bool) -> Result<(&'static str, usize), String> {
@@ -200,12 +245,15 @@ impl Engine {
         }
         let done = self.cached.len();
         let mut logits = self.prefill(&prompt[done..]);
+        if let Some(allowed) = &p.first_tokens {
+            mask_logits(&mut logits, allowed);
+        }
         let t_prefill = t0.elapsed().as_secs_f64();
         self.cached = prompt.to_vec();
         self.remember(prompt, false);
         let t0 = std::time::Instant::now();
 
-        let mut out = Out { mode: Mode::None, pending: vec![] };
+        let mut out = Out { mode: if prompt.last() == Some(&self.sp.invoke_tool) { Mode::Tool } else { Mode::None }, pending: vec![] };
         let (mut n, mut steps, mut t_draft, mut t_verify) = (0, 0, 0f64, 0f64);
         let greedy = p.temperature <= 0.0 || p.top_k == 1;
         let mut rng = p.seed | 1;
@@ -367,6 +415,15 @@ impl Engine {
 struct Out {
     mode: Mode,
     pending: Vec<u32>,
+}
+
+/// allowed にない位置を -∞ にして、最初のトークンを allowed の中から選ばせる
+fn mask_logits(logits: &mut [f32], allowed: &[u32]) {
+    for (i, l) in logits.iter_mut().enumerate() {
+        if !allowed.contains(&(i as u32)) {
+            *l = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// 最大の値の位置。同じ値なら小さい位置 (GPU の argmax_rows と同じ決め方)
@@ -579,19 +636,48 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// モデルが書いたツール呼び出しの JSON を OpenAI の形にする。読めなければ None
-fn tool_call(text: &str, id: String, index: usize) -> Option<Value> {
+/// モデルが書いたツール呼び出しの JSON を OpenAI の形にする。読めなければ None。
+/// name が Some なら、JSON の name ではなくその名前を使う (tool_choice で関数を指定したとき)
+fn tool_call(text: &str, id: String, index: usize, name: Option<&str>) -> Option<Value> {
     let v: Value = serde_json::from_str(text).ok()?;
     let args = v.get("args").filter(|a| a.is_object())?;
-    Some(json!({"index": index, "id": id, "type": "function", "function": {"name": v["name"].as_str()?, "arguments": args.to_string()}}))
+    Some(json!({"index": index, "id": id, "type": "function", "function": {"name": name.or_else(|| v["name"].as_str())?, "arguments": args.to_string()}}))
 }
 
 fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<()> {
-    let tools = if req["tool_choice"] == "none" { vec![] } else { req["tools"].as_array().cloned().unwrap_or_default() };
+    let choice = match parse_tool_choice(&req["tool_choice"]) {
+        Ok(c) => c,
+        Err(e) => return respond(s, 400, &err_json(&e)),
+    };
+    let mut tools = req["tools"].as_array().cloned().unwrap_or_default();
+    match &choice {
+        ToolChoice::None => tools.clear(),
+        ToolChoice::Required if tools.is_empty() => return respond(s, 400, &err_json("tool_choice が required だが tools がない")),
+        ToolChoice::Named(name) => {
+            tools.retain(|t| t.get("function").unwrap_or(t)["name"].as_str() == Some(name.as_str()));
+            if tools.is_empty() {
+                return respond(s, 400, &err_json(&format!("tool_choice の関数 {name} が tools にない")));
+            }
+        }
+        _ => {}
+    }
     let prompt = match parse_messages(&req["messages"]).and_then(|m| Ok((m, effort(&req["reasoning_effort"])?))).and_then(|(m, e)| engine.prompt(&m, &tools, e))
     {
         Ok(p) => p,
         Err(e) => return respond(s, 400, &err_json(&e)),
+    };
+    let mut prompt = prompt;
+    let first_tokens = match &choice {
+        ToolChoice::Required => engine.force_tool_call(&mut prompt, &tools, None),
+        ToolChoice::Named(name) => {
+            engine.force_tool_call(&mut prompt, &tools, Some(name));
+            None
+        }
+        _ => None,
+    };
+    let forced = match &choice {
+        ToolChoice::Named(name) => Some(name.as_str()),
+        _ => None,
     };
     let num = |k: &str| req[k].as_f64();
     let params = Params {
@@ -600,6 +686,7 @@ fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<
         top_p: num("top_p").unwrap_or(1.0) as f32,
         top_k: num("top_k").unwrap_or(0.0) as usize,
         seed: req["seed"].as_u64().unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64),
+        first_tokens,
     };
     let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let id = format!("chatcmpl-{created}{:x}", params.seed & 0xffffff);
@@ -618,7 +705,7 @@ fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<
             let delta = match p {
                 Piece::Thinking(t) => json!({"reasoning_content": t}),
                 Piece::Text(t) => json!({"content": t}),
-                Piece::Tool(t) => match tool_call(&t, call_id(calls), calls) {
+                Piece::Tool(t) => match tool_call(&t, call_id(calls), calls, forced) {
                     Some(c) => {
                         calls += 1;
                         json!({"tool_calls": [c]})
@@ -649,7 +736,7 @@ fn chat(engine: &mut Engine, req: &Value, s: &mut TcpStream) -> std::io::Result<
         match p {
             Piece::Thinking(t) => thinking += &t,
             Piece::Text(t) => text += &t,
-            Piece::Tool(t) => match tool_call(&t, call_id(calls.len()), calls.len()) {
+            Piece::Tool(t) => match tool_call(&t, call_id(calls.len()), calls.len(), forced) {
                 Some(c) => calls.push(c),
                 None => text += &t,
             },
@@ -683,11 +770,35 @@ mod tests {
 
     #[test]
     fn converts_model_tool_call() {
-        let c = tool_call(r#"{"name":"read","args":{"path":"a.txt"}}"#, "x".into(), 2).unwrap();
+        let c = tool_call(r#"{"name":"read","args":{"path":"a.txt"}}"#, "x".into(), 2, None).unwrap();
         assert_eq!(c["index"], 2);
         assert_eq!(c["function"]["name"], "read");
         assert_eq!(c["function"]["arguments"], r#"{"path":"a.txt"}"#);
-        assert!(tool_call("{broken", "x".into(), 0).is_none());
+        assert!(tool_call("{broken", "x".into(), 0, None).is_none());
+        // 関数を指定したときは、モデルが書いた名前ではなく指定の名前を使う
+        let c = tool_call(r#"{"name":"other","args":{"a":1}}"#, "x".into(), 0, Some("read")).unwrap();
+        assert_eq!(c["function"]["name"], "read");
+        assert_eq!(c["function"]["arguments"], r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn parses_tool_choice() {
+        assert!(matches!(parse_tool_choice(&Value::Null), Ok(ToolChoice::Auto)));
+        assert!(matches!(parse_tool_choice(&json!("auto")), Ok(ToolChoice::Auto)));
+        assert!(matches!(parse_tool_choice(&json!("none")), Ok(ToolChoice::None)));
+        assert!(matches!(parse_tool_choice(&json!("required")), Ok(ToolChoice::Required)));
+        assert!(matches!(parse_tool_choice(&json!({"type": "function", "function": {"name": "read"}})), Ok(ToolChoice::Named(n)) if n == "read"));
+        assert!(parse_tool_choice(&json!("any")).is_err());
+        assert!(parse_tool_choice(&json!({"type": "function"})).is_err());
+    }
+
+    #[test]
+    fn masks_disallowed_tokens() {
+        let mut l = vec![1.0, 2.0, 3.0];
+        mask_logits(&mut l, &[0, 2]);
+        assert_eq!(l[0], 1.0);
+        assert!(l[1].is_infinite() && l[1] < 0.0);
+        assert_eq!(l[2], 3.0);
     }
 
     #[test]

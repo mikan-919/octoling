@@ -34,7 +34,7 @@ fn main() {
             let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], ..Default::default() }];
             let prompt = engine.prompt(&msgs, &[], e).unwrap();
             let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-            let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed };
+            let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed, first_tokens: None };
             let t0 = Instant::now();
             let (finish, n) = engine
                 .generate(&prompt, &p, |piece| {

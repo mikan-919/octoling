@@ -243,7 +243,7 @@ prompt 22 tokens (10 reused, prefill 58 ms), generated 101 tokens (126.2 tok/s, 
 | `stream` | `true` で Server-Sent Events で流す | `false` |
 | `stream_options.include_usage` | 流す時に、最後にトークン数を送る | `false` |
 | `tools` | 関数の定義。モデルの呼び出しは `tool_calls` で返し、`finish_reason` は `tool_calls` | なし |
-| `tool_choice` | `none` だけを見る（ツールを渡さない）。ほかの値は `auto` と同じ扱い | `auto` |
+| `tool_choice` | `none` はツールを渡さない。`required` はツール呼び出しを強制し、関数名の指定は指定の関数だけを呼び出す | `auto` |
 
 <a name="reasoning_effort"></a>`reasoning_effort` は文字列か 0〜0.99 の数で、プロンプトの `Thinking effort level` に入ります。
 
@@ -341,7 +341,6 @@ SQ-10 の expert は、量子化したまま GPU で展開してテンソルコ�
 - モデルは Inkling-2 Mini だけです。
 - リクエストは1つずつ処理します。
 - サンプリングは `temperature`・`top_p`・`top_k`・`seed` だけです。`stop`・`n`・`logprobs`・`response_format` などは無視します。
-- `tool_choice` の `required` と関数名の指定は、`auto` と同じに扱います。
 - 投機的デコードの出力は、下書きなしの貪欲法の出力と同じとは限りません。確かめる計算（複数トークン）と1トークンずつの計算で足し算の順番が違い、第1候補と第2候補の差が小さい所で選ぶトークンが変わることがあります。
 - 認証はありません。外から接続できるアドレスで待ち受ける時は注意してください。
 

@@ -224,7 +224,7 @@ Reasoning is returned in `reasoning_content` and the answer in `content`. Even w
 | `stream` | `true` streams with Server-Sent Events | `false` |
 | `stream_options.include_usage` | When streaming, send token counts at the end | `false` |
 | `tools` | Function definitions. Calls from the model are returned in `tool_calls` with `finish_reason` `tool_calls` | none |
-| `tool_choice` | Only `none` is honored (tools are not passed). Other values act as `auto` | `auto` |
+| `tool_choice` | `none` drops tools. `required` forces a tool call. A function name restricts to only that function | `auto` |
 
 <a name="reasoning_effort"></a>`reasoning_effort` is a string or a number from 0 to 0.99, inserted into the prompt as `Thinking effort level`.
 
@@ -260,7 +260,6 @@ Speculative decoding speed is measured with the `spec_bench` example (see the de
 - Inkling-2 Mini only.
 - One request at a time.
 - Only `temperature`, `top_p`, `top_k`, and `seed` affect sampling. `stop`, `n`, `logprobs`, `response_format`, and others are ignored.
-- `tool_choice` set to `required` or to a function name acts as `auto`.
 - Speculative decoding output is not always identical to greedy output without the draft model. The multi-token verify pass and the single-token pass add in a different order, so the chosen token can differ where the top two candidates are close.
 - There is no authentication. Be careful when listening on an address reachable from outside.
 
