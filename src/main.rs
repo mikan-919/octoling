@@ -34,7 +34,7 @@ fn main() {
             let msgs = [Msg { role: "user".into(), content: vec![args[3].clone()], ..Default::default() }];
             let prompt = engine.prompt(&msgs, &[], e).unwrap();
             let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
-            let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed };
+            let p = Params { max_tokens: usize::MAX, temperature: 1.0, top_p: 1.0, top_k: 0, seed, first_tokens: None };
             let t0 = Instant::now();
             let (finish, n) = engine
                 .generate(&prompt, &p, |piece| {
@@ -111,11 +111,17 @@ fn bench_one(gpu: &mut Gpu, tokens: &[u32], n_gen: usize) {
     }
 }
 
+/// 1トークンずつ進める。OCTO_LOGITS=ファイル なら、各位置の logits (f32 x 語彙) を続けて書く (examples/kv_compare.py で比べられる)
 fn step_all(tokens: &[u32], mut step: impl FnMut(u32) -> Vec<f32>) {
+    use std::io::Write;
+    let mut dump = std::env::var_os("OCTO_LOGITS").map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("OCTO_LOGITS のファイルを作れない")));
     for &t in tokens {
         let t0 = Instant::now();
         let logits = step(t);
         report(t, &logits, t0.elapsed().as_secs_f64() * 1e3);
+        if let Some(f) = &mut dump {
+            f.write_all(&logits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        }
     }
 }
 

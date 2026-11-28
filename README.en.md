@@ -168,6 +168,8 @@ To skip DFlash2, leave out the last two lines.
 
 octoling reads only `.strata` v1.1 with SQ-10 experts (S2_K, S3_K, SF4). Other combinations such as SQ-15 are not supported.
 
+(Experimental) If the directory also holds `experts.tq`, the experts it contains are computed from trellis-quantized weights (each weight is computed from a short window of a bit string, with no value table) instead of SQ-10's S2_K/S3_K, and the `.strata` may leave those experts out. An `experts.tq` at about 2.1 bits per expert weight (6.41 GB) plus a `.strata` without those experts and without the unused DSpark weights (1.66 GB) comes to 8.07 GB, with a lower KL divergence from the official weights than SQ-10 on English, code and Japanese text. Generation runs at about 90% of SQ-10's speed. The tools that build `experts.tq` are not in the repository yet.
+
 ### Official weights
 
 ```sh
@@ -222,7 +224,7 @@ Reasoning is returned in `reasoning_content` and the answer in `content`. Even w
 | `stream` | `true` streams with Server-Sent Events | `false` |
 | `stream_options.include_usage` | When streaming, send token counts at the end | `false` |
 | `tools` | Function definitions. Calls from the model are returned in `tool_calls` with `finish_reason` `tool_calls` | none |
-| `tool_choice` | Only `none` is honored (tools are not passed). Other values act as `auto` | `auto` |
+| `tool_choice` | `none` drops tools. `required` forces a tool call. A function name restricts to only that function | `auto` |
 
 <a name="reasoning_effort"></a>`reasoning_effort` is a string or a number from 0 to 0.99, inserted into the prompt as `Thinking effort level`.
 
@@ -258,7 +260,6 @@ Speculative decoding speed is measured with the `spec_bench` example (see the de
 - Inkling-2 Mini only.
 - One request at a time.
 - Only `temperature`, `top_p`, `top_k`, and `seed` affect sampling. `stop`, `n`, `logprobs`, `response_format`, and others are ignored.
-- `tool_choice` set to `required` or to a function name acts as `auto`.
 - Speculative decoding output is not always identical to greedy output without the draft model. The multi-token verify pass and the single-token pass add in a different order, so the chosen token can differ where the top two candidates are close.
 - There is no authentication. Be careful when listening on an address reachable from outside.
 

@@ -40,7 +40,8 @@ pub(crate) struct Experts {
     pub(crate) w2: &'static [u8],
     pub(crate) s2: &'static [u8],
     pub(crate) a2: &'static [f32],
-    pub(crate) sk: Option<crate::strata::SkLayer>, // SQ 形式なら上の欄は空で、こちらを使う
+    pub(crate) sk: Option<crate::strata::SkLayer>,          // SQ 形式なら上の欄は空で、こちらを使う
+    pub(crate) tq: Option<(&'static crate::tq::Tq, usize)>, // (実験) OCTO_TQ のトレリスの expert と層の番号。量子化した expert はこちらで計算する
 }
 
 pub(crate) struct Ctrl {
@@ -151,6 +152,7 @@ impl Model {
                     s2: get(&e("w2_weight_scale"), "U8", &[N_EXP, D, FF / 32]),
                     a2: &[],
                     sk: None,
+                    tq: None,
                 }
             } else {
                 Experts {
@@ -162,6 +164,7 @@ impl Model {
                     s2: get(&e("w2_weight_scale"), "F8_E4M3", &[N_EXP, D, FF / 16]),
                     a2: f32s(&e("w2_weight_amax"), &[N_EXP]),
                     sk: None,
+                    tq: None,
                 }
             }
         };
@@ -181,7 +184,25 @@ impl Model {
             .unwrap_or_else(|| panic!("{} に safetensors も .strata もない", dir.display()));
         let pack = crate::strata::Pack::open(&pack).unwrap_or_else(|e| panic!("{e}"));
         let pack: &'static crate::strata::Pack = Box::leak(Box::new(pack));
-        Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i), &|name| pack.q8(name), pack.s6("model.llm.unembed.weight"))
+        let mut m = Self::build(
+            &|name, dtype, shape| pack.tensor(name, dtype, shape),
+            &|i| pack.experts(i),
+            &|name| pack.q8(name),
+            pack.s6("model.llm.unembed.weight"),
+        );
+        // 同じディレクトリに experts.tq があれば、そこにある expert はトレリスの重みで計算する
+        let tq_path = dir.join("experts.tq");
+        let tq = tq_path.exists().then(|| &*Box::leak(Box::new(crate::tq::Tq::open(&tq_path).unwrap_or_else(|e| panic!("{e}")))));
+        for (il, l) in m.layers.iter_mut().enumerate() {
+            l.experts.tq = tq.map(|t| (t, il));
+            let sk = l.experts.sk.as_ref().unwrap();
+            for ex in 0..N_EXP {
+                let has = [0, 1].map(|w| tq.is_some_and(|t| t.mat(il, ex, w).is_some()));
+                assert!(has[0] == has[1], "experts.tq の層 {il} expert {ex} が gate/up と down の片方だけ");
+                assert!(has[0] || sk.has_body(ex), "層 {il} expert {ex} の重みが .strata にも experts.tq にもない");
+            }
+        }
+        m
     }
 
     fn build(
@@ -445,22 +466,33 @@ impl Model {
     pub(crate) fn moe_some(&self, l: &Layer, x: &[f32], sel: &[usize], wts: &[f32]) -> Vec<f32> {
         let n = sel.len();
         let e = &l.experts;
+        let tq = |ex: usize, m: usize| e.tq.and_then(|(t, il)| t.mat(il, ex, m));
+        let xr = e.tq.map(|(t, _)| t.rotate(x));
         // 選ばれた expert の行をまとめて分割し、全スレッドに配る
         let mut gu = vec![0.0; n * 2 * FF];
         crate::pool::chunks_mut(&mut gu, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
                 let r = c * 64 + i;
                 let ex = sel[r / (2 * FF)];
-                *o = e.up(ex, r % (2 * FF), x);
+                *o = match tq(ex, 0) {
+                    Some(m) => m.dot(r % (2 * FF), xr.as_deref().unwrap()),
+                    None => e.up(ex, r % (2 * FF), x),
+                };
             }
         });
         let mut act = vec![0.0; n * FF];
         crate::pool::chunks_mut(&mut act, 256, |c, o| o.copy_from_slice(&situ_pairs(&gu[c * 512..][..2 * o.len()])));
+        let ar: Vec<Option<Vec<f32>>> = (0..n).map(|k| tq(sel[k], 1).map(|_| e.tq.unwrap().0.rotate(&act[k * FF..][..FF]))).collect();
         let mut y = vec![0.0; D];
         crate::pool::chunks_mut(&mut y, 64, |c, o| {
             for (i, o) in o.iter_mut().enumerate() {
                 let row = c * 64 + i;
-                *o = (0..n).map(|k| e.down(sel[k], row, &act[k * FF..][..FF]) * wts[k]).sum();
+                *o = (0..n)
+                    .map(|k| match tq(sel[k], 1) {
+                        Some(m) => m.dot(row, ar[k].as_deref().unwrap()),
+                        None => e.down(sel[k], row, &act[k * FF..][..FF]),
+                    } * wts[k])
+                    .sum();
             }
         });
         y
