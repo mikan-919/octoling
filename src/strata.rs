@@ -127,10 +127,13 @@ impl Pack {
             let off = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
             let (gu, dn, len, dn_off) = (e[2], e[3], u32_at(16), u32_at(20));
             // 長さ 0 は本体が experts.tq にある expert (Model::open が確かめる)
-            let ok = id < N_EXP && matches!((gu, dn), (2 | 3, 2 | 3) | (SF4, SF4)) && off + len <= sec4.len() && (len == 0 || {
-                let need = if gu == SF4 { dn_off + D * FF / 2 + D * FF / 16 } else { dn_off + DN_RECS * SB_REC * sb_bytes(dn) };
-                need <= len
-            });
+            let ok = id < N_EXP
+                && matches!((gu, dn), (2 | 3, 2 | 3) | (SF4, SF4))
+                && off + len <= sec4.len()
+                && (len == 0 || {
+                    let need = if gu == SF4 { dn_off + D * FF / 2 + D * FF / 16 } else { dn_off + DN_RECS * SB_REC * sb_bytes(dn) };
+                    need <= len
+                });
             if !ok {
                 return Err(bad(&format!("expert {i} の形式 ({gu}, {dn}) を読めない")));
             }

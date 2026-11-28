@@ -40,7 +40,7 @@ pub(crate) struct Experts {
     pub(crate) w2: &'static [u8],
     pub(crate) s2: &'static [u8],
     pub(crate) a2: &'static [f32],
-    pub(crate) sk: Option<crate::strata::SkLayer>, // SQ 形式なら上の欄は空で、こちらを使う
+    pub(crate) sk: Option<crate::strata::SkLayer>,          // SQ 形式なら上の欄は空で、こちらを使う
     pub(crate) tq: Option<(&'static crate::tq::Tq, usize)>, // (実験) OCTO_TQ のトレリスの expert と層の番号。量子化した expert はこちらで計算する
 }
 
@@ -184,7 +184,12 @@ impl Model {
             .unwrap_or_else(|| panic!("{} に safetensors も .strata もない", dir.display()));
         let pack = crate::strata::Pack::open(&pack).unwrap_or_else(|e| panic!("{e}"));
         let pack: &'static crate::strata::Pack = Box::leak(Box::new(pack));
-        let mut m = Self::build(&|name, dtype, shape| pack.tensor(name, dtype, shape), &|i| pack.experts(i), &|name| pack.q8(name), pack.s6("model.llm.unembed.weight"));
+        let mut m = Self::build(
+            &|name, dtype, shape| pack.tensor(name, dtype, shape),
+            &|i| pack.experts(i),
+            &|name| pack.q8(name),
+            pack.s6("model.llm.unembed.weight"),
+        );
         // 同じディレクトリに experts.tq があれば、そこにある expert はトレリスの重みで計算する
         let tq_path = dir.join("experts.tq");
         let tq = tq_path.exists().then(|| &*Box::leak(Box::new(crate::tq::Tq::open(&tq_path).unwrap_or_else(|e| panic!("{e}")))));
